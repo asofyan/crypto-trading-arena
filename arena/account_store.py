@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime
 
 from arena.fees import FeeModel
+from arena.ledger import Ledger
 from arena.models import AgentAccount, TradeLogEntry, TradeRecorder, TradeResult
 from arena.price_book import PriceBook
 
@@ -15,15 +17,84 @@ log = logging.getLogger(__name__)
 class AccountStore:
     """In-memory trading account store, keyed by agent_id."""
 
-    def __init__(self, price_book: PriceBook, fee_model: FeeModel | None = None) -> None:
+    def __init__(
+        self,
+        price_book: PriceBook,
+        fee_model: FeeModel | None = None,
+        ledger: Ledger | None = None,
+    ) -> None:
         self._accounts: dict[str, AgentAccount] = {}
         self._trade_log: list[TradeLogEntry] = []
         self._price_book = price_book
         self._data_recorder: TradeRecorder | None = None
         self._fee_model = fee_model or FeeModel()
+        self._ledger = ledger
+        # One fill at a time: tool calls arrive from worker threads, and the
+        # read-modify-write below plus ledger.save_fill must see a settled state.
+        self._write_lock = threading.Lock()
+        # Set when a ledger write fails: the fill still counted in memory, so the
+        # disk is now behind. Surfaced by PortfolioView's header badge and by the
+        # durable meta row that `manage_bot.py status` reads from another process.
+        self._ledger_degraded = False
+
+    @property
+    def ledger_degraded(self) -> bool:
+        """True once a fill could not be persisted (memory and disk have diverged)."""
+        return self._ledger_degraded
+
+    def _mark_ledger_degraded(self, agent_id: str, moment: datetime) -> None:
+        """Record the divergence durably; best-effort, since the write path is broken."""
+        if self._ledger is None:
+            return
+        try:
+            self._ledger.mark_degraded(agent_id, moment.isoformat())
+        except Exception as exc:
+            # The in-memory flag still works, so the dashboard badge shows up even
+            # when the marker cannot be written — only the cross-process view is lost.
+            log.warning("account_store: could not persist the degraded marker: %s", exc)
 
     def attach_recorder(self, recorder: TradeRecorder) -> None:
         self._data_recorder = recorder
+
+    def attach_ledger(self, ledger: Ledger, *, clear_marker: bool = False) -> None:
+        """Adopt a ledger and hydrate accounts/fills from it (startup path).
+
+        ``clear_marker`` is opt-in because hydrating from disk is not proof that this
+        startup succeeds: the deployment attaches the ledger before the broker is even
+        reached, so a refused Kafka bootstrap would die right after erasing the
+        operator's record of an earlier divergence. The deploy entrypoint clears the
+        marker from its ``after_startup`` hook (broker up) instead.
+        """
+        if self._accounts or self._trade_log:
+            raise RuntimeError(
+                "account_store.attach_ledger: this store already holds "
+                f"{len(self._accounts)} account(s) and {len(self._trade_log)} fill(s). "
+                "Attaching another ledger would discard them — attach the ledger "
+                "before any trade is executed."
+            )
+        self._ledger = ledger
+        self._ledger_degraded = False
+        self._accounts = ledger.load_accounts()
+        self._trade_log = ledger.recent_fills()
+        if clear_marker:
+            self.mark_ledger_healthy()
+        log.info(
+            "account_store.attach_ledger: hydrated %d account(s) and %d recent fill(s) from %s",
+            len(self._accounts), len(self._trade_log), ledger.path,
+        )
+
+    def mark_ledger_healthy(self) -> None:
+        """Clear the durable degraded marker; call only once the engine really serves.
+
+        Best-effort like the write side: the marker shares the ledger's connection, so
+        when it cannot be written the dashboard badge and the logs are what remain.
+        """
+        if self._ledger is None:
+            return
+        try:
+            self._ledger.mark_healthy()
+        except Exception as exc:
+            log.warning("account_store: could not clear the degraded marker: %s", exc)
 
     def set_fee_model(self, fee_model: FeeModel) -> None:
         """Replace the active fee model. Used by deploy entrypoints after CLI/config resolution."""
@@ -52,6 +123,18 @@ class AccountStore:
         return self._trade_log
 
     def execute_trade(
+        self,
+        agent_id: str,
+        product_id: str,
+        quantity: float,
+        action: str,
+        latency: float | None = None,
+    ) -> TradeResult:
+        """Execute one fill, serialised so overlapping tool calls cannot interleave."""
+        with self._write_lock:
+            return self._execute_trade_locked(agent_id, product_id, quantity, action, latency)
+
+    def _execute_trade_locked(
         self,
         agent_id: str,
         product_id: str,
@@ -197,13 +280,18 @@ class AccountStore:
         fee: float,
         latency: float | None = None,
     ) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
+        now = datetime.now()
         self._trade_log.append(
-            TradeLogEntry(ts, agent_id, action, product_id, quantity, price, fee, latency)
+            TradeLogEntry(
+                now.strftime("%H:%M:%S"),
+                agent_id, action, product_id, quantity, price, fee, latency,
+            )
         )
 
+        # Resolved once: both the CSV recorder and the ledger need the post-fill state.
+        account = self._accounts.get(agent_id)
+
         if self._data_recorder is not None:
-            account = self._accounts.get(agent_id)
             self._data_recorder.record_trade(
                 agent_id=agent_id,
                 action=action,
@@ -214,3 +302,34 @@ class AccountStore:
                 cash_after=account.cash if account else 0.0,
                 latency=latency,
             )
+
+        if self._ledger is not None and account is not None:
+            try:
+                self._ledger.save_fill(
+                    agent_id=agent_id,
+                    account=account,
+                    timestamp=now.isoformat(),
+                    action=action,
+                    product_id=product_id,
+                    quantity=quantity,
+                    price=price,
+                    fee=fee,
+                    cash_after=account.cash,
+                    latency=latency,
+                )
+            except Exception:
+                # The fill already happened in memory; failing the trade because the
+                # disk hiccuped would break the agent mid-session. Flag the divergence
+                # instead (dashboard badge + `manage_bot.py status`), and write the
+                # durable marker only on the transition: it means "disk is behind from
+                # this instant on", so rewriting it on every later failure would move
+                # the timestamp past fills already missing and hammer a broken database.
+                first_failure = not self._ledger_degraded
+                self._ledger_degraded = True
+                if first_failure:
+                    self._mark_ledger_degraded(agent_id, now)
+                log.exception(
+                    "account_store: ledger write FAILED for agent=%s %s %s qty=%s — "
+                    "this fill is in memory only; the ledger is now behind",
+                    agent_id, action, product_id, quantity,
+                )

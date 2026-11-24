@@ -56,6 +56,32 @@ def test_summary_cards_ranked_by_portfolio_value_descending(make_store):
     assert text.find("winner") < text.find("loser")
 
 
+def test_header_flags_a_degraded_ledger(make_store, make_ledger):
+    """Live(screen=True) swallows the traceback, so the header is the operator's only cue."""
+    store = make_store(taker_bps=0)
+    ledger = make_ledger()
+    store.attach_ledger(ledger)
+    ledger.close()  # every later fill fails to persist
+    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.ledger_degraded is True
+
+    text = _render(PortfolioView(store)._build_header())
+
+    assert "LEDGER DEGRADED" in text
+    assert "persistence failing" in text
+    assert "Portfolio Dashboard" in text  # the rest of the header is untouched
+
+
+def test_header_stays_clean_with_a_healthy_ledger(make_store_with_ledger):
+    store = make_store_with_ledger(taker_bps=0)
+    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+
+    text = _render(PortfolioView(store)._build_header())
+
+    assert "DEGRADED" not in text
+    assert "Portfolio Dashboard" in text
+
+
 def test_summary_cards_handle_no_accounts(make_store):
     view = PortfolioView(make_store())
     assert "No accounts yet" in _render(view._build_summary_cards())

@@ -1,6 +1,9 @@
 import argparse
 import asyncio
 import logging
+import sqlite3
+import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 from rich.live import Live
@@ -10,7 +13,10 @@ from exchanges import (
     PRICE_TOPIC,
     TickerMessage,
 )
+from arena.account_store import AccountStore
 from arena.fees import FeeModel
+from arena.ledger import DEFAULT_DB_PATH, Ledger, LedgerInUseError, LedgerSchemaError
+from arena.models import INITIAL_CASH, AgentAccount
 from arena.tools import (
     calculator,
     execute_trade,
@@ -62,7 +68,76 @@ def parse_args():
         default="config.json",
         help="Path to config file (default: config.json).",
     )
+    parser.add_argument(
+        "--db",
+        default=str(DEFAULT_DB_PATH),
+        help=(
+            "SQLite wallet ledger path (default: %(default)s). The ledger is what lets a "
+            "restart keep cash/positions instead of resetting every agent."
+        ),
+    )
+    parser.add_argument(
+        "--no-ledger",
+        action="store_true",
+        help="Disable wallet persistence (volatile wallets; state resets on restart)",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without the Rich Live dashboard, for detached/supervised runs",
+    )
     return parser.parse_args()
+
+
+def describe_wallet(accounts: dict[str, AgentAccount], path: str | Path) -> str:
+    """Startup status block, so an operator can tell a resumed session from a fresh one."""
+    if not accounts:
+        return f"Fresh ledger at {path} — every agent starts at ${INITIAL_CASH:,.0f}"
+
+    lines = [f"Hydrated {len(accounts)} agent(s) from {path}:"]
+    for agent_id, account in sorted(accounts.items()):
+        lines.append(
+            f"  - {agent_id}: ${account.cash:,.2f} cash, "
+            f"{len(account.positions)} open position(s)"
+        )
+    return "\n".join(lines)
+
+
+def open_ledger_or_exit(path: str | Path) -> Ledger:
+    """Open the writer ledger or exit 1 with an actionable message.
+
+    A raw traceback here is unreadable for an operator whose only mistake was
+    starting a second engine (or pointing ``--db`` at the wrong file).
+    """
+    try:
+        return Ledger(path)
+    except LedgerInUseError:
+        print(
+            f"\nERROR: another engine already owns this ledger ({path}).\n"
+            f"  Only one engine may write a ledger at a time.\n"
+            f"  Stop the running engine (manage_bot.py stop), pass --db <other-path> "
+            f"for a separate ledger, or pass --no-ledger to run without persistence."
+        )
+    except (LedgerSchemaError, sqlite3.Error, OSError) as exc:
+        print(
+            f"\nERROR: cannot open the wallet ledger at {path}: {exc}\n"
+            f"  Move the unusable file aside, pass --db <other-path> to use a "
+            f"different ledger, or pass --no-ledger to run without persistence."
+        )
+    sys.exit(1)
+
+
+def clear_degraded_marker_when_serving(worker: Worker, store: AccountStore) -> None:
+    """Clear a stale degraded marker only once this startup has really succeeded.
+
+    ``store.attach_ledger`` hydrates from disk, which proves nothing about the rest of
+    the boot: a refused Kafka bootstrap aborts the process before the first fill, and
+    clearing the marker there would erase the operator's only cross-process record of
+    a past divergence (ADR 0003 promises it is cleared on the next *successful*
+    startup). ``after_startup`` runs with the broker up, so the engine is serving by
+    then — that is the earliest honest point.
+    """
+    worker.after_startup(lambda _ctx: store.mark_ledger_healthy())
 
 
 async def main():
@@ -85,11 +160,24 @@ async def main():
     store.set_fee_model(FeeModel(taker_bps=taker_bps))
     print(f"Trading fee: {taker_bps} bps ({taker_bps / 100:.2f}% taker) applied to every fill")
 
+    # ── Wallet persistence ───────────────────────────────────────
+    # Hydrate before the worker starts serving fills, so a restart resumes the
+    # previous session rather than handing every agent a fresh $100k.
+    ledger = None
+    if args.no_ledger:
+        print("\nWARNING: persistence disabled (--no-ledger) — wallets reset on every restart")
+    else:
+        ledger = open_ledger_or_exit(args.db)
+        store.attach_ledger(ledger)
+        print(f"\n{describe_wallet(store.accounts, ledger.path)}")
+
     print(f"\nConnecting to Kafka broker at {args.bootstrap_servers}...")
     client = Client.connect(args.bootstrap_servers)
 
     tools = [execute_trade, get_portfolio, calculator]
     worker = Worker(client, nodes=tools)
+    if ledger is not None:
+        clear_degraded_marker_when_serving(worker, store)
 
     # ── Tool nodes ───────────────────────────────────────────────
     print("\nRegistering trading tool nodes...")
@@ -111,17 +199,29 @@ async def main():
         store.attach_recorder(recorder)
         print(f"\nCSV recording enabled → {args.data_dir}/ (snapshots every {args.snapshot_interval}s)")
 
-    print("\nStarting portfolio dashboard (prices via Kafka)...")
+    if args.headless:
+        # view.rerender() no-ops without an attached Live, so price callbacks stay cheap.
+        print("\nHeadless mode: live dashboard disabled (logs only)")
+    else:
+        print("\nStarting portfolio dashboard (prices via Kafka)...")
 
     try:
-        with Live(view._build_layout(), auto_refresh=False, screen=True) as live:
-            view.attach_live(live)
+        if args.headless:
             if recorder is not None:
                 recorder.start_snapshot_loop(store, interval=args.snapshot_interval)
             await worker.run()
+        else:
+            with Live(view._build_layout(), auto_refresh=False, screen=True) as live:
+                view.attach_live(live)
+                if recorder is not None:
+                    recorder.start_snapshot_loop(store, interval=args.snapshot_interval)
+                await worker.run()
     finally:
         if recorder is not None:
             await recorder.close()
+        # Close after the recorder so the final CSV snapshot reads coherent state.
+        if ledger is not None:
+            ledger.close()
 
 
 if __name__ == "__main__":

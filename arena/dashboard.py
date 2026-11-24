@@ -144,10 +144,19 @@ class PortfolioView:
 
     def _build_header(self) -> Panel:
         now = datetime.now().strftime("%H:%M:%S")
+        # Rebuilt every frame, so the badge appears the moment a ledger write fails and
+        # clears after a clean restart. It is the only cue an operator inside
+        # Live(screen=True) gets: the traceback scrolls away with the alternate screen.
+        degraded = (
+            "  [bold white on red] LEDGER DEGRADED [/]"
+            " [red]persistence failing — fills diverge from disk; check logs[/]"
+            if self._store.ledger_degraded
+            else ""
+        )
         return Panel(
             Text.from_markup(
                 "[bold cyan]Portfolio Dashboard[/]  [bold red]●[/] "
-                f"[bold green]LIVE[/]  [dim]|  {now}[/]"
+                f"[bold green]LIVE[/]  [dim]|  {now}[/]{degraded}"
             ),
             style="cyan",
             height=3,

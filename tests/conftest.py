@@ -11,11 +11,13 @@ Two opt-in test categories keep the default run fast and dependency-free:
 """
 
 import logging
+from pathlib import Path
 
 import pytest
 
 from arena.account_store import AccountStore
 from arena.fees import FeeModel
+from arena.ledger import Ledger
 from arena.price_book import PriceBook
 
 # ── Canonical test market data ───────────────────────────────────
@@ -112,6 +114,47 @@ def make_store(price_book):
 
     def _make(taker_bps: int = 0) -> AccountStore:
         return AccountStore(price_book, FeeModel(taker_bps=taker_bps))
+
+    return _make
+
+
+@pytest.fixture
+def make_ledger(tmp_path):
+    """Factory for Ledger instances over one shared tmp DB file.
+
+    Every call defaults to the same file, so a second call simulates a process
+    restart (fresh connection, same on-disk state) without ever touching
+    ``data/arena.db``. All instances are closed at teardown.
+    """
+    opened: list[Ledger] = []
+    active: dict[Path, Ledger] = {}
+
+    def _make(path=None) -> Ledger:
+        target = Path(path if path is not None else tmp_path / "arena.db")
+        # A second ledger on the same file models a restart, and a restart means the
+        # previous process let go of its single-writer lock first.
+        previous = active.pop(target, None)
+        if previous is not None:
+            previous.close()
+        ledger = Ledger(target)
+        opened.append(ledger)
+        active[target] = ledger
+        return ledger
+
+    yield _make
+
+    for ledger in opened:
+        ledger.close()
+
+
+@pytest.fixture
+def make_store_with_ledger(make_store, make_ledger):
+    """Factory for an AccountStore already attached to the shared tmp ledger."""
+
+    def _make(taker_bps: int = 0, path=None) -> AccountStore:
+        store = make_store(taker_bps=taker_bps)
+        store.attach_ledger(make_ledger(path))
+        return store
 
     return _make
 

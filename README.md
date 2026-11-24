@@ -226,6 +226,33 @@ For full column descriptions and examples, see [docs/csv-data-recording.md](docs
 
 <br>
 
+## Persistent Wallets & Bot Control
+
+Agent wallets are persisted to a SQLite ledger at `data/arena.db`, so restarting the
+tools & dashboard resumes each agent's cash, positions, and counters instead of
+resetting everyone to `$100k`. `manage_bot.py` wraps the engine lifecycle:
+
+```bash
+uv run python manage_bot.py start backend   # detached engine; log in .run/bot.log
+uv run python manage_bot.py start tui       # foreground dashboard (Ctrl-C to stop)
+uv run python manage_bot.py status          # process state + per-agent wallet rows
+uv run python manage_bot.py stop            # SIGINT → SIGTERM (add --force for SIGKILL)
+```
+
+- **New session:** `manage_bot.py start backend --fresh` archives the current ledger
+  (and its sidecars) to `data/archive/arena-<timestamp>.db` and starts every agent at
+  `$100k` again. It refuses while another engine still holds the ledger. Combined with
+  `--no-ledger` it is a no-op: a volatile run never reads the ledger, so nothing is
+  archived (the CLI prints a note saying so).
+- **Volatile wallets:** add `--no-ledger` to `start` to skip persistence entirely —
+  wallets reset on every restart.
+
+Only one engine can write a given ledger at a time (single-writer lock on
+`<db>.lock`), and `start` refuses to launch a second one. Full flag tables, exit
+codes, and durability notes: [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md).
+
+<br>
+
 ## CLI Reference & Config-Based Deployments
 
 For full CLI flags, config-based deployment options, and the config schema, see [CLI_REFERENCE.md](docs/CLI_REFERENCE.md).

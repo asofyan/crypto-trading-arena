@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -179,3 +180,114 @@ def test_committed_schema_encodes_taker_bps_upper_bound():
     taker = _find_key(schema, "taker_bps")
     assert taker is not None
     assert taker.get("maximum") == MAX_TAKER_BPS
+
+
+# ── Provider extra headers (providers like opencode-go reject requests
+#    without a routing header, e.g. x-opencode-session) ─────────
+
+
+def test_provider_extra_headers_default_empty():
+    assert LLMProviderConfig().extra_headers == {}
+
+
+def test_provider_extra_headers_parsed_from_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "oc_sk_test")
+    path = _write(
+        tmp_path,
+        {
+            "llm_providers": {
+                "opencode-go": {
+                    "api_key": "${OPENCODE_GO_API_KEY}",
+                    "base_url": "https://opencode.ai/inference/go/openai/v1",
+                    "extra_headers": {"x-opencode-session": "arena-test"},
+                }
+            }
+        },
+    )
+    provider = load_config(path).get_provider_config("opencode-go")
+    assert provider.api_key == "oc_sk_test"
+    assert provider.extra_headers == {"x-opencode-session": "arena-test"}
+
+
+def test_provider_extra_headers_resolve_env_vars(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSION_HEADER_VALUE", "from-env")
+    path = _write(
+        tmp_path,
+        {"llm_providers": {"p": {"extra_headers": {"x-session": "${SESSION_HEADER_VALUE}"}}}},
+    )
+    assert load_config(path).get_provider_config("p").extra_headers == {"x-session": "from-env"}
+
+
+def test_committed_schema_documents_extra_headers():
+    schema = json.loads(Path("config.schema.json").read_text())
+    provider = _find_key(schema, "extra_headers")
+    assert provider is not None
+    assert provider.get("type") == "object"
+
+
+# ── Provider extra headers: agent wiring ────────────────────────
+
+
+def test_extra_header_flags_parse_into_mapping(monkeypatch):
+    import deploy.agent as agent_module
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent",
+            "--name", "a",
+            "--strategy", "default",
+            "--model-id", "m",
+            "--bootstrap-servers", "localhost:9092",
+            "--extra-header", "x-opencode-session=arena-a",
+            "--extra-header", "x-trace=1",
+        ],
+    )
+    args = agent_module.parse_args()
+    assert args.extra_headers == {"x-opencode-session": "arena-a", "x-trace": "1"}
+
+
+def test_extra_header_flag_rejects_malformed_pair(monkeypatch):
+    import deploy.agent as agent_module
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent",
+            "--name", "a",
+            "--strategy", "default",
+            "--model-id", "m",
+            "--bootstrap-servers", "localhost:9092",
+            "--extra-header", "no-equals-sign",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        agent_module.parse_args()
+
+
+# ── .env loading ────────────────────────────────────────────────
+# Every entrypoint reads config.json, but only deploy/*.py called load_dotenv.
+# With an env-referenced api_key, the exchange connectors crashed at startup
+# because they resolved ${VAR} against a process env that never saw .env.
+
+
+def test_load_config_honors_dotenv_in_cwd(tmp_path, monkeypatch):
+    monkeypatch.delenv("ARENA_DOTENV_PROBE", raising=False)
+    (tmp_path / ".env").write_text("ARENA_DOTENV_PROBE=from-dotenv\n")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"llm_providers": {"p": {"api_key": "${ARENA_DOTENV_PROBE}"}}})
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert load_config().get_provider_config("p").api_key == "from-dotenv"
+
+
+def test_load_config_env_var_beats_dotenv(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("ARENA_DOTENV_PROBE=from-dotenv\n")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"llm_providers": {"p": {"api_key": "${ARENA_DOTENV_PROBE}"}}})
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARENA_DOTENV_PROBE", "from-process")
+
+    assert load_config().get_provider_config("p").api_key == "from-process"

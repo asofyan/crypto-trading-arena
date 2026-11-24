@@ -78,6 +78,15 @@
           "description": "Default model ID when not overridden by an agent.",
           "title": "Default Model",
           "type": "string"
+        },
+        "extra_headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Extra HTTP headers sent with every inference request. Some providers reject requests without a routing header, e.g. opencode-go requires `x-opencode-session`.",
+          "title": "Extra Headers",
+          "type": "object"
         }
       },
       "title": "LLMProviderConfig",

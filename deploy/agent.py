@@ -39,6 +39,14 @@ from exchanges import AGENT_INPUT_TOPIC
 load_dotenv()
 
 
+def _parse_header_pair(pair: str) -> tuple[str, str]:
+    """Parse a repeatable `--extra-header KEY=VALUE` argument."""
+    key, sep, value = pair.partition("=")
+    if not sep or not key.strip():
+        raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {pair!r}")
+    return key.strip(), value
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Deploy a named Agent for the daytrading arena.",
@@ -73,6 +81,18 @@ def parse_args() -> argparse.Namespace:
         help='Reasoning effort for reasoning models (e.g. "low")',
     )
     parser.add_argument(
+        "--extra-header",
+        dest="extra_header",
+        action="append",
+        default=[],
+        type=_parse_header_pair,
+        metavar="KEY=VALUE",
+        help=(
+            "Extra HTTP header sent with inference requests, repeatable "
+            "(e.g. x-opencode-session=arena-agent)"
+        ),
+    )
+    parser.add_argument(
         "--bootstrap-servers",
         required=True,
         help="Kafka bootstrap servers address",
@@ -88,7 +108,9 @@ def parse_args() -> argparse.Namespace:
         default="config.json",
         help="Path to config file (default: config.json)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.extra_headers = dict(args.extra_header)
+    return args
 
 
 async def main() -> None:
@@ -113,6 +135,7 @@ async def main() -> None:
         if provider_config:
             args.api_key = provider_config.api_key or args.api_key
             args.base_url = provider_config.base_url or args.base_url
+            args.extra_headers.update(provider_config.extra_headers)
             if not args.model_id and provider_config.default_model:
                 args.model_id = provider_config.default_model
         else:
@@ -156,6 +179,7 @@ async def main() -> None:
             base_url=args.base_url,
             api_key=api_key,
             reasoning_effort=args.reasoning_effort,
+            extra_headers=args.extra_headers or None,
         ),
         tools=tools,
     )
@@ -171,6 +195,8 @@ async def main() -> None:
         print(f"  - Base URL: {args.base_url}")
     if args.reasoning_effort:
         print(f"  - Reasoning effort: {args.reasoning_effort}")
+    if args.extra_headers:
+        print(f"  - Extra headers: {', '.join(args.extra_headers)}")
 
     print("\nAgent ready. Waiting for requests...")
     await worker.run()

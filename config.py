@@ -17,6 +17,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from dotenv import find_dotenv, load_dotenv
+
 from arena.fees import DEFAULT_TAKER_BPS, MAX_TAKER_BPS
 
 DEFAULT_CONFIG_PATH = Path("config.json")
@@ -47,6 +49,14 @@ class LLMProviderConfig(BaseModel):
     api_key: str = Field("", description="API key or ${ENV_VAR} reference.")
     base_url: str = Field("", description="Base URL for the provider's API.")
     default_model: str = Field("", description="Default model ID when not overridden by an agent.")
+    extra_headers: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Extra HTTP headers sent with every inference request. Some providers "
+            "reject requests without a routing header, e.g. opencode-go requires "
+            "`x-opencode-session`."
+        ),
+    )
 
 
 class AgentConfig(BaseModel):
@@ -170,6 +180,13 @@ def load_config(config_path: Path | str | None = None) -> ArenaConfig:
         config_path = DEFAULT_CONFIG_PATH
     else:
         config_path = Path(config_path)
+
+    # Every entrypoint reads config.json, but only deploy/*.py used to call
+    # load_dotenv — so an api_key written as ${SOME_VAR} crashed the exchange
+    # connectors at startup. Loading here keeps resolution identical everywhere.
+    # usecwd mirrors how DEFAULT_CONFIG_PATH ("config.json") is resolved: both are
+    # relative to the launch directory. A real process env var still wins.
+    load_dotenv(find_dotenv(usecwd=True))
 
     if not config_path.exists():
         # Return default configuration

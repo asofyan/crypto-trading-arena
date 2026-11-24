@@ -64,6 +64,20 @@ For the full config schema with all fields, types, and defaults, see [`config.sc
 - Environment variable: `"${OPENAI_API_KEY}"` - Reads from env var at runtime
 - Embedded key: `"sk-..."` - Key embedded directly in config (less secure)
 
+**Extra headers:** some providers reject requests that arrive without a routing header
+rather than an OpenAI one. `extra_headers` sends fixed headers with every inference call:
+
+```json
+"opencode-go": {
+  "api_key": "${OPENCODE_GO_API_KEY}",
+  "base_url": "https://opencode.ai/inference/go/openai/v1",
+  "extra_headers": { "x-opencode-session": "crypto-trading-arena" }
+}
+```
+
+opencode-go returns `400 MissingSessionID` without `x-opencode-session`; any stable
+value works. `${ENV_VAR}` references are resolved inside `extra_headers` too.
+
 ---
 
 ## deploy/agent.py
@@ -79,6 +93,7 @@ Deploy an agent with an embedded model client and trading strategy. Can use expl
 | `--base-url` | No | OpenAI | Base URL for OpenAI-compatible providers |
 | `--api-key` | No | `$OPENAI_API_KEY` | API key for the provider |
 | `--reasoning-effort` | No | `None` | For reasoning models (e.g. `"low"`) |
+| `--extra-header` | No | — | Extra HTTP header `KEY=VALUE` sent with inference requests; repeatable, merged over the provider's `extra_headers` |
 | `--from-config` | No | — | Load agent config by name from config file |
 | `--config-path` | No | `config.json` | Path to config file |
 
@@ -198,3 +213,39 @@ uv run python -m deploy.tools_and_dashboard --bootstrap-servers localhost:9092
 uv run python -m deploy.tools_and_dashboard \
     --bootstrap-servers localhost:9092 --config config.binance.json
 ```
+
+---
+
+## deploy/portfolio_monitor.py
+
+Read-only monitor for an arena that is **already running**. The wallets live in the memory
+of the `tools_and_dashboard` process, so a second copy of that entrypoint cannot observe
+them — it would start its own $100k wallet and, because calfkit names consumer groups after
+the node, join the same groups and split the stream into two half-arenas.
+
+This entrypoint takes the indirect route: it replays the newest `trades_*.csv` through the
+same `AccountStore` code that produced it, then marks the rebuilt positions to market from
+`market_data.prices` under its own consumer group (`portfolio-monitor`). Killing it never
+affects trading and never resets a wallet; it also never publishes anything.
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--bootstrap-servers` | No | `localhost:9092` | Kafka broker address |
+| `--data-dir` | No | `./data` | Directory with the arena's `trades_*.csv` |
+| `--config` | No | `config.json` | Config used to resolve `trading.fees.taker_bps` for replay |
+| `--refresh` | No | `2.0` | Seconds between trades-CSV polls |
+| `--once` | No | off | Replay and print one snapshot, then exit (no broker needed) |
+
+**Examples:**
+```bash
+# Live read-only dashboard in a second terminal
+uv run python -m deploy.portfolio_monitor --bootstrap-servers localhost:9092
+
+# One-shot snapshot, broker not required
+uv run python -m deploy.portfolio_monitor --once
+```
+
+If the running arena restarts, it writes a new `trades_*.csv`; the monitor notices the newer
+file and resets to that session's state. Replayed cash is cross-checked against each row's
+`cash_after` — a mismatch means `trading.fees.taker_bps` here differs from the running
+process, and is logged as a warning.

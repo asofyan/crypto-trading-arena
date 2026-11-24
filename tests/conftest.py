@@ -114,3 +114,11 @@ def make_store(price_book):
         return AccountStore(price_book, FeeModel(taker_bps=taker_bps))
 
     return _make
+
+
+@pytest.fixture
+def fee_model_10bps():
+    """Fee model matching the Binance VIP 0 config used in the monitor tests."""
+    from arena.fees import FeeModel
+
+    return FeeModel(taker_bps=10)

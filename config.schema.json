@@ -58,6 +58,21 @@
       "title": "AgentConfig",
       "type": "object"
     },
+    "FeeConfig": {
+      "description": "Trading fee configuration. All simulated fills cross the spread, so only\nthe taker rate is applied. Expressed in basis points (1 bps = 0.01%).\n\nDefault 60 bps matches Coinbase Advanced Trade's base-tier taker rate. Set to\n10 for Binance global (VIP 0), 40 for Kraken Pro, or 0 to disable.",
+      "properties": {
+        "taker_bps": {
+          "default": 60,
+          "description": "Taker fee in basis points (60 bps = 0.60%). 0 disables fees.",
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "Taker Bps",
+          "type": "integer"
+        }
+      },
+      "title": "FeeConfig",
+      "type": "object"
+    },
     "LLMProviderConfig": {
       "description": "Configuration for an LLM provider (must be OpenAI-compatible).",
       "properties": {
@@ -83,7 +98,6 @@
           "additionalProperties": {
             "type": "string"
           },
-          "default": {},
           "description": "Extra HTTP headers sent with every inference request. Some providers reject requests without a routing header, e.g. opencode-go requires `x-opencode-session`.",
           "title": "Extra Headers",
           "type": "object"
@@ -92,9 +106,217 @@
       "title": "LLMProviderConfig",
       "type": "object"
     },
+    "LiveAccountConfig": {
+      "additionalProperties": false,
+      "description": "One Binance Spot account's credentials. Never commit the resolved values.",
+      "properties": {
+        "api_key": {
+          "default": "",
+          "description": "API key or ${ENV_VAR} reference.",
+          "title": "Api Key",
+          "type": "string"
+        },
+        "api_secret": {
+          "default": "",
+          "description": "API secret or ${ENV_VAR} reference.",
+          "title": "Api Secret",
+          "type": "string"
+        },
+        "testnet": {
+          "default": false,
+          "description": "Use testnet.binance.vision instead of the live venue.",
+          "title": "Testnet",
+          "type": "boolean"
+        }
+      },
+      "title": "LiveAccountConfig",
+      "type": "object"
+    },
+    "LiveConfig": {
+      "additionalProperties": false,
+      "description": "Real-money trading: credentials, which agents may trade, and the guardrails.\n\nDefaults are deliberately the paranoid ones: ``dry_run`` on, a 25% per-order cap,\na 10% daily-loss budget and a 2-orders-per-minute ceiling. ``extra=\"forbid\"`` so a\nmisspelled limit fails at startup instead of silently not applying.",
+      "properties": {
+        "_comment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Operator note. Ignored by the engine.",
+          "title": " Comment"
+        },
+        "accounts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/LiveAccountConfig"
+          },
+          "description": "Named venue accounts, referenced by agent_accounts.",
+          "title": "Accounts",
+          "type": "object"
+        },
+        "agent_accounts": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "agent name \u2192 account name. An agent absent here cannot trade live.",
+          "title": "Agent Accounts",
+          "type": "object"
+        },
+        "dry_run": {
+          "default": true,
+          "description": "Journal and validate every order without contacting the venue.",
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "reserve_usdt": {
+          "default": 0.0,
+          "description": "Quote balance never allocated to agents (buffer for fees).",
+          "minimum": 0.0,
+          "title": "Reserve Usdt",
+          "type": "number"
+        },
+        "balance_refresh_seconds": {
+          "default": 30.0,
+          "description": "How often the real balance is re-read for equity sync.",
+          "exclusiveMinimum": 0.0,
+          "title": "Balance Refresh Seconds",
+          "type": "number"
+        },
+        "sync_tolerance_usdt": {
+          "default": 1.0,
+          "description": "Surplus smaller than this is treated as dust, not a deposit.",
+          "minimum": 0.0,
+          "title": "Sync Tolerance Usdt",
+          "type": "number"
+        },
+        "deposit_policy": {
+          "default": "credit_sole_agent",
+          "description": "Where an externally funded surplus is credited.",
+          "enum": [
+            "credit_sole_agent",
+            "proportional",
+            "unallocated"
+          ],
+          "title": "Deposit Policy",
+          "type": "string"
+        },
+        "allow_symbols": {
+          "description": "Symbols this bot may trade live. Empty denies all.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Allow Symbols",
+          "type": "array"
+        },
+        "max_order_pct_of_equity": {
+          "default": 25.0,
+          "description": "Per-order ceiling as a share of equity.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 100.0,
+          "title": "Max Order Pct Of Equity",
+          "type": "number"
+        },
+        "max_position_pct_of_equity": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 50.0,
+          "description": "Per-symbol position ceiling as a share of equity; null disables.",
+          "title": "Max Position Pct Of Equity"
+        },
+        "max_order_notional_usdt": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional absolute per-order ceiling (fat-finger backstop).",
+          "title": "Max Order Notional Usdt"
+        },
+        "max_daily_loss_pct": {
+          "default": 10.0,
+          "description": "Halt when session P&L falls this far below equity.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 100.0,
+          "title": "Max Daily Loss Pct",
+          "type": "number"
+        },
+        "max_orders_per_minute": {
+          "default": 2,
+          "description": "Trading intent ceiling; also protects the venue rate limit.",
+          "minimum": 1,
+          "title": "Max Orders Per Minute",
+          "type": "integer"
+        },
+        "max_price_age_seconds": {
+          "default": 5.0,
+          "description": "Refuse to trade on a quote older than this.",
+          "exclusiveMinimum": 0.0,
+          "title": "Max Price Age Seconds",
+          "type": "number"
+        },
+        "max_price_slippage_bps": {
+          "default": 50,
+          "description": "Cash headroom reserved for the venue filling above the quoted touch.",
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "Max Price Slippage Bps",
+          "type": "integer"
+        },
+        "recv_window_ms": {
+          "default": 5000,
+          "description": "Binance recvWindow for signed requests.",
+          "maximum": 60000,
+          "minimum": 1000,
+          "title": "Recv Window Ms",
+          "type": "integer"
+        }
+      },
+      "title": "LiveConfig",
+      "type": "object"
+    },
+    "PaperConfig": {
+      "description": "How paper fills are priced.\n\n``venue`` snaps every quantity to the cached ``exchangeInfo`` rules (step size,\nminimum notional), so a paper run rehearses exactly what the venue will accept and\na rejection in paper is a rejection live. ``simple`` keeps the legacy one-decimal\nrule for deployments with no venue data (Coinbase products, offline runs).",
+      "properties": {
+        "instrument_rules": {
+          "default": "venue",
+          "description": "venue = enforce cached exchangeInfo rules; simple = legacy 1-decimal rule.",
+          "enum": [
+            "venue",
+            "simple"
+          ],
+          "title": "Instrument Rules",
+          "type": "string"
+        }
+      },
+      "title": "PaperConfig",
+      "type": "object"
+    },
     "TradingConfig": {
       "description": "Trading-related configuration.",
       "properties": {
+        "mode": {
+          "default": "paper",
+          "description": "paper = simulated fills against the price book; live = real orders on the venue (see trading.live). Defaults to paper: approving live trading is a deliberate config change, never an accident.",
+          "enum": [
+            "paper",
+            "live"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
         "exchange": {
           "default": "coinbase",
           "description": "Which exchange connector to use for market data.",
@@ -121,26 +343,26 @@
           "title": "Coinbase Products",
           "type": "array"
         },
+        "instrument_cache": {
+          "default": "data/instruments-binance.json",
+          "description": "Cached exchangeInfo rules that quantities are snapped to. Refresh with `uv run python -m arena.instruments --refresh`.",
+          "title": "Instrument Cache",
+          "type": "string"
+        },
+        "paper": {
+          "$ref": "#/$defs/PaperConfig",
+          "description": "Paper-mode fill rules."
+        },
+        "live": {
+          "$ref": "#/$defs/LiveConfig",
+          "description": "Real-money trading configuration."
+        },
         "fees": {
           "$ref": "#/$defs/FeeConfig",
           "description": "Trading fees applied to every simulated fill."
         }
       },
       "title": "TradingConfig",
-      "type": "object"
-    },
-    "FeeConfig": {
-      "description": "Trading fee configuration. Only the taker rate applies because all simulated fills cross the spread.",
-      "properties": {
-        "taker_bps": {
-          "default": 60,
-          "description": "Taker fee in basis points (60 bps = 0.60%). 0 disables fees.",
-          "minimum": 0,
-          "title": "Taker Bps",
-          "type": "integer"
-        }
-      },
-      "title": "FeeConfig",
       "type": "object"
     }
   },

@@ -74,7 +74,7 @@ def _fill(
 
 def test_module_constants():
     assert DEFAULT_DB_PATH == Path("data/arena.db")
-    assert SCHEMA_VERSION == 1
+    assert SCHEMA_VERSION == 2
     assert RECENT_FILLS_LIMIT == 50
     assert issubclass(LedgerSchemaError, RuntimeError)
 

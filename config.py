@@ -15,7 +15,7 @@ from typing import Any
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -88,9 +88,133 @@ class FeeConfig(BaseModel):
     )
 
 
+class PaperConfig(BaseModel):
+    """How paper fills are priced.
+
+    ``venue`` snaps every quantity to the cached ``exchangeInfo`` rules (step size,
+    minimum notional), so a paper run rehearses exactly what the venue will accept and
+    a rejection in paper is a rejection live. ``simple`` keeps the legacy one-decimal
+    rule for deployments with no venue data (Coinbase products, offline runs).
+    """
+
+    instrument_rules: Literal["venue", "simple"] = Field(
+        "venue",
+        description="venue = enforce cached exchangeInfo rules; simple = legacy 1-decimal rule.",
+    )
+
+
+class LiveAccountConfig(BaseModel):
+    """One Binance Spot account's credentials. Never commit the resolved values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: str = Field("", description="API key or ${ENV_VAR} reference.")
+    api_secret: str = Field("", description="API secret or ${ENV_VAR} reference.")
+    testnet: bool = Field(
+        False, description="Use testnet.binance.vision instead of the live venue."
+    )
+
+
+class LiveConfig(BaseModel):
+    """Real-money trading: credentials, which agents may trade, and the guardrails.
+
+    Defaults are deliberately the paranoid ones: ``dry_run`` on, a 25% per-order cap,
+    a 10% daily-loss budget and a 2-orders-per-minute ceiling. ``extra="forbid"`` so a
+    misspelled limit fails at startup instead of silently not applying.
+    """
+
+    # extra="forbid" catches a misspelled limit; the `_comment` alias keeps the
+    # example config's explanatory key (a repo-wide convention) legal.
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    comment: str | None = Field(
+        None, alias="_comment", description="Operator note. Ignored by the engine."
+    )
+    accounts: dict[str, LiveAccountConfig] = Field(
+        default_factory=dict, description="Named venue accounts, referenced by agent_accounts."
+    )
+    agent_accounts: dict[str, str] = Field(
+        default_factory=dict,
+        description="agent name → account name. An agent absent here cannot trade live.",
+    )
+    dry_run: bool = Field(
+        True,
+        description="Journal and validate every order without contacting the venue.",
+    )
+    reserve_usdt: float = Field(
+        0.0, ge=0, description="Quote balance never allocated to agents (buffer for fees)."
+    )
+    balance_refresh_seconds: float = Field(
+        30.0, gt=0, description="How often the real balance is re-read for equity sync."
+    )
+    sync_tolerance_usdt: float = Field(
+        1.0, ge=0, description="Surplus smaller than this is treated as dust, not a deposit."
+    )
+    deposit_policy: Literal["credit_sole_agent", "proportional", "unallocated"] = Field(
+        "credit_sole_agent",
+        description="Where an externally funded surplus is credited.",
+    )
+    allow_symbols: list[str] = Field(
+        default_factory=list, description="Symbols this bot may trade live. Empty denies all."
+    )
+    max_order_pct_of_equity: float = Field(
+        25.0, gt=0, le=100, description="Per-order ceiling as a share of equity."
+    )
+    max_position_pct_of_equity: float | None = Field(
+        50.0, description="Per-symbol position ceiling as a share of equity; null disables."
+    )
+    max_order_notional_usdt: float | None = Field(
+        None, description="Optional absolute per-order ceiling (fat-finger backstop)."
+    )
+    max_daily_loss_pct: float = Field(
+        10.0, gt=0, le=100, description="Halt when session P&L falls this far below equity."
+    )
+    max_orders_per_minute: int = Field(
+        2, ge=1, description="Trading intent ceiling; also protects the venue rate limit."
+    )
+    max_price_age_seconds: float = Field(
+        5.0, gt=0, description="Refuse to trade on a quote older than this."
+    )
+    max_price_slippage_bps: int = Field(
+        50,
+        ge=0,
+        le=1000,
+        description="Cash headroom reserved for the venue filling above the quoted touch.",
+    )
+    recv_window_ms: int = Field(
+        5000, ge=1000, le=60000, description="Binance recvWindow for signed requests."
+    )
+
+    @model_validator(mode="after")
+    def _check_limits_and_wiring(self) -> LiveConfig:
+        if (
+            self.max_position_pct_of_equity is not None
+            and self.max_order_pct_of_equity > self.max_position_pct_of_equity
+        ):
+            raise ValueError(
+                "max_order_pct_of_equity must not exceed max_position_pct_of_equity "
+                "(a cap that a single order can breach is not a cap)"
+            )
+        for agent, account in self.agent_accounts.items():
+            if account not in self.accounts:
+                raise ValueError(
+                    f"agent_accounts[{agent!r}] names account {account!r}, which is not "
+                    f"defined in live.accounts ({', '.join(sorted(self.accounts)) or 'none'})"
+                )
+        return self
+
+
 class TradingConfig(BaseModel):
     """Trading-related configuration."""
 
+    mode: Literal["paper", "live"] = Field(
+        "paper",
+        description=(
+            "paper = simulated fills against the price book; live = real orders on the "
+            "venue (see trading.live). Defaults to paper: approving live trading is a "
+            "deliberate config change, never an accident."
+        ),
+    )
     exchange: Literal["coinbase", "binance"] = Field(
         "coinbase", description="Which exchange connector to use for market data."
     )
@@ -101,6 +225,19 @@ class TradingConfig(BaseModel):
     coinbase_products: list[str] = Field(
         default_factory=lambda: DEFAULT_COINBASE_PRODUCTS.copy(),
         description="Coinbase product IDs to subscribe to.",
+    )
+    instrument_cache: str = Field(
+        "data/instruments-binance.json",
+        description=(
+            "Cached exchangeInfo rules that quantities are snapped to. Refresh with "
+            "`uv run python -m arena.instruments --refresh`."
+        ),
+    )
+    paper: PaperConfig = Field(
+        default_factory=PaperConfig, description="Paper-mode fill rules."
+    )
+    live: LiveConfig = Field(
+        default_factory=LiveConfig, description="Real-money trading configuration."
     )
     fees: FeeConfig = Field(
         default_factory=FeeConfig,
@@ -123,6 +260,48 @@ class ArenaConfig(BaseModel):
         default_factory=TradingConfig,
         description="Exchange connector and trading pair configuration.",
     )
+
+    @model_validator(mode="after")
+    def _check_live_mode(self) -> ArenaConfig:
+        live = self.trading.live
+        if self.trading.mode != "live":
+            return self
+        if not live.accounts:
+            raise ValueError("trading.mode is 'live' but trading.live.accounts is empty")
+        if not live.agent_accounts:
+            raise ValueError(
+                "trading.mode is 'live' but trading.live.agent_accounts is empty — no "
+                "agent would be allowed to trade"
+            )
+        for name, account in live.accounts.items():
+            missing = [
+                field
+                for field, value in (("api_key", account.api_key), ("api_secret", account.api_secret))
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    f"trading.live.accounts[{name!r}] is missing {', '.join(missing)} "
+                    "(use ${ENV_VAR} references, never literal secrets)"
+                )
+        if not live.allow_symbols:
+            raise ValueError(
+                "trading.mode is 'live' but trading.live.allow_symbols is empty — every "
+                "order would be denied"
+            )
+        configured = sorted(set(live.agent_accounts.values()))
+        if len(configured) > 1:
+            raise ValueError(
+                f"live trading with more than one account ({', '.join(configured)}) is not "
+                "supported yet; map the agents you want to trade to a single account"
+            )
+        known = {agent.name for agent in self.agents}
+        unknown = sorted(set(live.agent_accounts) - known)
+        if unknown:
+            raise ValueError(
+                f"live.agent_accounts names agent(s) not in agents[]: {', '.join(unknown)}"
+            )
+        return self
 
     def get_provider_config(self, provider_name: str) -> LLMProviderConfig | None:
         """Get configuration for a specific provider."""

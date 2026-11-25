@@ -257,25 +257,18 @@ def test_get_or_create_is_idempotent_and_per_agent(make_store):
     assert a1 is not b
 
 
-# ── Confirmed bugs (strict xfail — assert CORRECT behavior) ───────
+# ── Quantity edge cases (previously findings B2/B5/B6, fixed) ──
 
 
-@pytest.mark.xfail(
-    reason="B2: qty in (0,1e-9] rounds to 0.0 and crashes on a fresh position",
-    raises=ZeroDivisionError,
-    strict=True,
-)
 def test_subrounding_quantity_rejected(make_store):
+    """B2: a quantity that rounds to zero must be rejected, not crash or phantom-fill."""
     store = make_store(taker_bps=0)
     result = store.execute_trade("a", "BTC-USD", 1e-10, "buy")
-    assert not result.success  # should be rejected, not crash or phantom-fill
+    assert not result.success
 
 
-@pytest.mark.xfail(
-    reason="B5: NaN quantity bypasses all guards and poisons the account",
-    strict=True,
-)
 def test_nan_quantity_rejected(make_store):
+    """B5: NaN used to bypass every guard and poison cash/positions."""
     import math
 
     store = make_store(taker_bps=0)
@@ -286,16 +279,14 @@ def test_nan_quantity_rejected(make_store):
     assert acct.positions == {}
 
 
-@pytest.mark.xfail(
-    reason="B6: float drift in accumulated position blocks a legitimate full sell",
-    strict=True,
-)
 def test_full_position_sell_after_fractional_buys(make_store):
+    """B6: float drift (0.1+0.1+0.7) must not block the closing sell."""
     store = make_store(taker_bps=0)
     for qty in (0.1, 0.1, 0.7):
         assert store.execute_trade("a", "SOL-USD", qty, "buy").success
     result = store.execute_trade("a", "SOL-USD", 0.9, "sell")
     assert result.success, result.message
+    assert store.get_or_create("a").positions == {}
 
 
 # ── Ledger persistence (wallet survives a restart) ───────────────

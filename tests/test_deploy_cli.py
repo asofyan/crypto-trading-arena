@@ -189,3 +189,81 @@ def test_degraded_marker_survives_a_startup_that_never_serves(make_store, make_l
 
     worker.go_live()  # the broker is up: this startup really succeeded
     assert ledger.degraded_marker() is None
+
+
+# ── Instrument rules resolution (venue-accurate paper fills) ────
+
+
+_SOLUSDT_INFO = {
+    "symbols": [
+        {
+            "symbol": "SOLUSDT",
+            "status": "TRADING",
+            "baseAsset": "SOL",
+            "quoteAsset": "USDT",
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.00100000", "minQty": "0.00100000"},
+                {
+                    "filterType": "NOTIONAL",
+                    "minNotional": "5.00000000",
+                    "applyMinToMarket": True,
+                },
+            ],
+        }
+    ]
+}
+
+
+def _cached_rules(tmp_path) -> str:
+    from arena.instruments import parse_exchange_info, save_cache
+
+    path = tmp_path / "instruments.json"
+    save_cache(parse_exchange_info(_SOLUSDT_INFO), path)
+    return str(path)
+
+
+def test_resolve_instrument_rules_keeps_only_subscribed_symbols(tmp_path):
+    from config import TradingConfig
+
+    trading = TradingConfig.model_validate(
+        {
+            "exchange": "binance",
+            "binance_symbols": ["SOLUSDT", "XRPUSDT"],
+            "instrument_cache": _cached_rules(tmp_path),
+        }
+    )
+
+    rules, summary = deploy_cli.resolve_instrument_rules(trading)
+
+    assert set(rules) == {"SOLUSDT"}
+    assert "1/2" in summary
+    assert "uncached: XRPUSDT" in summary
+
+
+def test_resolve_instrument_rules_simple_mode_ignores_the_cache(tmp_path):
+    from config import TradingConfig
+
+    trading = TradingConfig.model_validate(
+        {
+            "paper": {"instrument_rules": "simple"},
+            "instrument_cache": _cached_rules(tmp_path),
+        }
+    )
+
+    rules, summary = deploy_cli.resolve_instrument_rules(trading)
+
+    assert rules == {}
+    assert summary.startswith("simple")
+
+
+def test_resolve_instrument_rules_missing_cache_tells_the_operator_how_to_fix_it(tmp_path):
+    from config import TradingConfig
+
+    trading = TradingConfig.model_validate(
+        {"instrument_cache": str(tmp_path / "absent.json"), "exchange": "binance"}
+    )
+
+    rules, summary = deploy_cli.resolve_instrument_rules(trading)
+
+    assert rules == {}
+    assert "arena.instruments --refresh" in summary

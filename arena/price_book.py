@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -30,6 +31,10 @@ class PriceBook:
             "last_size": data.get("last_size", "0"),
             "volume_24h": data.get("volume_24h", "0"),
             "time": data.get("time", ""),
+            # Local receipt time, not the venue's clock: a live order must be able to
+            # ask "how old is this quote *here*", and a stalled consumer is exactly
+            # the failure the venue timestamp cannot reveal.
+            "_received_at": time.time(),
         }
         log.debug(
             "price_book.update: %s price=%s bid=%s ask=%s",

@@ -32,6 +32,7 @@
   ],
   "trading": {
     "exchange": "coinbase",
+    "mode": "paper",
     "binance_symbols": [
       "SOLUSDT",
       "XRPUSDT",
@@ -42,6 +43,38 @@
       "SOL-USD",
       "FARTCOIN-USD"
     ],
+    "instrument_cache": "data/instruments-binance.json",
+    "paper": {
+      "_comment": "venue = paper fills obey cached exchangeInfo rules (step size, min notional), so paper rejects what Binance rejects. simple = legacy 1-decimal rule. Refresh the cache with: uv run python -m arena.instruments --refresh",
+      "instrument_rules": "venue"
+    },
+    "live": {
+      "_comment": "Nothing here is used while trading.mode is 'paper'. Setting mode to 'live' requires accounts, agent_accounts and allow_symbols, and fails at startup otherwise. Keep dry_run true until you have watched a full session in the journal. Secrets: use ${ENV_VAR} references, never literals.",
+      "accounts": {
+        "main": {
+          "api_key": "${BINANCE_API_KEY}",
+          "api_secret": "${BINANCE_API_SECRET}",
+          "testnet": false
+        }
+      },
+      "agent_accounts": {},
+      "dry_run": true,
+      "reserve_usdt": 5.0,
+      "balance_refresh_seconds": 30.0,
+      "sync_tolerance_usdt": 1.0,
+      "deposit_policy": "credit_sole_agent",
+      "allow_symbols": [
+        "SOLUSDT"
+      ],
+      "max_order_pct_of_equity": 25.0,
+      "max_position_pct_of_equity": 50.0,
+      "max_order_notional_usdt": 25.0,
+      "max_daily_loss_pct": 10.0,
+      "max_orders_per_minute": 2,
+      "max_price_age_seconds": 5.0,
+      "max_price_slippage_bps": 50,
+      "recv_window_ms": 5000
+    },
     "fees": {
       "_comment": "Taker fee in basis points (1 bps = 0.01%). 60 = Coinbase Advanced Trade base tier. Set to 10 for Binance global VIP 0, or 0 to disable.",
       "taker_bps": 60

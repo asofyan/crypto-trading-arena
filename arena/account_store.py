@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
+from arena.execution import Executor, FillRequest, PaperExecutor
 from arena.fees import FeeModel
+from arena.instruments import SymbolRules
 from arena.ledger import Ledger
 from arena.models import AgentAccount, TradeLogEntry, TradeRecorder, TradeResult
 from arena.price_book import PriceBook
 
 log = logging.getLogger(__name__)
+
+# A closed position must vanish even when float subtraction leaves dust
+# (0.1+0.1+0.7−0.9 = 1.1e−16), and venue steps go far finer than the old 1-decimal
+# rounding. Smaller than any venue's minimum step, so no real quantity is swallowed.
+_QTY_EPSILON = 1e-9
 
 
 class AccountStore:
@@ -31,7 +38,16 @@ class AccountStore:
         self._ledger = ledger
         # One fill at a time: tool calls arrive from worker threads, and the
         # read-modify-write below plus ledger.save_fill must see a settled state.
-        self._write_lock = threading.Lock()
+        # Re-entrant because an executor holds it across "validate, then apply_fill"
+        # (the nested acquire in apply_fill is a no-op on the same thread).
+        self._write_lock = threading.RLock()
+        # Default fill source: simulate against the price book. A live run swaps this
+        # at startup (set_executor), so every caller keeps using execute_trade.
+        self._executor: Executor = PaperExecutor(self)
+        # Per-symbol venue rules (see arena.instruments). Empty means "no venue data":
+        # every symbol keeps the coarse 1-decimal paper rule, which is what keeps the
+        # unit suite and a Coinbase/offline deployment working unchanged.
+        self._instrument_rules: dict[str, SymbolRules] = {}
         # Set when a ledger write fails: the fill still counted in memory, so the
         # disk is now behind. Surfaced by PortfolioView's header badge and by the
         # durable meta row that `manage_bot.py status` reads from another process.
@@ -101,6 +117,15 @@ class AccountStore:
         self._fee_model = fee_model
 
     @property
+    def instrument_rules(self) -> dict[str, SymbolRules]:
+        """Venue rules per product id; a symbol absent here trades on the legacy rule."""
+        return self._instrument_rules
+
+    def set_instrument_rules(self, rules: dict[str, SymbolRules]) -> None:
+        """Install venue rules at startup, before the first fill can arrive."""
+        self._instrument_rules = dict(rules)
+
+    @property
     def fee_model(self) -> FeeModel:
         return self._fee_model
 
@@ -122,6 +147,21 @@ class AccountStore:
     def trade_log(self) -> list[TradeLogEntry]:
         return self._trade_log
 
+    # ── Execution seam ───────────────────────────────────────────
+
+    @property
+    def write_lock(self) -> threading.RLock:
+        """Held across any read-modify-write of an account; executors take it too."""
+        return self._write_lock
+
+    @property
+    def executor(self) -> Executor:
+        return self._executor
+
+    def set_executor(self, executor: Executor) -> None:
+        """Install the fill source. Paper by default; a live run swaps it at startup."""
+        self._executor = executor
+
     def execute_trade(
         self,
         agent_id: str,
@@ -130,63 +170,93 @@ class AccountStore:
         action: str,
         latency: float | None = None,
     ) -> TradeResult:
-        """Execute one fill, serialised so overlapping tool calls cannot interleave."""
-        with self._write_lock:
-            return self._execute_trade_locked(agent_id, product_id, quantity, action, latency)
+        """Route one trade intent through the active executor."""
+        return self._executor.execute(
+            FillRequest(agent_id, product_id, quantity, action, latency)
+        )
 
-    def _execute_trade_locked(
+    def apply_fill(
         self,
         agent_id: str,
+        action: str,
         product_id: str,
         quantity: float,
-        action: str,
+        price: float,
+        fee: float,
         latency: float | None = None,
+        fee_bps: int | None = None,
+        client_order_id: str | None = None,
+        fee_asset: str | None = None,
+        venue_order_id: str | None = None,
+    ) -> TradeResult:
+        """Book one already-priced fill: cash, cost basis, P&L, trade log, ledger.
+
+        The account's own constraints still decide whether the fill may be booked
+        (cash on a buy, holdings on a sell) — the executor already decided *what*
+        filled and at what price. ``fee_bps`` only shapes the confirmation text:
+        paper passes the configured rate, a live fill passes the rate implied by the
+        venue's commission (or ``None`` when it cannot be stated cleanly).
+
+        ``client_order_id`` switches persistence from "append a fill" to "settle this
+        journal entry", which is what makes a post-crash replay a no-op: the check runs
+        *before* the in-memory account moves, so memory and disk cannot disagree.
+        """
+        with self._write_lock:
+            return self._apply_fill_locked(
+                agent_id, action, product_id, quantity, price, fee, latency, fee_bps,
+                client_order_id, fee_asset, venue_order_id,
+            )
+
+    def _apply_fill_locked(
+        self,
+        agent_id: str,
+        action: str,
+        product_id: str,
+        quantity: float,
+        price: float,
+        fee: float,
+        latency: float | None = None,
+        fee_bps: int | None = None,
+        client_order_id: str | None = None,
+        fee_asset: str | None = None,
+        venue_order_id: str | None = None,
     ) -> TradeResult:
         product_id = product_id.upper().strip()
         action = action.lower().strip()
+
+        if (
+            client_order_id is not None
+            and self._ledger is not None
+            and self._ledger.has_fill(client_order_id)
+        ):
+            log.warning(
+                "account_store.apply_fill: %s is already booked; ignoring replay",
+                client_order_id,
+            )
+            return TradeResult(
+                False, f"Order {client_order_id} was already booked; nothing to do."
+            )
         log.debug(
-            "account_store.execute_trade ENTER: agent=%s action=%s product=%s qty=%s",
-            agent_id, action, product_id, quantity,
+            "account_store.apply_fill ENTER: agent=%s action=%s product=%s qty=%s "
+            "price=%s fee=%s",
+            agent_id, action, product_id, quantity, price, fee,
         )
 
         if action not in ("buy", "sell"):
-            log.debug("account_store.execute_trade REJECT: invalid action=%s", action)
+            log.debug("account_store.apply_fill REJECT: invalid action=%s", action)
             return TradeResult(False, f"Invalid action '{action}'. Must be 'buy' or 'sell'.")
 
-        entry = self._price_book.get(product_id)
-        if entry is None:
-            available = ", ".join(sorted(self._price_book.snapshot().keys()))
-            log.debug(
-                "account_store.execute_trade REJECT: no price for %s (available: %s)",
-                product_id, available,
-            )
-            return TradeResult(
-                False,
-                f"No live price for '{product_id}'. "
-                f"Available: {available or 'none (waiting for price data)'}",
-            )
-
-        if quantity <= 0:
-            log.debug("account_store.execute_trade REJECT: non-positive qty=%s", quantity)
-            return TradeResult(False, "Quantity must be positive.")
-
-        rounded = round(quantity, 1)
-        if abs(quantity - rounded) > 1e-9:
-            log.debug("account_store.execute_trade REJECT: qty precision qty=%s", quantity)
-            return TradeResult(
-                False, "Quantity must have at most 1 decimal place (e.g., 0.5, 1.2)."
-            )
-        quantity = rounded
-
         account = self.get_or_create(agent_id)
+        # Only the confirmation text needs the rate: a live fill's commission may not
+        # reduce to a clean bps figure (base-asset or BNB-denominated fees).
+        fee_rate = f" @ {fee_bps} bps" if fee_bps is not None else ""
 
         if action == "buy":
-            price = float(entry["best_ask"])
             notional = price * quantity
-            cash_out, fee = self._fee_model.buy_cost(notional)
+            cash_out = notional + fee
             if cash_out > account.cash:
                 log.debug(
-                    "account_store.execute_trade REJECT: insufficient cash "
+                    "account_store.apply_fill REJECT: insufficient cash "
                     "need=%.2f (incl fee=%.2f) have=%.2f agent=%s",
                     cash_out, fee, account.cash, agent_id,
                 )
@@ -208,9 +278,12 @@ class AccountStore:
             account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) + cash_out
             account.total_fees_paid += fee
             account.trade_count += 1
-            self._record_trade(agent_id, action, product_id, quantity, price, fee, latency)
+            self._record_trade(
+                agent_id, action, product_id, quantity, price, fee, latency,
+                client_order_id, fee_asset, venue_order_id,
+            )
             log.debug(
-                "account_store.execute_trade BUY OK: agent=%s %s %s @ $%.2f "
+                "account_store.apply_fill BUY OK: agent=%s %s %s @ $%.2f "
                 "notional=$%.2f fee=$%.2f cash_after=$%.2f positions=%s trade_count=%d",
                 agent_id, quantity, product_id, price,
                 notional, fee, account.cash, dict(account.positions), account.trade_count,
@@ -218,16 +291,18 @@ class AccountStore:
             return TradeResult(
                 True,
                 f"Bought {quantity} {product_id} @ ${price:,.2f} for ${cash_out:,.2f} "
-                f"(${notional:,.2f} + ${fee:,.2f} fee @ {self._fee_model.taker_bps} bps). "
+                f"(${notional:,.2f} + ${fee:,.2f} fee{fee_rate}). "
                 f"Cash remaining: ${account.cash:,.2f}.",
             )
 
         # sell
-        price = float(entry["best_bid"])
         held = account.positions.get(product_id, 0)
-        if quantity > held:
+        # Tolerance, not equality: accumulating 0.1+0.1+0.7 leaves the position a hair
+        # under 0.9, and refusing the closing sell would strand the agent in a position
+        # it asked to exit.
+        if quantity > held + _QTY_EPSILON:
             log.debug(
-                "account_store.execute_trade REJECT: insufficient holdings "
+                "account_store.apply_fill REJECT: insufficient holdings "
                 "want=%s held=%s product=%s agent=%s",
                 quantity, held, product_id, agent_id,
             )
@@ -237,7 +312,7 @@ class AccountStore:
                 f"but only hold {held}.",
             )
         notional = price * quantity
-        cash_in, fee = self._fee_model.sell_proceeds(notional)
+        cash_in = notional - fee
         account.cash += cash_in
         # Reduce cost basis proportionally (average cost method). avg_cost includes
         # the capitalized buy fee, so realized P&L nets both the entry and exit fees:
@@ -248,17 +323,20 @@ class AccountStore:
         account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) - (
             avg_cost * quantity
         )
-        new_qty = round(held - quantity, 1)
-        if new_qty <= 0:
+        new_qty = held - quantity
+        if new_qty <= _QTY_EPSILON:
             del account.positions[product_id]
             del account.cost_basis[product_id]
             account.avg_entry_ts.pop(product_id, None)
         else:
             account.positions[product_id] = new_qty
         account.trade_count += 1
-        self._record_trade(agent_id, action, product_id, quantity, price, fee, latency)
+        self._record_trade(
+            agent_id, action, product_id, quantity, price, fee, latency,
+            client_order_id, fee_asset, venue_order_id,
+        )
         log.debug(
-            "account_store.execute_trade SELL OK: agent=%s %s %s @ $%.2f "
+            "account_store.apply_fill SELL OK: agent=%s %s %s @ $%.2f "
             "notional=$%.2f fee=$%.2f cash_after=$%.2f positions=%s trade_count=%d",
             agent_id, quantity, product_id, price,
             notional, fee, account.cash, dict(account.positions), account.trade_count,
@@ -266,7 +344,7 @@ class AccountStore:
         return TradeResult(
             True,
             f"Sold {quantity} {product_id} @ ${price:,.2f} for ${cash_in:,.2f} "
-            f"(${notional:,.2f} − ${fee:,.2f} fee @ {self._fee_model.taker_bps} bps). "
+            f"(${notional:,.2f} − ${fee:,.2f} fee{fee_rate}). "
             f"Cash remaining: ${account.cash:,.2f}.",
         )
 
@@ -279,6 +357,9 @@ class AccountStore:
         price: float,
         fee: float,
         latency: float | None = None,
+        client_order_id: str | None = None,
+        fee_asset: str | None = None,
+        venue_order_id: str | None = None,
     ) -> None:
         now = datetime.now()
         self._trade_log.append(
@@ -304,19 +385,41 @@ class AccountStore:
             )
 
         if self._ledger is not None and account is not None:
+            stamp = datetime.now(timezone.utc).isoformat()
             try:
-                self._ledger.save_fill(
-                    agent_id=agent_id,
-                    account=account,
-                    timestamp=now.isoformat(),
-                    action=action,
-                    product_id=product_id,
-                    quantity=quantity,
-                    price=price,
-                    fee=fee,
-                    cash_after=account.cash,
-                    latency=latency,
-                )
+                if client_order_id is None:
+                    self._ledger.save_fill(
+                        agent_id=agent_id,
+                        account=account,
+                        timestamp=stamp,
+                        action=action,
+                        product_id=product_id,
+                        quantity=quantity,
+                        price=price,
+                        fee=fee,
+                        cash_after=account.cash,
+                        latency=latency,
+                    )
+                else:
+                    # A venue fill closes its own journal row in the same transaction,
+                    # so "booked" and "journal closed" can never disagree.
+                    self._ledger.settle_fill(
+                        client_order_id=client_order_id,
+                        agent_id=agent_id,
+                        account=account,
+                        timestamp=stamp,
+                        action=action,
+                        product_id=product_id,
+                        quantity=quantity,
+                        price=price,
+                        fee=fee,
+                        fee_asset=fee_asset,
+                        cash_after=account.cash,
+                        latency=latency,
+                        venue_order_id=venue_order_id,
+                        executed_qty=quantity,
+                        cum_notional=quantity * price,
+                    )
             except Exception:
                 # The fill already happened in memory; failing the trade because the
                 # disk hiccuped would break the agent mid-session. Flag the divergence

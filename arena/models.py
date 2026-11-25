@@ -67,6 +67,35 @@ class TradeLogEntry(typing.NamedTuple):
     latency: float | None
 
 
+# ── Order journal ────────────────────────────────────────────────
+
+
+class OrderRecord(typing.NamedTuple):
+    """One row of the live order journal (``orders`` table).
+
+    Written before the venue is contacted and closed after it answers, so a crash at
+    any point leaves a record the next startup can resolve by ``client_order_id``.
+    """
+
+    client_order_id: str
+    ts: str
+    agent_id: str
+    account: str
+    symbol: str
+    side: str
+    qty_requested: float | None
+    quote_qty_requested: float | None
+    state: str
+    venue_order_id: str | None
+    executed_qty: float | None
+    cum_notional: float | None
+    fee: float | None
+    fee_asset: str | None
+    price: float | None
+    error: str | None
+    updated_at: str
+
+
 # ── Trade recorder protocol ──────────────────────────────────────
 
 

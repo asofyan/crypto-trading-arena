@@ -14,7 +14,9 @@ from exchanges import (
     TickerMessage,
 )
 from arena.account_store import AccountStore
+from arena.execution import LiveBinanceExecutor
 from arena.fees import FeeModel
+from arena.instruments import SymbolRules, load_cache, parse_exchange_info
 from arena.ledger import DEFAULT_DB_PATH, Ledger, LedgerInUseError, LedgerSchemaError
 from arena.models import INITIAL_CASH, AgentAccount
 from arena.tools import (
@@ -25,7 +27,13 @@ from arena.tools import (
     store,
     view,
 )
-from config import load_config_strict
+from arena.risk import DEFAULT_HALT_PATH, LiveLimits, RiskGates
+from config import TradingConfig, load_config_strict
+from exchanges.binance_spot import (
+    BINANCE_SPOT_REST,
+    BINANCE_SPOT_TESTNET_REST,
+    BinanceSpotClient,
+)
 
 # Tools & Price Feed — Deploys trading tool workers and subscribes
 # to the Kafka price topic published by the connector.
@@ -89,6 +97,92 @@ def parse_args():
     return parser.parse_args()
 
 
+def halt(reason: str, *, path: Path = DEFAULT_HALT_PATH) -> None:
+    """Disarm live trading durably, from any process.
+
+    Used when the venue tells us to stop (IP ban, credential error) — the one class of
+    failure where continuing to retry makes things strictly worse.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{reason}\n", encoding="utf-8")
+    logging.getLogger(__name__).error("LIVE TRADING HALTED: %s (flag: %s)", reason, path)
+
+
+def build_live_executor(
+    store: AccountStore,
+    trading: TradingConfig,
+    ledger: Ledger | None,
+) -> tuple[LiveBinanceExecutor | None, str]:
+    """Wire real orders, or explain why not. Never trades without a ledger."""
+    live = trading.live
+    if live.dry_run:
+        logging.getLogger(__name__).warning(
+            "live.dry_run is on: orders are journaled but never sent to the venue"
+        )
+    if ledger is None:
+        return None, "live mode needs wallet persistence; remove --no-ledger"
+    if trading.exchange != "binance":
+        return None, f"live execution is only implemented for Binance, not {trading.exchange}"
+
+    account_name = sorted(set(live.agent_accounts.values()))[0]
+    account = live.accounts[account_name]
+    base_url = BINANCE_SPOT_TESTNET_REST if account.testnet else BINANCE_SPOT_REST
+    client = BinanceSpotClient(
+        account.api_key,
+        account.api_secret,
+        base_url=base_url,
+        recv_window_ms=live.recv_window_ms,
+    )
+    try:
+        client.sync_time()
+        info = client.exchange_info(sorted(live.allow_symbols))
+        client.remember_symbols(info)
+    except Exception as exc:  # credentials, network, venue refusal: do not trade blind
+        client.close()
+        return None, f"could not reach {base_url} to validate live trading: {exc}"
+
+    # The venue's own rules, freshly fetched: the cached file is for paper mode, where
+    # the engine may be offline. A live order must be sized against what the venue says
+    # right now.
+    rules = parse_exchange_info(info)
+    store.set_instrument_rules(rules)
+
+    gates = RiskGates(
+        LiveLimits(
+            allow_symbols=tuple(s.upper() for s in live.allow_symbols),
+            max_order_pct_of_equity=live.max_order_pct_of_equity,
+            max_position_pct_of_equity=live.max_position_pct_of_equity,
+            max_order_notional_usdt=live.max_order_notional_usdt,
+            max_daily_loss_pct=live.max_daily_loss_pct,
+            max_orders_per_minute=live.max_orders_per_minute,
+            max_price_age_seconds=live.max_price_age_seconds,
+        ),
+        is_halted=DEFAULT_HALT_PATH.exists,
+    )
+    executor = LiveBinanceExecutor(
+        store,
+        client,
+        ledger,
+        account=account_name,
+        agent_accounts=dict(live.agent_accounts),
+        rules=rules,
+        gates=gates,
+        dry_run=live.dry_run,
+        on_fatal=lambda exc: halt(f"venue refused further orders: {exc}"),
+    )
+    summary = (
+        f"live {'(DRY-RUN, no orders sent)' if live.dry_run else '(REAL MONEY)'} "
+        f"account={account_name} venue={base_url} "
+        f"agents={', '.join(sorted(live.agent_accounts))} "
+        f"symbols={', '.join(sorted(rules))} | caps: order "
+        f"{live.max_order_pct_of_equity:g}%, position "
+        f"{live.max_position_pct_of_equity if live.max_position_pct_of_equity is not None else 'off'}%,"
+        f" daily loss {live.max_daily_loss_pct:g}%, "
+        f"{live.max_orders_per_minute} orders/min"
+    )
+    return executor, summary
+
+
 def describe_wallet(accounts: dict[str, AgentAccount], path: str | Path) -> str:
     """Startup status block, so an operator can tell a resumed session from a fresh one."""
     if not accounts:
@@ -101,6 +195,37 @@ def describe_wallet(accounts: dict[str, AgentAccount], path: str | Path) -> str:
             f"{len(account.positions)} open position(s)"
         )
     return "\n".join(lines)
+
+
+def resolve_instrument_rules(
+    trading: TradingConfig,
+) -> tuple[dict[str, SymbolRules], str]:
+    """Venue rules for the subscribed symbols, or the legacy 1-decimal fallback.
+
+    Returns the rules plus a one-line summary for the startup banner. An empty dict is
+    a supported outcome, not an error: every symbol then keeps the coarse paper rule,
+    which is what a Coinbase deployment or a cache-less first start needs.
+    """
+    if trading.paper.instrument_rules == "simple":
+        return {}, "simple (legacy 1-decimal rule)"
+
+    cached = load_cache(trading.instrument_cache)
+    if not cached:
+        return {}, (
+            f"simple — no usable cache at {trading.instrument_cache} "
+            "(run `uv run python -m arena.instruments --refresh`)"
+        )
+
+    subscribed = (
+        trading.binance_symbols if trading.exchange == "binance" else trading.coinbase_products
+    )
+    rules = {s.upper(): cached[s.upper()] for s in subscribed if s.upper() in cached}
+    uncached = [s for s in subscribed if s.upper() not in cached]
+    summary = f"venue ({len(rules)}/{len(subscribed)} subscribed symbol(s) cached)"
+    if uncached:
+        # Say it out loud: those symbols silently trade on the coarse rule instead.
+        summary += f"; uncached: {', '.join(uncached)}"
+    return rules, summary
 
 
 def open_ledger_or_exit(path: str | Path) -> Ledger:
@@ -156,9 +281,23 @@ async def main():
     # Resolve the taker fee from config — the single source of truth shared with
     # the price-feed connector, so the fee charged here always matches the fee the
     # connector advertises to agents.
-    taker_bps = load_config_strict(args.config).trading.fees.taker_bps
+    arena_config = load_config_strict(args.config)
+    trading = arena_config.trading
+    taker_bps = trading.fees.taker_bps
     store.set_fee_model(FeeModel(taker_bps=taker_bps))
     print(f"Trading fee: {taker_bps} bps ({taker_bps / 100:.2f}% taker) applied to every fill")
+
+    # Venue rules make paper rehearse the real constraints (step size, min notional),
+    # so an order this engine accepts is an order the venue accepts.
+    instrument_rules, rules_summary = resolve_instrument_rules(trading)
+    store.set_instrument_rules(instrument_rules)
+    print(f"Instrument rules: {rules_summary}")
+    for symbol in sorted(instrument_rules):
+        rule = instrument_rules[symbol]
+        print(
+            f"  - {symbol}: step {rule.step_size:g}, min notional "
+            f"{rule.min_notional:g} {rule.quote_asset}"
+        )
 
     # ── Wallet persistence ───────────────────────────────────────
     # Hydrate before the worker starts serving fills, so a restart resumes the
@@ -170,6 +309,21 @@ async def main():
         ledger = open_ledger_or_exit(args.db)
         store.attach_ledger(ledger)
         print(f"\n{describe_wallet(store.accounts, ledger.path)}")
+
+    # ── Live execution (or paper) ────────────────────────────────
+    # Built before the worker serves tool nodes: a live executor that cannot validate
+    # its credentials must leave the arena in paper mode rather than half-armed.
+    mode = trading.mode
+    if mode == "live":
+        executor, live_summary = build_live_executor(store, trading, ledger)
+        print(f"Execution: {live_summary}")
+        if executor is not None:
+            store.set_executor(executor)
+        else:
+            mode = "paper"
+            print("Execution: falling back to PAPER — live trading is not armed")
+    else:
+        print("Execution: paper (simulated fills at the best bid/ask)")
 
     print(f"\nConnecting to Kafka broker at {args.bootstrap_servers}...")
     client = Client.connect(args.bootstrap_servers)

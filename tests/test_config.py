@@ -14,6 +14,7 @@ from config import (
     ArenaConfig,
     FeeConfig,
     LLMProviderConfig,
+    TradingConfig,
     get_default_symbols,
     load_config,
     load_config_strict,
@@ -171,12 +172,8 @@ def _find_key(obj, key):
     return None
 
 
-@pytest.mark.xfail(
-    reason="R5: committed config.schema.json omits taker_bps maximum; it has drifted from the model",
-    strict=True,
-)
 def test_committed_schema_encodes_taker_bps_upper_bound():
-    schema = json.loads((__import__("pathlib").Path("config.schema.json")).read_text())
+    schema = json.loads(Path("config.schema.json").read_text())
     taker = _find_key(schema, "taker_bps")
     assert taker is not None
     assert taker.get("maximum") == MAX_TAKER_BPS
@@ -291,3 +288,176 @@ def test_load_config_env_var_beats_dotenv(tmp_path, monkeypatch):
     monkeypatch.setenv("ARENA_DOTENV_PROBE", "from-process")
 
     assert load_config().get_provider_config("p").api_key == "from-process"
+
+
+# ── Paper instrument rules (venue-accurate paper fills) ─────────
+
+
+def test_paper_instrument_rules_default_to_venue():
+    assert TradingConfig().paper.instrument_rules == "venue"
+
+
+def test_paper_instrument_rules_accept_simple():
+    cfg = TradingConfig.model_validate({"paper": {"instrument_rules": "simple"}})
+    assert cfg.paper.instrument_rules == "simple"
+
+
+@pytest.mark.parametrize("value", ["off", "VENUE", ""])
+def test_paper_instrument_rules_reject_unknown_values(value, tmp_path):
+    path = _write(tmp_path, {"trading": {"paper": {"instrument_rules": value}}})
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_instrument_cache_path_is_configurable(tmp_path):
+    path = _write(tmp_path, {"trading": {"instrument_cache": "data/custom.json"}})
+    assert load_config(path).trading.instrument_cache == "data/custom.json"
+
+
+def test_committed_schema_documents_instrument_rules():
+    schema = json.loads(Path("config.schema.json").read_text())
+    assert "instrument_rules" in schema["$defs"]["PaperConfig"]["properties"]
+    assert "instrument_cache" in schema["$defs"]["TradingConfig"]["properties"]
+
+
+# ── Live trading configuration (real money, so fail closed) ─────
+
+
+def _live_payload(**overrides) -> dict:
+    """A complete, valid live-mode config that individual tests then break."""
+    payload = {
+        "agents": [{"name": "a1", "provider": "p", "model": "m"}],
+        "llm_providers": {"p": {"api_key": "k"}},
+        "trading": {
+            "mode": "live",
+            "live": {
+                "accounts": {"main": {"api_key": "k", "api_secret": "s"}},
+                "agent_accounts": {"a1": "main"},
+                "allow_symbols": ["SOLUSDT"],
+            },
+        },
+    }
+    for path, value in overrides.items():
+        target = payload["trading"]["live"] if path != "trading" else payload["trading"]
+        if path == "trading":
+            target.update(value)
+        else:
+            target[path] = value
+    return payload
+
+
+def test_trading_mode_defaults_to_paper():
+    assert TradingConfig().mode == "paper"
+    assert TradingConfig().live.dry_run is True
+
+
+def test_a_complete_live_config_loads(tmp_path):
+    cfg = load_config(_write(tmp_path, _live_payload()))
+    assert cfg.trading.mode == "live"
+    assert cfg.trading.live.agent_accounts == {"a1": "main"}
+    assert cfg.trading.live.dry_run is True  # still opt-in to real orders
+
+
+def test_live_mode_without_credentials_refuses_to_start(tmp_path):
+    payload = _live_payload()
+    payload["trading"]["live"]["accounts"] = {"main": {"api_key": "", "api_secret": ""}}
+    with pytest.raises(ValidationError, match="api_key"):
+        load_config(_write(tmp_path, payload))
+
+
+def test_live_mode_without_an_agent_mapping_refuses_to_start(tmp_path):
+    with pytest.raises(ValidationError, match="agent_accounts is empty"):
+        load_config(_write(tmp_path, _live_payload(agent_accounts={})))
+
+
+def test_live_mode_without_an_allowlist_refuses_to_start(tmp_path):
+    with pytest.raises(ValidationError, match="allow_symbols is empty"):
+        load_config(_write(tmp_path, _live_payload(allow_symbols=[])))
+
+
+def test_agent_mapping_must_reference_a_defined_account(tmp_path):
+    with pytest.raises(ValidationError, match="not defined in live.accounts"):
+        load_config(_write(tmp_path, _live_payload(agent_accounts={"a1": "missing"})))
+
+
+def test_live_mode_rejects_more_than_one_account(tmp_path):
+    """Two venue accounts would need per-account executors; refuse until they exist."""
+    payload = _live_payload()
+    payload["agents"] = [
+        {"name": "a1", "provider": "p", "model": "m"},
+        {"name": "a2", "provider": "p", "model": "m"},
+    ]
+    payload["trading"]["live"]["accounts"]["second"] = {"api_key": "k2", "api_secret": "s2"}
+    payload["trading"]["live"]["agent_accounts"] = {"a1": "main", "a2": "second"}
+
+    with pytest.raises(ValidationError, match="more than one account"):
+        load_config(_write(tmp_path, payload))
+
+
+def test_an_unused_second_account_is_allowed(tmp_path):
+    payload = _live_payload()
+    payload["trading"]["live"]["accounts"]["second"] = {"api_key": "k2", "api_secret": "s2"}
+
+    cfg = load_config(_write(tmp_path, payload))
+
+    assert cfg.trading.live.agent_accounts == {"a1": "main"}
+
+
+def test_order_pct_cannot_exceed_position_pct(tmp_path):
+    with pytest.raises(ValidationError, match="must not exceed"):
+        load_config(
+            _write(tmp_path, _live_payload(max_order_pct_of_equity=60, max_position_pct_of_equity=50))
+        )
+
+
+def test_live_defaults_are_the_paranoid_ones(tmp_path):
+    live = load_config(_write(tmp_path, _live_payload())).trading.live
+    assert live.max_order_pct_of_equity == 25.0
+    assert live.max_position_pct_of_equity == 50.0
+    assert live.max_daily_loss_pct == 10.0
+    assert live.max_orders_per_minute == 2
+    assert live.max_price_age_seconds == 5.0
+    assert live.deposit_policy == "credit_sole_agent"
+
+
+def test_a_misspelled_limit_fails_instead_of_being_ignored(tmp_path):
+    """extra='forbid': a typo must not silently drop a guardrail."""
+    payload = _live_payload()
+    payload["trading"]["live"]["max_dailly_loss_pct"] = 5  # three l's
+
+    with pytest.raises(ValidationError) as exc:
+        load_config(_write(tmp_path, payload))
+
+    assert "max_dailly_loss_pct" in str(exc.value)
+
+
+def test_a_comment_key_is_allowed_in_the_live_block(tmp_path):
+    payload = _live_payload()
+    payload["trading"]["live"]["_comment"] = "operator note"
+    assert load_config(_write(tmp_path, payload)).trading.live.comment == "operator note"
+
+
+def test_paper_mode_ignores_an_incomplete_live_block(tmp_path):
+    cfg = load_config(
+        _write(tmp_path, {"trading": {"mode": "paper", "live": {"dry_run": False}}})
+    )
+    assert cfg.trading.mode == "paper"
+    assert cfg.trading.live.accounts == {}
+
+
+def test_committed_schema_documents_live_mode():
+    schema = json.loads(Path("config.schema.json").read_text())
+    trading = schema["$defs"]["TradingConfig"]["properties"]
+    assert "mode" in trading
+    assert "live" in trading
+    live = schema["$defs"]["LiveConfig"]["properties"]
+    for key in (
+        "accounts",
+        "agent_accounts",
+        "dry_run",
+        "allow_symbols",
+        "max_order_pct_of_equity",
+        "max_daily_loss_pct",
+        "max_price_age_seconds",
+    ):
+        assert key in live

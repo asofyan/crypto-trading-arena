@@ -28,7 +28,7 @@ candlestick charts (1-min, 5-min, 15-min)." Binance's `run()` wires it correctly
 *Test:* `test_exchanges.py` asserts Binance's `run()` builds a non-None candle book
 and (xfail) that Coinbase's `run()` does too.
 
-### B2 — Sub-rounding quantity crashes or records a phantom trade · Medium · open
+### B2 — Sub-rounding quantity crashes or records a phantom trade · Medium · fixed
 `AccountStore.execute_trade` validates `quantity > 0` then `abs(quantity - round(quantity, 1)) <= 1e-9`.
 A quantity in `(0, 1e-9]` passes **both** guards, then `quantity` is reassigned to
 `round(quantity, 1) == 0.0`:
@@ -40,8 +40,10 @@ A quantity in `(0, 1e-9]` passes **both** guards, then `quantity` is reassigned 
 Root cause: the precision guard treats "rounds to zero" as acceptable. Correct
 behavior: reject any quantity that rounds to `0.0`.
 
-*Test:* `test_account_store.py::test_subrounding_quantity_rejected` (xfail, strict,
-raises `ZeroDivisionError` for the fresh-position case).
+*Test:* `test_account_store.py::test_subrounding_quantity_rejected` (now a plain, passing
+assertion).
+**Fixed (2026-11-25, live-trading work).** `PaperExecutor` rejects any quantity that rounds to `0` before booking, so the
+`ZeroDivisionError` path in the weighted-average entry timestamp is unreachable.
 
 ### B3 — `calculator` raises an uncaught `AttributeError` on non-scalar input · Medium · open
 `arena/tools.py::calculator` does `result = sympy.sympify(expression)` then
@@ -71,7 +73,7 @@ Related quality issues (same tool, lower severity, documented by tests):
 
 Wasted network/CPU; no correctness impact on live pricing (the WebSocket feeds it).
 
-### B5 — `NaN` quantity bypasses every guard and permanently poisons an account · High · open
+### B5 — `NaN` quantity bypasses every guard and permanently poisons an account · High · fixed
 `AccountStore.execute_trade` guards with `quantity <= 0` and `abs(quantity - rounded) > 1e-9`.
 **Both are `False` for `NaN`** (every `NaN` comparison is false), so a `NaN` buy runs
 full execution: `cash`, `positions[pid]`, `cost_basis[pid]`, `avg_entry_ts[pid]` and
@@ -81,10 +83,12 @@ guard compares against `NaN` (always false) so no trade can ever succeed, and
 Correct behavior: reject non-finite quantities up front (`math.isfinite`). `inf` is
 incidentally caught on buys only (`inf > cash`) but not defensively rejected either.
 
-*Test:* `test_account_store.py::test_nan_quantity_rejected` (xfail, strict — currently
-returns success).
+*Test:* `test_account_store.py::test_nan_quantity_rejected` (now a plain, passing
+assertion). **Fixed (2026-11-25, live-trading work).** `PaperExecutor` rejects a
+non-finite quantity with `math.isfinite` before any pricing, and a live executor will
+inherit the same guard through `apply_fill`'s callers.
 
-### B6 — Float drift in position accumulation strands a full-position sell · High · open
+### B6 — Float drift in position accumulation strands a full-position sell · High · fixed
 Buys accumulate raw floats (`positions[pid] = existing_qty + quantity`) while the sell
 guard compares the user's rounded request against the drifted stored quantity
 (`if quantity > held`). After buying `0.1 + 0.1 + 0.7`, `held == 0.8999999999999999`;
@@ -95,7 +99,9 @@ Correct behavior: store quantities quantized (the code already rounds elsewhere)
 `held` is exact, or compare with a tolerance.
 
 *Test:* `test_account_store.py::test_full_position_sell_after_fractional_buys`
-(xfail, strict — the sell currently fails).
+(now a plain, passing assertion). **Fixed (2026-11-25, live-trading work).** Booking
+compares and closes against a `1e-9` tolerance instead of rounding to one decimal, which
+venue steps (0.001 for SOLUSDT) made untenable anyway.
 
 ### B7 — Snapshot/dashboard report a fabricated `unrealized_pnl` for unpriced positions · High · open
 In `recorder.py::take_snapshot` (and identically `dashboard.py`), a held position with
@@ -144,15 +150,18 @@ reconcile to actual cash deltas at the exit-fee level. Likely a deliberate "mark
 mid, fee on close" convention, but it's undocumented and surprising. *Documented; a
 characterization test pins the current numbers so a future change is intentional.*
 
-### R5 — `config.schema.json` has drifted from the Pydantic model · Medium · open
+### R5 — `config.schema.json` has drifted from the Pydantic model · Medium · fixed
 `FeeConfig.taker_bps` enforces `le=MAX_TAKER_BPS` (1000), but the committed
 `config.schema.json` `taker_bps` has only `minimum: 0` and **no `maximum`** — so a
 schema-aware editor accepts `taker_bps: 5000` that Pydantic then rejects at load. The
 `FeeConfig` description is also stale. (Note: `model_json_schema()` omits the top-level
 `$schema` key the committed file carries, so any regenerator must re-inject it.)
 
-*Test:* `test_config.py::test_committed_schema_matches_model` (xfail, strict — drift
-exists today; flips green when the schema is regenerated).
+*Test:* `test_config.py::test_committed_schema_encodes_taker_bps_upper_bound` (now a plain,
+passing assertion). 
+**Fixed (2026-11-25, live-trading work).** the schema was regenerated from `ArenaConfig.model_json_schema()` with the
+top-level `$schema` key re-injected, and a test now guards the new `PaperConfig`/`instrument_cache`
+keys.
 
 ### R6 — `resolve_env_vars` silently passes through embedded `${VAR}` · Low · open
 The regex is whole-string anchored (`^\$\{...\}$`), so `"Bearer ${TOKEN}"`,

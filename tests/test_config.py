@@ -105,7 +105,7 @@ def test_get_default_symbols_per_exchange(monkeypatch):
     # get_default_symbols reads the repo config.json, which references ${OPENAI_API_KEY};
     # a dummy value keeps resolve_env_vars from raising (see finding R3).
     monkeypatch.setenv("OPENAI_API_KEY", "dummy")
-    assert "BTCUSDT" in get_default_symbols("binance")
+    assert "SOLUSDT" in get_default_symbols("binance")
     assert "BTC-USD" in get_default_symbols("coinbase")
     assert get_default_symbols("BINANCE") == get_default_symbols("binance")  # case-insensitive
 

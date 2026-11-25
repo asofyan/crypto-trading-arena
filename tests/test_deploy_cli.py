@@ -13,7 +13,7 @@ import sys
 import pytest
 
 from arena.ledger import DEFAULT_DB_PATH, Ledger
-from arena.models import AgentAccount
+from arena.models import INITIAL_CASH, AgentAccount
 from deploy import tools_and_dashboard as deploy_cli
 
 
@@ -75,7 +75,7 @@ def test_describe_wallet_reports_fresh_ledger(tmp_path):
     text = deploy_cli.describe_wallet({}, tmp_path / "arena.db")
 
     assert "Fresh ledger" in text
-    assert "100,000" in text
+    assert f"${INITIAL_CASH:,.0f}" in text
 
 
 def test_describe_wallet_lists_hydrated_agents(tmp_path):

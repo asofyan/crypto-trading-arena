@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import pytest
 
 import arena.tools as tools
+from arena.models import INITIAL_CASH
 from arena.tools import _format_hold_time, _get_portfolio, calculator
 
 _STUB_CTX = types.SimpleNamespace(agent_name="tester", tool_call_id="tc-1")
@@ -124,6 +125,9 @@ def seeded_singleton():
     tools.price_book.update(
         {"product_id": "BTC-USD", "price": "50000", "best_bid": "49990", "best_ask": "50010"}
     )
+    tools.price_book.update(
+        {"product_id": "SOL-USD", "price": "100.00", "best_bid": "99.90", "best_ask": "100.10"}
+    )
     tools.store._accounts.clear()
     tools.store._trade_log.clear()
     yield tools.store
@@ -133,21 +137,21 @@ def seeded_singleton():
 
 def test_get_portfolio_empty(seeded_singleton):
     out = _get_portfolio("agent")
-    assert "Cash: $100,000.00" in out
+    assert f"Cash: ${INITIAL_CASH:,.2f}" in out
     assert "Positions: none" in out
-    assert "Total portfolio value: $100,000.00" in out
+    assert f"Total portfolio value: ${INITIAL_CASH:,.2f}" in out
 
 
 def test_get_portfolio_with_priced_position(seeded_singleton):
     acct = seeded_singleton.get_or_create("agent")
-    acct.positions["BTC-USD"] = 1.0
-    acct.cost_basis["BTC-USD"] = 48_000.0
+    acct.positions["SOL-USD"] = 0.5
+    acct.cost_basis["SOL-USD"] = 48.0
 
     out = _get_portfolio("agent")
-    assert "BTC-USD" in out
-    assert "$50,000.00" in out  # current price column (last price)
-    # Total value = cash (100k) + 1 * 50000 mark.
-    assert "Total portfolio value: $150,000.00" in out
+    assert "SOL-USD" in out
+    assert "$100.00" in out  # current price column (last price)
+    # Total value = cash (100) + 0.5 * 100 mark.
+    assert "Total portfolio value: $150.00" in out
 
 
 def test_get_portfolio_position_without_price_shows_na(seeded_singleton):
@@ -176,7 +180,7 @@ def test_execute_trade_records_latency_from_invoked_at(seeded_singleton, monkeyp
     monkeypatch.setattr(tools.view, "rerender", lambda: None)
     ctx = _exec_ctx({"invoked_at": time.time() - 0.5})
 
-    msg = tools.execute_trade._tool.function(ctx, "BTC-USD", 0.1, "buy")
+    msg = tools.execute_trade._tool.function(ctx, "SOL-USD", 0.5, "buy")
 
     assert msg.startswith("Bought")
     latency = seeded_singleton.trade_log[-1].latency
@@ -188,6 +192,6 @@ def test_execute_trade_latency_none_when_dep_absent(seeded_singleton, monkeypatc
     monkeypatch.setattr(tools.view, "rerender", lambda: None)
     ctx = _exec_ctx({})
 
-    tools.execute_trade._tool.function(ctx, "BTC-USD", 0.1, "buy")
+    tools.execute_trade._tool.function(ctx, "SOL-USD", 0.5, "buy")
 
     assert seeded_singleton.trade_log[-1].latency is None

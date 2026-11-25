@@ -33,9 +33,9 @@
   "trading": {
     "exchange": "coinbase",
     "binance_symbols": [
-      "BTCUSDT",
       "SOLUSDT",
-      "FARTCOINUSDT"
+      "XRPUSDT",
+      "LINKUSDT"
     ],
     "coinbase_products": [
       "BTC-USD",

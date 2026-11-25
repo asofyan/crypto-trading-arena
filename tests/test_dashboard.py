@@ -21,7 +21,7 @@ def _render(renderable, width=200) -> str:
 
 def test_capture_balance_snapshot_records_portfolio_value(make_store):
     store = make_store(taker_bps=0)
-    store.execute_trade("a", "BTC-USD", 1.0, "buy")
+    store.execute_trade("a", "SOL-USD", 0.5, "buy")
     view = PortfolioView(store)
 
     view._capture_balance_snapshot()
@@ -62,7 +62,7 @@ def test_header_flags_a_degraded_ledger(make_store, make_ledger):
     ledger = make_ledger()
     store.attach_ledger(ledger)
     ledger.close()  # every later fill fails to persist
-    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
     assert store.ledger_degraded is True
 
     text = _render(PortfolioView(store)._build_header())
@@ -74,7 +74,7 @@ def test_header_flags_a_degraded_ledger(make_store, make_ledger):
 
 def test_header_stays_clean_with_a_healthy_ledger(make_store_with_ledger):
     store = make_store_with_ledger(taker_bps=0)
-    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
 
     text = _render(PortfolioView(store)._build_header())
 

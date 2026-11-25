@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from arena.fees import FeeModel
+from arena.models import INITIAL_CASH
 from deploy.portfolio_monitor import MONITOR_GROUP_ID, PortfolioMirror, latest_trades_file
 
 TRADE_FIELDS = [
@@ -33,7 +34,21 @@ def _write_trades(path: Path, rows: list[dict], *, header: bool = True) -> Path:
     return path
 
 
-def _buy(agent="a", product="SOLUSDT", qty=10.0, price=70.0, fee=0.7, cash=100_000 - 700.7):
+FEE_BPS = 10  # matches the fee_model_10bps fixture
+
+
+def _buy(agent="a", product="SOLUSDT", qty=0.5, price=70.0, fee=None, cash=None):
+    """One recorded buy row, sized for the $100 wallet the arena starts every agent on.
+
+    ``fee``/``cash`` default to what the arena itself would have written (10 bps on
+    notional, subtracted from INITIAL_CASH), so a replayed row matches the CSV and
+    the mirror never has to fall back to the recorded cash.
+    """
+    notional = qty * price
+    if fee is None:
+        fee = notional * FEE_BPS / 10_000
+    if cash is None:
+        cash = INITIAL_CASH - notional - fee
     return {
         "timestamp": "2026-01-01T00:00:00",
         "agent_id": agent,
@@ -41,7 +56,7 @@ def _buy(agent="a", product="SOLUSDT", qty=10.0, price=70.0, fee=0.7, cash=100_0
         "product_id": product,
         "quantity": qty,
         "price": price,
-        "total_value": qty * price,
+        "total_value": notional,
         "fee": fee,
         "cash_after": cash,
         "latency": 1.0,
@@ -61,35 +76,35 @@ def test_latest_trades_file_picks_newest(tmp_path):
 def test_replay_rebuilds_positions_and_cash(tmp_path, fee_model_10bps):
     path = _write_trades(
         tmp_path / "trades_20260101_000000.csv",
-        [_buy(qty=10.0, price=70.0, fee=0.07, cash=100_000 - 700.07)],
+        [_buy(qty=0.5, price=70.0, fee=0.035, cash=INITIAL_CASH - 35.035)],
     )
     mirror = PortfolioMirror(tmp_path, fee_model_10bps)
     assert mirror.sync() is True
 
     account = mirror.store.get_or_create("a")
-    assert account.positions["SOLUSDT"] == 10.0
-    assert abs(account.cash - (100_000 - 700.07)) < 1e-6
+    assert account.positions["SOLUSDT"] == 0.5
+    assert abs(account.cash - (INITIAL_CASH - 35.035)) < 1e-6
     assert mirror.replayed_contracts == 1
     assert mirror.session_file == path
 
 
 def test_replay_is_incremental(tmp_path, fee_model_10bps):
-    path = _write_trades(
-        tmp_path / "trades_20260101_000000.csv",
-        [_buy(price=70.0, fee=0.07, cash=100_000 - 700.07)],
-    )
+    first = _buy(price=70.0)  # 0.5 @ 70 → $35.035 out of the wallet
+    path = _write_trades(tmp_path / "trades_20260101_000000.csv", [first])
     mirror = PortfolioMirror(tmp_path, fee_model_10bps)
     mirror.sync()
     assert mirror.replayed_contracts == 1
 
     # Recorder appends a second fill; only the new row may be replayed.
+    second = _buy(price=71.0)  # 0.5 @ 71 → $35.5355 more
+    second["cash_after"] = INITIAL_CASH - 35.035 - 35.5355
     with path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=TRADE_FIELDS)
-        writer.writerow(_buy(price=71.0, fee=0.071, cash=100_000 - 700.07 - 710.071))
+        writer.writerow(second)
 
     assert mirror.sync() is True
     assert mirror.replayed_contracts == 2
-    assert mirror.store.get_or_create("a").positions["SOLUSDT"] == 20.0
+    assert mirror.store.get_or_create("a").positions["SOLUSDT"] == 1.0
 
 
 def test_partial_last_row_is_skipped(tmp_path, fee_model_10bps):
@@ -105,25 +120,25 @@ def test_partial_last_row_is_skipped(tmp_path, fee_model_10bps):
 
 
 def test_newer_session_file_resets_state(tmp_path, fee_model_10bps):
-    first = _write_trades(tmp_path / "trades_20260101_000000.csv", [_buy(qty=10.0)])
+    first = _write_trades(tmp_path / "trades_20260101_000000.csv", [_buy(qty=0.5)])
     mirror = PortfolioMirror(tmp_path, fee_model_10bps)
     mirror.sync()
-    assert mirror.store.get_or_create("a").positions["SOLUSDT"] == 10.0
+    assert mirror.store.get_or_create("a").positions["SOLUSDT"] == 0.5
 
     time.sleep(0.01)
-    second = _write_trades(tmp_path / "trades_20260101_020000.csv", [_buy(qty=3.0)])
+    second = _write_trades(tmp_path / "trades_20260101_020000.csv", [_buy(qty=0.2)])
     assert mirror.sync() is True
     assert mirror.session_file == second
     assert first.exists()
     # Fresh wallet: the new session only knows about its own fill.
-    assert mirror.store.get_or_create("a").positions["SOLUSDT"] == 3.0
+    assert mirror.store.get_or_create("a").positions["SOLUSDT"] == 0.2
     assert mirror.replayed_contracts == 1
 
 
 def test_live_tick_marks_positions(tmp_path, fee_model_10bps):
     _write_trades(
         tmp_path / "trades_20260101_000000.csv",
-        [_buy(qty=10.0, price=70.0, fee=0.07, cash=100_000 - 700.07)],
+        [_buy(qty=0.5, price=70.0, fee=0.035, cash=INITIAL_CASH - 35.035)],
     )
     mirror = PortfolioMirror(tmp_path, fee_model_10bps)
     mirror.sync()
@@ -139,7 +154,7 @@ def test_live_tick_marks_positions(tmp_path, fee_model_10bps):
 
     mirror.update_price(Ticker())
     account = mirror.store.get_or_create("a")
-    expected = 100_000 - 700.07 + 10.0 * 80.0
+    expected = INITIAL_CASH - 35.035 + 0.5 * 80.0
     assert abs(account.portfolio_value(mirror.store.price_book) - expected) < 1e-6
 
 
@@ -168,8 +183,23 @@ def test_fee_model_is_injected_not_recomputed(tmp_path):
     """Zero-fee replay must match a zero-fee CSV, proving the model is honoured."""
     _write_trades(
         tmp_path / "trades_20260101_000000.csv",
-        [_buy(qty=10.0, price=70.0, fee=0.0, cash=100_000 - 700.0)],
+        [_buy(qty=0.5, price=70.0, fee=0.0, cash=INITIAL_CASH - 35.0)],
     )
     mirror = PortfolioMirror(tmp_path, FeeModel(taker_bps=0))
     mirror.sync()
-    assert abs(mirror.store.get_or_create("a").cash - (100_000 - 700.0)) < 1e-6
+    assert abs(mirror.store.get_or_create("a").cash - (INITIAL_CASH - 35.0)) < 1e-6
+
+
+def test_replay_trusts_recorded_cash_when_the_fee_rate_disagrees(tmp_path, caplog):
+    """The CSV is written by the arena, so it wins over a misconfigured fee rate."""
+    _write_trades(
+        tmp_path / "trades_20260101_000000.csv",
+        [_buy(qty=0.5, price=70.0, fee=0.0, cash=INITIAL_CASH - 35.0)],  # written fee-free
+    )
+    mirror = PortfolioMirror(tmp_path, FeeModel(taker_bps=10))  # replay charges 10 bps
+    assert mirror.sync() is True
+
+    account = mirror.store.get_or_create("a")
+    assert account.positions["SOLUSDT"] == 0.5
+    assert abs(account.cash - (INITIAL_CASH - 35.0)) < 1e-6  # recorded cash, not 34.965
+    assert "taker_bps matches the running arena" in caplog.text

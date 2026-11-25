@@ -230,7 +230,7 @@ For full column descriptions and examples, see [docs/csv-data-recording.md](docs
 
 Agent wallets are persisted to a SQLite ledger at `data/arena.db`, so restarting the
 tools & dashboard resumes each agent's cash, positions, and counters instead of
-resetting everyone to `$100k`. `manage_bot.py` wraps the engine lifecycle:
+resetting everyone to `$100`. `manage_bot.py` wraps the engine lifecycle:
 
 ```bash
 uv run python manage_bot.py start backend   # detached engine; log in .run/bot.log
@@ -241,7 +241,7 @@ uv run python manage_bot.py stop            # SIGINT → SIGTERM (add --force fo
 
 - **New session:** `manage_bot.py start backend --fresh` archives the current ledger
   (and its sidecars) to `data/archive/arena-<timestamp>.db` and starts every agent at
-  `$100k` again. It refuses while another engine still holds the ledger. Combined with
+  `$100` again. It refuses while another engine still holds the ledger. Combined with
   `--no-ledger` it is a no-op: a volatile run never reads the ledger, so nothing is
   archived (the CLI prints a note saying so).
 - **Volatile wallets:** add `--no-ledger` to `start` to skip persistence entirely —
@@ -296,7 +296,7 @@ strict `xfail`s; see [docs/REVIEW_FINDINGS.md](docs/REVIEW_FINDINGS.md).
 
 | File | Constant | Default | Description |
 |------|----------|---------|-------------|
-| `arena/models.py` | `INITIAL_CASH` | `100_000.0` | Starting cash balance per agent |
+| `arena/models.py` | `INITIAL_CASH` | `100.0` | Starting cash balance per agent |
 | `exchanges/coinbase.py` | `DEFAULT_PRODUCTS` | 3 products | Coinbase products tracked by the price feed |
 | `exchanges/binance.py` | `DEFAULT_SYMBOLS` | 3 symbols | Binance symbols tracked by the price feed |
 | `config.json` | `trading.fees.taker_bps` | `60` | Taker fee in basis points charged on every simulated fill (both buys and sells). `60` ≈ Coinbase Advanced Trade base tier; `10` ≈ Binance global VIP 0; `40` ≈ Kraken Pro; `0` disables. Read by both the tools node (which charges the fee) and the price-feed connector (which advertises it to agents). |

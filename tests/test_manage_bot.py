@@ -445,7 +445,7 @@ def test_start_fresh_archives_previous_wallet(run_dir, monkeypatch, tmp_path, ca
     assert "Archived" in capsys.readouterr().out
     archives = list((db.parent / "archive").glob("arena-*.db"))
     assert len(archives) == 1
-    assert not db.exists()  # archived away, so the child starts from $100k again
+    assert not db.exists()  # archived away, so the child starts from $100 again
     assert captured["db"] == str(db)
     assert captured["headless"] is True
     info = manage_bot.read_pidfile()

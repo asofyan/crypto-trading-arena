@@ -40,6 +40,7 @@ def test_portfolio_value_skips_positions_without_a_live_price(price_book):
 
 
 def test_portfolio_value_default_starting_balance():
+    assert INITIAL_CASH == 100.0
     assert AgentAccount().cash == INITIAL_CASH
     assert AgentAccount().portfolio_value(PriceBook()) == pytest.approx(INITIAL_CASH)
 

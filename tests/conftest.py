@@ -50,6 +50,22 @@ SOL_TICKER = {
     "time": "2024-01-01T00:00:00Z",
 }
 
+# A unit of BTC costs more than the whole $100 wallet, and orders are capped at one
+# decimal place, so BTC can never be filled here. XRP stands in wherever a test needs
+# a second tradable product (small notional, same precision rules).
+XRP_TICKER = {
+    "product_id": "XRP-USD",
+    "price": "2.00",
+    "best_bid": "1.99",
+    "best_ask": "2.01",
+    "best_bid_size": "5000",
+    "best_ask_size": "5000",
+    "side": "buy",
+    "last_size": "100.0",
+    "volume_24h": "2500000.0",
+    "time": "2024-01-01T00:00:00Z",
+}
+
 
 # ── Collection hooks: markers + external-dependency opt-in ────────
 
@@ -97,10 +113,11 @@ def sol_ticker() -> dict:
 
 @pytest.fixture
 def price_book() -> PriceBook:
-    """A PriceBook seeded with BTC-USD and SOL-USD live quotes."""
+    """A PriceBook seeded with BTC-USD, SOL-USD and XRP-USD live quotes."""
     pb = PriceBook()
     pb.update(dict(BTC_TICKER))
     pb.update(dict(SOL_TICKER))
+    pb.update(dict(XRP_TICKER))
     return pb
 
 

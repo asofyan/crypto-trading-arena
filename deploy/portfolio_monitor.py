@@ -2,7 +2,7 @@
 
 The arena's paper wallets live in the memory of the `deploy.tools_and_dashboard`
 process, so a second copy of that entrypoint cannot observe them: it would start
-its own wallet at $100k and, because calfkit names consumer groups after the node
+its own wallet at $100 and, because calfkit names consumer groups after the node
 (`calfkit/worker/worker.py`), it would join the very same groups and split the
 stream — leaving two half-arenas that both look plausible.
 

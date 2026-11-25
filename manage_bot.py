@@ -5,7 +5,7 @@
 ``stop`` signals only a pid it can prove belongs to the bot, so a recycled pid in a stale
 pid file can never take down an unrelated process. ``status`` reports the process plus the
 wallet state the SQLite ledger has persisted, which is how an operator sees that a restart
-resumed the previous session instead of resetting every agent to ``$100k``, and whether the
+resumed the previous session instead of resetting every agent to ``$100``, and whether the
 engine hit a persistence failure (memory and disk diverged) that outlived the process.
 
     uv run python manage_bot.py start backend
@@ -902,7 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--fresh",
         action="store_true",
-        help="archive the existing wallet DB first, so every agent restarts at $100k",
+        help="archive the existing wallet DB first, so every agent restarts at $100",
     )
     _add_launch_flags(start)
     start.set_defaults(handler=cmd_start)

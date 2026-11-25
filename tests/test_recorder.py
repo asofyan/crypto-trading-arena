@@ -10,6 +10,7 @@ import pytest
 
 from arena.account_store import AccountStore
 from arena.fees import FeeModel
+from arena.models import INITIAL_CASH
 from arena.price_book import PriceBook
 from arena.recorder import DataRecorder, SnapshotRow, TradeRow
 
@@ -79,20 +80,20 @@ def test_snapshot_cash_only_account_one_blank_position_row(tmp_path, make_store)
     assert len(rows) == 1
     assert rows[0]["product_id"] == ""
     assert float(rows[0]["quantity"]) == 0.0
-    assert float(rows[0]["portfolio_value"]) == pytest.approx(100_000.0)
+    assert float(rows[0]["portfolio_value"]) == pytest.approx(INITIAL_CASH)
 
 
 def test_snapshot_with_priced_position(tmp_path, make_store):
     store = make_store(taker_bps=0)
-    store.execute_trade("a", "BTC-USD", 1.0, "buy")  # cost basis 50010 @ ask
+    store.execute_trade("a", "SOL-USD", 0.5, "buy")  # cost basis 50.05 @ ask
     rec = DataRecorder(data_dir=str(tmp_path))
     rec.take_snapshot(store)
 
-    row = next(r for r in _rows(tmp_path, "snapshots") if r["product_id"] == "BTC-USD")
-    assert float(row["market_price"]) == pytest.approx(50_000.0)  # last price
-    assert float(row["market_value"]) == pytest.approx(50_000.0)
-    # unrealized = market_value - cost_basis = 50000 - 50010 = -10
-    assert float(row["unrealized_pnl"]) == pytest.approx(-10.0)
+    row = next(r for r in _rows(tmp_path, "snapshots") if r["product_id"] == "SOL-USD")
+    assert float(row["market_price"]) == pytest.approx(100.0)  # last price
+    assert float(row["market_value"]) == pytest.approx(50.0)
+    # unrealized = market_value - cost_basis = 50.00 - 50.05 = -0.05
+    assert float(row["unrealized_pnl"]) == pytest.approx(-0.05)
 
 
 @pytest.mark.xfail(

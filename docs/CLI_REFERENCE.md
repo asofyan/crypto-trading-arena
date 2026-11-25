@@ -51,7 +51,7 @@ For the full config schema with all fields, types, and defaults, see [`config.sc
   ],
   "trading": {
     "exchange": "coinbase",
-    "binance_symbols": ["BTCUSDT", "SOLUSDT", "FARTCOINUSDT"],
+    "binance_symbols": ["SOLUSDT", "XRPUSDT", "LINKUSDT"],
     "coinbase_products": ["BTC-USD", "SOL-USD", "FARTCOIN-USD"],
     "fees": { "taker_bps": 60 }
   }
@@ -142,7 +142,7 @@ uv run python -m exchanges.binance --bootstrap-servers localhost:9092
 # Override with specific symbols
 uv run python -m exchanges.binance \
     --bootstrap-servers localhost:9092 \
-    --symbols BTCUSDT ETHUSDT SOLUSDT
+    --symbols SOLUSDT XRPUSDT LINKUSDT
 ```
 
 ---
@@ -266,7 +266,7 @@ consumer groups itself — it only spawns, signals, and inspects the engine proc
 | Subcommand | Flag | Default | Description |
 |------------|------|---------|-------------|
 | `start` | `[backend\|tui]` | `backend` | `backend`: detached, logs to `.run/bot.log`; `tui`: foreground dashboard |
-| `start` | `--fresh` | off | Archive the existing wallet DB first, so every agent restarts at `$100k`. No-op when `--no-ledger` is also set (see below) |
+| `start` | `--fresh` | off | Archive the existing wallet DB first, so every agent restarts at `$100`. No-op when `--no-ledger` is also set (see below) |
 | `start` | `--bootstrap-servers` | `localhost:9092` | Kafka bootstrap servers |
 | `start` | `--config` | `config.json` | Path to config file |
 | `start` | `--data-dir` | `./data` | Directory for CSV snapshots/trades |
@@ -304,7 +304,7 @@ database. When another engine already holds it:
 sidecars are moved into `<db dir>/archive/` as
 `<name>-<YYYYmmdd-HHMMSS-ffffff>.db` — for the default `data/arena.db` that is
 `data/archive/arena-20261124-160546-589452.db` — so history stays inspectable while
-every agent starts over at `$100k`. If an engine still holds the single-writer lock,
+every agent starts over at `$100`. If an engine still holds the single-writer lock,
 `--fresh` refuses and moves nothing. Combined with `--no-ledger`, `--fresh` is a no-op:
 a volatile run never opens the ledger, so archiving would destroy history the run does
 not replace — `start` prints `note: --fresh ignored because --no-ledger is set` and
@@ -338,7 +338,7 @@ still in the WAL. See the note in
 ```bash
 uv run python manage_bot.py start                 # detached backend (logs in .run/bot.log)
 uv run python manage_bot.py start tui             # foreground dashboard; Ctrl-C stops
-uv run python manage_bot.py start backend --fresh # archive wallet → new session at $100k
+uv run python manage_bot.py start backend --fresh # archive wallet → new session at $100
 uv run python manage_bot.py start --no-ledger     # volatile wallets, nothing persisted
 uv run python manage_bot.py status                # process state + wallet table
 uv run python manage_bot.py status --json
@@ -352,7 +352,7 @@ uv run python manage_bot.py stop --force          # + SIGKILL if it will not go
 
 Read-only monitor for an arena that is **already running**. The live wallets live in the
 memory of the `tools_and_dashboard` process (mirrored to the SQLite ledger), so a second
-copy of that entrypoint cannot observe them — it would start its own $100k wallet and,
+copy of that entrypoint cannot observe them — it would start its own $100 wallet and,
 because calfkit names consumer groups after the node, join the same groups and split the
 stream into two half-arenas.
 

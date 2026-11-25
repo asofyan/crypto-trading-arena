@@ -162,7 +162,7 @@ async def main():
 
     # ── Wallet persistence ───────────────────────────────────────
     # Hydrate before the worker starts serving fills, so a restart resumes the
-    # previous session rather than handing every agent a fresh $100k.
+    # previous session rather than handing every agent a fresh $100.
     ledger = None
     if args.no_ledger:
         print("\nWARNING: persistence disabled (--no-ledger) — wallets reset on every restart")

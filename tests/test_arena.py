@@ -121,22 +121,28 @@ def _account():
 # ── Fee model unit tests (no LLM required) ──────────────────────
 
 
+# BTC costs ~$50k per unit and orders are capped at one decimal place, so a $100
+# wallet can never fill a BTC order. The fee tests below trade SOL (~$100/unit) at
+# sizes a real $100 wallet funds; the accounting under test is product-agnostic.
+SOL_ASK = 100.10
+SOL_BID = 99.90
+
+
 def test_buy_fee_capitalized_into_cost_basis():
     """A buy with fees charges notional + fee and rolls the fee into cost basis."""
     store.set_fee_model(FeeModel(taker_bps=60))
     agent = "fee_test_buy"
 
-    result = store.execute_trade(agent, "BTC-USD", 0.5, "buy")
+    result = store.execute_trade(agent, "SOL-USD", 0.5, "buy")
     assert result.success, result.message
 
     account = store.get_or_create(agent)
-    price = 50010.00  # best_ask
-    notional = price * 0.5
+    notional = SOL_ASK * 0.5
     expected_fee = notional * 0.006
     expected_cash_out = notional + expected_fee
 
     assert account.cash == pytest.approx(INITIAL_CASH - expected_cash_out)
-    assert account.cost_basis["BTC-USD"] == pytest.approx(expected_cash_out)
+    assert account.cost_basis["SOL-USD"] == pytest.approx(expected_cash_out)
 
 
 def test_sell_fee_deducted_from_proceeds():
@@ -144,21 +150,20 @@ def test_sell_fee_deducted_from_proceeds():
     store.set_fee_model(FeeModel(taker_bps=60))
     agent = "fee_test_sell"
 
-    store.execute_trade(agent, "BTC-USD", 0.5, "buy")
+    store.execute_trade(agent, "SOL-USD", 0.5, "buy")
     account = store.get_or_create(agent)
     cash_after_buy = account.cash
 
-    result = store.execute_trade(agent, "BTC-USD", 0.5, "sell")
+    result = store.execute_trade(agent, "SOL-USD", 0.5, "sell")
     assert result.success, result.message
 
-    sell_price = 49990.00  # best_bid
-    sell_notional = sell_price * 0.5
+    sell_notional = SOL_BID * 0.5
     sell_fee = sell_notional * 0.006
     expected_proceeds = sell_notional - sell_fee
 
     assert account.cash == pytest.approx(cash_after_buy + expected_proceeds)
     # Fully closed position — round-trip in a flat market always loses both fees
-    assert "BTC-USD" not in account.positions
+    assert "SOL-USD" not in account.positions
 
 
 def test_zero_fee_matches_notional():
@@ -166,11 +171,11 @@ def test_zero_fee_matches_notional():
     store.set_fee_model(FeeModel(taker_bps=0))
     agent = "fee_test_zero"
 
-    store.execute_trade(agent, "BTC-USD", 0.5, "buy")
+    store.execute_trade(agent, "SOL-USD", 0.5, "buy")
     account = store.get_or_create(agent)
 
-    assert account.cash == pytest.approx(INITIAL_CASH - 50010.00 * 0.5)
-    assert account.cost_basis["BTC-USD"] == pytest.approx(50010.00 * 0.5)
+    assert account.cash == pytest.approx(INITIAL_CASH - SOL_ASK * 0.5)
+    assert account.cost_basis["SOL-USD"] == pytest.approx(SOL_ASK * 0.5)
 
 
 def test_buy_fee_blocks_when_cash_insufficient_for_fee():
@@ -179,9 +184,9 @@ def test_buy_fee_blocks_when_cash_insufficient_for_fee():
     agent = "fee_test_insufficient"
     account = store.get_or_create(agent)
     # Just enough cash for notional, not for the 0.6% fee on top.
-    account.cash = 50010.00 * 0.5
+    account.cash = SOL_ASK * 0.5
 
-    result = store.execute_trade(agent, "BTC-USD", 0.5, "buy")
+    result = store.execute_trade(agent, "SOL-USD", 0.5, "buy")
     assert not result.success
     assert "Insufficient cash" in result.message
 
@@ -191,12 +196,12 @@ def test_total_fees_paid_accumulates_buy_and_sell():
     store.set_fee_model(FeeModel(taker_bps=60))
     agent = "fee_test_total"
 
-    store.execute_trade(agent, "BTC-USD", 0.5, "buy")
-    store.execute_trade(agent, "BTC-USD", 0.5, "sell")
+    store.execute_trade(agent, "SOL-USD", 0.5, "buy")
+    store.execute_trade(agent, "SOL-USD", 0.5, "sell")
     account = store.get_or_create(agent)
 
-    buy_fee = 50010.00 * 0.5 * 0.006
-    sell_fee = 49990.00 * 0.5 * 0.006
+    buy_fee = SOL_ASK * 0.5 * 0.006
+    sell_fee = SOL_BID * 0.5 * 0.006
     assert account.total_fees_paid == pytest.approx(buy_fee + sell_fee)
 
 
@@ -205,11 +210,11 @@ def test_realized_pnl_zero_until_position_closed():
     store.set_fee_model(FeeModel(taker_bps=60))
     agent = "fee_test_open_only"
 
-    store.execute_trade(agent, "BTC-USD", 0.5, "buy")
+    store.execute_trade(agent, "SOL-USD", 0.5, "buy")
     account = store.get_or_create(agent)
 
     assert account.realized_pnl == 0.0
-    assert account.total_fees_paid == pytest.approx(50010.00 * 0.5 * 0.006)
+    assert account.total_fees_paid == pytest.approx(SOL_ASK * 0.5 * 0.006)
 
 
 def test_realized_pnl_nets_both_fees_on_round_trip():
@@ -221,15 +226,15 @@ def test_realized_pnl_nets_both_fees_on_round_trip():
     store.set_fee_model(FeeModel(taker_bps=60))
     agent = "fee_test_realized"
 
-    store.execute_trade(agent, "BTC-USD", 0.5, "buy")
-    store.execute_trade(agent, "BTC-USD", 0.5, "sell")
+    store.execute_trade(agent, "SOL-USD", 0.5, "buy")
+    store.execute_trade(agent, "SOL-USD", 0.5, "sell")
     account = store.get_or_create(agent)
 
-    cost_basis = 50010.00 * 0.5 * 1.006  # notional + capitalized buy fee
-    proceeds = 49990.00 * 0.5 * 0.994  # notional − sell fee
+    cost_basis = SOL_ASK * 0.5 * 1.006  # notional + capitalized buy fee
+    proceeds = SOL_BID * 0.5 * 0.994  # notional − sell fee
     assert account.realized_pnl == pytest.approx(proceeds - cost_basis)
     assert account.realized_pnl < 0  # spread + round-trip fees guarantee a loss
-    assert "BTC-USD" not in account.positions
+    assert "SOL-USD" not in account.positions
 
 
 def test_partial_sell_reduces_basis_proportionally_and_realizes_pnl():
@@ -237,18 +242,18 @@ def test_partial_sell_reduces_basis_proportionally_and_realizes_pnl():
     store.set_fee_model(FeeModel(taker_bps=60))
     agent = "fee_test_partial"
 
-    store.execute_trade(agent, "BTC-USD", 1.0, "buy")
+    store.execute_trade(agent, "SOL-USD", 0.5, "buy")
     account = store.get_or_create(agent)
-    avg_cost = account.avg_cost_per_unit("BTC-USD")  # fee-inclusive
+    avg_cost = account.avg_cost_per_unit("SOL-USD")  # fee-inclusive
 
-    store.execute_trade(agent, "BTC-USD", 0.4, "sell")
+    store.execute_trade(agent, "SOL-USD", 0.2, "sell")
 
-    cash_in = 49990.00 * 0.4 * 0.994  # best_bid notional − sell fee
-    assert account.positions["BTC-USD"] == pytest.approx(0.6)
+    cash_in = SOL_BID * 0.2 * 0.994  # best_bid notional − sell fee
+    assert account.positions["SOL-USD"] == pytest.approx(0.3)
     # Per-unit cost is unchanged by a partial sell; only quantity and basis shrink.
-    assert account.avg_cost_per_unit("BTC-USD") == pytest.approx(avg_cost)
-    assert account.cost_basis["BTC-USD"] == pytest.approx(avg_cost * 0.6)
-    assert account.realized_pnl == pytest.approx(cash_in - avg_cost * 0.4)
+    assert account.avg_cost_per_unit("SOL-USD") == pytest.approx(avg_cost)
+    assert account.cost_basis["SOL-USD"] == pytest.approx(avg_cost * 0.3)
+    assert account.realized_pnl == pytest.approx(cash_in - avg_cost * 0.2)
 
 
 def test_multiple_buys_use_weighted_average_cost_including_fees():
@@ -256,22 +261,22 @@ def test_multiple_buys_use_weighted_average_cost_including_fees():
     store.set_fee_model(FeeModel(taker_bps=60))
     agent = "fee_test_avg"
 
-    store.execute_trade(agent, "BTC-USD", 0.5, "buy")
-    cost1 = 50010.00 * 0.5 * 1.006  # notional + capitalized fee
+    store.execute_trade(agent, "SOL-USD", 0.1, "buy")
+    cost1 = SOL_ASK * 0.1 * 1.006  # notional + capitalized fee
 
-    # Raise BTC's price, then buy again. The fixture re-seeds the book each test,
+    # Raise SOL's price, then buy again. The fixture re-seeds the book each test,
     # so this mutation does not leak.
     higher = dict(
-        TEST_PRICES["BTC-USD"], price="60000.00", best_bid="59990.00", best_ask="60010.00"
+        TEST_PRICES["SOL-USD"], price="150.00", best_bid="149.90", best_ask="150.10"
     )
     price_book.update(higher)
-    store.execute_trade(agent, "BTC-USD", 0.5, "buy")
-    cost2 = 60010.00 * 0.5 * 1.006
+    store.execute_trade(agent, "SOL-USD", 0.1, "buy")
+    cost2 = 150.10 * 0.1 * 1.006
 
     account = store.get_or_create(agent)
-    assert account.positions["BTC-USD"] == pytest.approx(1.0)
-    assert account.cost_basis["BTC-USD"] == pytest.approx(cost1 + cost2)
-    assert account.avg_cost_per_unit("BTC-USD") == pytest.approx(cost1 + cost2)
+    assert account.positions["SOL-USD"] == pytest.approx(0.2)
+    assert account.cost_basis["SOL-USD"] == pytest.approx(cost1 + cost2)
+    assert account.avg_cost_per_unit("SOL-USD") == pytest.approx((cost1 + cost2) / 0.2)
 
 
 def test_realized_pnl_accumulates_across_multiple_closes():
@@ -279,14 +284,14 @@ def test_realized_pnl_accumulates_across_multiple_closes():
     store.set_fee_model(FeeModel(taker_bps=60))
     agent = "fee_test_accum"
 
-    store.execute_trade(agent, "BTC-USD", 0.5, "buy")
-    store.execute_trade(agent, "BTC-USD", 0.5, "sell")
+    store.execute_trade(agent, "SOL-USD", 0.5, "buy")
+    store.execute_trade(agent, "SOL-USD", 0.5, "sell")
     account = store.get_or_create(agent)
     first_close = account.realized_pnl
     assert first_close < 0
 
-    store.execute_trade(agent, "BTC-USD", 0.5, "buy")
-    store.execute_trade(agent, "BTC-USD", 0.5, "sell")
+    store.execute_trade(agent, "SOL-USD", 0.5, "buy")
+    store.execute_trade(agent, "SOL-USD", 0.5, "sell")
     assert account.realized_pnl == pytest.approx(2 * first_close)
 
 
@@ -295,9 +300,9 @@ def test_rejected_buy_leaves_account_state_unchanged():
     store.set_fee_model(FeeModel(taker_bps=60))
     agent = "fee_test_reject"
     account = store.get_or_create(agent)
-    account.cash = 100.0  # nowhere near enough for 0.5 BTC
+    account.cash = 100.0  # a whole SOL unit plus fee is out of reach
 
-    result = store.execute_trade(agent, "BTC-USD", 0.5, "buy")
+    result = store.execute_trade(agent, "SOL-USD", 1.0, "buy")
     assert not result.success
     assert account.cash == 100.0
     assert account.positions == {}
@@ -321,11 +326,11 @@ def test_recorder_receives_fee_on_trade():
 
     store.attach_recorder(_FakeRecorder())
     try:
-        store.execute_trade(agent, "BTC-USD", 0.5, "buy")
+        store.execute_trade(agent, "SOL-USD", 0.5, "buy")
     finally:
         store.attach_recorder(None)  # detach so other tests are unaffected
 
-    assert captured["fee"] == pytest.approx(50010.00 * 0.5 * 0.006)
+    assert captured["fee"] == pytest.approx(SOL_ASK * 0.5 * 0.006)
 
 
 # ── FeeModel unit tests (no account store) ──────────────────────
@@ -369,17 +374,17 @@ def test_fee_model_disclosure_prompt():
 @pytest.mark.asyncio
 @skip_if_no_openai_key
 async def test_agent_executes_trade(deploy_client):
-    """Agent receives a prompt and executes a BTC buy via the execute_trade tool."""
+    """Agent receives a prompt and executes a SOL buy via the execute_trade tool."""
     client = deploy_client
 
     async with TestKafkaBroker(client.broker):
         await client.agent(topic=AGENT_INPUT_TOPIC).execute(
-            "Buy 0.1 BTC-USD right now.",
+            "Buy 0.5 SOL-USD right now.",
             timeout=30.0,
         )
 
         account = _account()
-        assert account.positions.get("BTC-USD", 0) > 0, "Agent should have bought BTC"
+        assert account.positions.get("SOL-USD", 0) > 0, "Agent should have bought SOL"
         assert account.cash < INITIAL_CASH, "Cash should have decreased after buying"
         assert account.trade_count > 0
 
@@ -398,7 +403,7 @@ async def test_agent_checks_portfolio(deploy_client):
         )
 
         assert result.output is not None
-        assert "100,000" in str(result.output) or "100000" in str(result.output)
+        assert f"{INITIAL_CASH:,.2f}" in str(result.output)
 
 
 @pytest.mark.llm
@@ -411,7 +416,7 @@ async def test_multi_turn_trading(deploy_client):
     async with TestKafkaBroker(client.broker):
         # Turn 1: Buy SOL
         result = await client.agent(topic=AGENT_INPUT_TOPIC).execute(
-            "Buy 5 SOL-USD",
+            "Buy 0.5 SOL-USD",
             timeout=30.0,
         )
 
@@ -454,29 +459,29 @@ async def test_full_trading_session(deploy_client):
     client = deploy_client
 
     async with TestKafkaBroker(client.broker):
-        # Buy BTC
+        # Buy SOL
         result = await client.agent(topic=AGENT_INPUT_TOPIC).execute(
-            "Buy 0.5 BTC-USD",
+            "Buy 0.5 SOL-USD",
             timeout=30.0,
         )
 
         account = _account()
-        assert account.positions.get("BTC-USD", 0) == 0.5
-        expected_cost = 50010.00 * 0.5  # best_ask * qty
+        assert account.positions.get("SOL-USD", 0) == 0.5
+        expected_cost = 100.10 * 0.5  # best_ask * qty
         assert account.cash == pytest.approx(INITIAL_CASH - expected_cost, rel=1e-2)
 
         # Sell some
         result = await client.agent(topic=AGENT_INPUT_TOPIC).execute(
-            "Sell 0.2 BTC-USD",
+            "Sell 0.2 SOL-USD",
             message_history=result.message_history,
             timeout=30.0,
         )
 
         account = _account()
-        assert account.positions.get("BTC-USD", 0) == 0.3
+        assert account.positions.get("SOL-USD", 0) == 0.3
         assert account.trade_count == 2
 
-        # Check portfolio mentions BTC
+        # Check portfolio mentions SOL
         result = await client.agent(topic=AGENT_INPUT_TOPIC).execute(
             "Show my portfolio",
             message_history=result.message_history,
@@ -484,7 +489,7 @@ async def test_full_trading_session(deploy_client):
         )
 
         assert result.output is not None
-        assert "btc" in str(result.output).lower()
+        assert "sol" in str(result.output).lower()
 
 
 @pytest.mark.llm
@@ -494,31 +499,32 @@ async def test_autonomous_portfolio_check_and_trade(deploy_client):
     """Default-strategy agent checks portfolio and sells into a price spike in one turn.
 
     Setup:
-    - Account pre-seeded with 1.0 BTC-USD at $50,010 cost basis
-    - BTC-USD live price spiked to $500,000 (10x unrealized gain)
+    - Account pre-seeded with 0.5 SOL-USD at $100.10 cost basis ($50.05 spent)
+    - SOL-USD live price spiked to $1,000 (10x unrealized gain)
 
     The agent should autonomously:
-    1. Call get_portfolio — discover BTC position with massive unrealized P&L
-    2. Call execute_trade — sell some/all BTC to lock in profits
+    1. Call get_portfolio — discover SOL position with massive unrealized P&L
+    2. Call execute_trade — sell some/all SOL to lock in profits
 
     Both tool calls occur within a single .execute() invocation, proving the
     agent makes multiple autonomous tool calls in one turn.
     """
     client = deploy_client
 
-    # Pre-seed the arena_agent account with a BTC position
+    # Pre-seed the arena_agent account with a SOL position a $100 wallet can hold
     account = store.get_or_create(AGENT_NAME)
-    account.positions["BTC-USD"] = 1.0
-    account.cost_basis["BTC-USD"] = 50_010.0  # avg cost $50,010 (original best_ask)
-    account.cash = INITIAL_CASH - 50_010.0  # $49,990 remaining
+    seeded_cost = 100.10 * 0.5
+    account.positions["SOL-USD"] = 0.5
+    account.cost_basis["SOL-USD"] = seeded_cost  # avg cost $100.10 (original best_ask)
+    account.cash = INITIAL_CASH - seeded_cost
 
-    # Spike BTC price to $500,000 — a 10x move over cost basis
+    # Spike SOL price to $1,000 — a 10x move over cost basis
     price_book.update({
-        "product_id": "BTC-USD",
-        "price": "500000.00",
-        "best_bid": "499500.00",
+        "product_id": "SOL-USD",
+        "price": "1000.00",
+        "best_bid": "999.00",
         "best_bid_size": "5.0",
-        "best_ask": "500500.00",
+        "best_ask": "1001.00",
         "best_ask_size": "3.0",
         "side": "buy",
         "last_size": "0.5",
@@ -527,10 +533,10 @@ async def test_autonomous_portfolio_check_and_trade(deploy_client):
     })
 
     ticker_json = (
-        '[{"product_id": "BTC-USD", "price": "500000.00", '
-        '"best_bid": "499500.00", "best_ask": "500500.00"}, '
-        '{"product_id": "SOL-USD", "price": "100.00", '
-        '"best_bid": "99.90", "best_ask": "100.10"}]'
+        '[{"product_id": "BTC-USD", "price": "50000.00", '
+        '"best_bid": "49990.00", "best_ask": "50010.00"}, '
+        '{"product_id": "SOL-USD", "price": "1000.00", '
+        '"best_bid": "999.00", "best_ask": "1001.00"}]'
     )
 
     async with TestKafkaBroker(client.broker):
@@ -547,6 +553,6 @@ async def test_autonomous_portfolio_check_and_trade(deploy_client):
 
     account = _account()
     assert account.trade_count > 0, "Agent should have executed at least one trade"
-    pre_trade_cash = INITIAL_CASH - 50_010.0
-    assert account.cash > pre_trade_cash, "Cash should have increased from selling BTC"
-    assert account.positions.get("BTC-USD", 0) < 1.0, "Agent should have sold some/all BTC"
+    pre_trade_cash = INITIAL_CASH - seeded_cost
+    assert account.cash > pre_trade_cash, "Cash should have increased from selling SOL"
+    assert account.positions.get("SOL-USD", 0) < 0.5, "Agent should have sold some/all SOL"

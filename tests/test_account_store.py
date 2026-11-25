@@ -17,9 +17,12 @@ from arena.account_store import AccountStore
 from arena.ledger import Ledger
 from arena.models import INITIAL_CASH, AgentAccount, TradeResult
 
-BTC_ASK = 50010.00
-BTC_BID = 49990.00
+# BTC costs ~$50k per unit and orders are capped at one decimal place, so no BTC order
+# fits the $100 wallet. Trades below use the affordable products (SOL ~$100/unit,
+# XRP ~$2/unit) at quantities a real $100 wallet can fund; BTC is kept only where a
+# test needs a quote the arena will refuse to fill.
 SOL_ASK = 100.10
+SOL_BID = 99.90
 
 
 # ── Happy-path execution & price selection ───────────────────────
@@ -27,32 +30,34 @@ SOL_ASK = 100.10
 
 def test_buy_executes_at_best_ask(make_store):
     store = make_store(taker_bps=0)
-    result = store.execute_trade("a", "BTC-USD", 1.0, "buy")
+    result = store.execute_trade("a", "SOL-USD", 0.5, "buy")
     assert result.success, result.message
 
     acct = store.get_or_create("a")
-    assert acct.positions["BTC-USD"] == pytest.approx(1.0)
-    assert acct.cash == pytest.approx(INITIAL_CASH - BTC_ASK)  # filled at ask, not last/bid
-    assert acct.cost_basis["BTC-USD"] == pytest.approx(BTC_ASK)
+    assert acct.positions["SOL-USD"] == pytest.approx(0.5)
+    expected_cost = SOL_ASK * 0.5
+    assert acct.cash == pytest.approx(INITIAL_CASH - expected_cost)  # filled at ask, not last/bid
+    assert acct.cost_basis["SOL-USD"] == pytest.approx(expected_cost)
     assert acct.trade_count == 1
 
 
 def test_sell_executes_at_best_bid(make_store):
     store = make_store(taker_bps=0)
-    store.execute_trade("a", "BTC-USD", 1.0, "buy")
+    store.execute_trade("a", "SOL-USD", 0.5, "buy")
     cash_after_buy = store.get_or_create("a").cash
 
-    result = store.execute_trade("a", "BTC-USD", 1.0, "sell")
+    result = store.execute_trade("a", "SOL-USD", 0.5, "sell")
     assert result.success, result.message
     acct = store.get_or_create("a")
-    assert acct.cash == pytest.approx(cash_after_buy + BTC_BID)  # proceeds at bid, not last/ask
+    # proceeds at bid, not last/ask
+    assert acct.cash == pytest.approx(cash_after_buy + SOL_BID * 0.5)
 
 
 def test_action_and_product_id_are_normalized(make_store):
     store = make_store(taker_bps=0)
-    result = store.execute_trade("a", "  btc-usd ", 1.0, " BUY ")
+    result = store.execute_trade("a", "  sol-usd ", 0.5, " BUY ")
     assert result.success, result.message
-    assert "BTC-USD" in store.get_or_create("a").positions
+    assert "SOL-USD" in store.get_or_create("a").positions
 
 
 # ── Validation / reject paths (no state mutation) ────────────────
@@ -93,9 +98,9 @@ def test_excess_precision_quantity_rejected(make_store, qty):
 def test_insufficient_cash_leaves_state_unchanged(make_store):
     store = make_store(taker_bps=0)
     acct = store.get_or_create("a")
-    acct.cash = 100.0  # nowhere near 1 BTC @ 50010
+    acct.cash = 100.0  # one SOL unit costs $100.10 — a cent more than the wallet holds
 
-    result = store.execute_trade("a", "BTC-USD", 1.0, "buy")
+    result = store.execute_trade("a", "SOL-USD", 1.0, "buy")
     assert not result.success
     assert "Insufficient cash" in result.message
     assert acct.cash == 100.0
@@ -107,16 +112,16 @@ def test_insufficient_cash_leaves_state_unchanged(make_store):
 
 def test_sell_more_than_held_rejected(make_store):
     store = make_store(taker_bps=0)
-    store.execute_trade("a", "BTC-USD", 1.0, "buy")
-    result = store.execute_trade("a", "BTC-USD", 2.0, "sell")
+    store.execute_trade("a", "SOL-USD", 0.5, "buy")
+    result = store.execute_trade("a", "SOL-USD", 1.0, "sell")
     assert not result.success
     assert "Insufficient holdings" in result.message
-    assert store.get_or_create("a").positions["BTC-USD"] == pytest.approx(1.0)  # untouched
+    assert store.get_or_create("a").positions["SOL-USD"] == pytest.approx(0.5)  # untouched
 
 
 def test_sell_with_no_position_rejected(make_store):
     store = make_store()
-    result = store.execute_trade("a", "BTC-USD", 1.0, "sell")
+    result = store.execute_trade("a", "SOL-USD", 0.5, "sell")
     assert not result.success
     assert "Insufficient holdings" in result.message
 
@@ -126,28 +131,28 @@ def test_sell_with_no_position_rejected(make_store):
 
 def test_full_sell_clears_position_and_all_metadata(make_store):
     store = make_store(taker_bps=0)
-    store.execute_trade("a", "BTC-USD", 1.0, "buy")
-    store.execute_trade("a", "BTC-USD", 1.0, "sell")
+    store.execute_trade("a", "SOL-USD", 0.5, "buy")
+    store.execute_trade("a", "SOL-USD", 0.5, "sell")
 
     acct = store.get_or_create("a")
-    assert "BTC-USD" not in acct.positions
-    assert "BTC-USD" not in acct.cost_basis
-    assert "BTC-USD" not in acct.avg_entry_ts
+    assert "SOL-USD" not in acct.positions
+    assert "SOL-USD" not in acct.cost_basis
+    assert "SOL-USD" not in acct.avg_entry_ts
 
 
 def test_partial_sell_keeps_per_unit_cost_and_all_keys(make_store):
     store = make_store(taker_bps=0)
-    store.execute_trade("a", "BTC-USD", 1.0, "buy")
+    store.execute_trade("a", "SOL-USD", 0.5, "buy")
     acct = store.get_or_create("a")
-    avg_before = acct.avg_cost_per_unit("BTC-USD")
+    avg_before = acct.avg_cost_per_unit("SOL-USD")
 
-    store.execute_trade("a", "BTC-USD", 0.4, "sell")
+    store.execute_trade("a", "SOL-USD", 0.2, "sell")
 
-    assert acct.positions["BTC-USD"] == pytest.approx(0.6)
-    assert acct.avg_cost_per_unit("BTC-USD") == pytest.approx(avg_before)
+    assert acct.positions["SOL-USD"] == pytest.approx(0.3)
+    assert acct.avg_cost_per_unit("SOL-USD") == pytest.approx(avg_before)
     # All three maps remain populated and in sync after a partial close.
-    assert acct.cost_basis["BTC-USD"] == pytest.approx(avg_before * 0.6)
-    assert "BTC-USD" in acct.avg_entry_ts
+    assert acct.cost_basis["SOL-USD"] == pytest.approx(avg_before * 0.3)
+    assert "SOL-USD" in acct.avg_entry_ts
 
 
 def test_account_maps_stay_in_sync_across_a_trade_sequence(make_store):
@@ -155,12 +160,12 @@ def test_account_maps_stay_in_sync_across_a_trade_sequence(make_store):
     store = make_store(taker_bps=10)
     acct = store.get_or_create("a")
     sequence = [
-        ("BTC-USD", 1.0, "buy"),
-        ("SOL-USD", 5.0, "buy"),
-        ("BTC-USD", 0.5, "buy"),
-        ("BTC-USD", 0.5, "sell"),
-        ("SOL-USD", 5.0, "sell"),  # fully closes SOL
-        ("BTC-USD", 1.0, "sell"),  # fully closes BTC
+        ("SOL-USD", 0.5, "buy"),
+        ("XRP-USD", 5.0, "buy"),
+        ("SOL-USD", 0.2, "buy"),
+        ("SOL-USD", 0.2, "sell"),
+        ("XRP-USD", 5.0, "sell"),  # fully closes XRP
+        ("SOL-USD", 0.5, "sell"),  # fully closes SOL
     ]
     for product, qty, action in sequence:
         assert store.execute_trade("a", product, qty, action).success
@@ -185,9 +190,9 @@ def test_weighted_average_entry_timestamp(make_store, monkeypatch):
     monkeypatch.setattr(acct_mod, "datetime", _FixedClock)
 
     store = make_store(taker_bps=0)
-    assert store.execute_trade("a", "SOL-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.1, "buy").success
     clock["t"] = 2000.0
-    assert store.execute_trade("a", "SOL-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.1, "buy").success
 
     # Equal sizes at t=1000 and t=2000 → weighted-average entry of 1500.
     assert store.get_or_create("a").avg_entry_ts["SOL-USD"] == pytest.approx(1500.0)
@@ -198,15 +203,15 @@ def test_weighted_average_entry_timestamp(make_store, monkeypatch):
 
 def test_trade_log_appends_one_entry_per_fill(make_store):
     store = make_store(taker_bps=10)
-    store.execute_trade("a", "BTC-USD", 1.0, "buy")
-    store.execute_trade("a", "BTC-USD", 0.5, "sell")
+    store.execute_trade("a", "SOL-USD", 0.5, "buy")
+    store.execute_trade("a", "SOL-USD", 0.2, "sell")
 
     log = store.trade_log
     assert len(log) == 2
-    assert log[0].action == "buy" and log[0].product_id == "BTC-USD"
-    assert log[0].price == pytest.approx(BTC_ASK)
+    assert log[0].action == "buy" and log[0].product_id == "SOL-USD"
+    assert log[0].price == pytest.approx(SOL_ASK)
     assert log[1].action == "sell"
-    assert log[1].price == pytest.approx(BTC_BID)
+    assert log[1].price == pytest.approx(SOL_BID)
     assert log[0].fee > 0  # 10 bps charged
 
 
@@ -219,13 +224,13 @@ def test_latency_forwarded_to_log_and_recorder(make_store):
             captured.update(kw)
 
     store.attach_recorder(_Recorder())
-    store.execute_trade("a", "BTC-USD", 1.0, "buy", latency=1.23)
+    store.execute_trade("a", "SOL-USD", 0.5, "buy", latency=1.23)
 
     assert store.trade_log[0].latency == pytest.approx(1.23)
     assert captured["latency"] == pytest.approx(1.23)
     assert captured["agent_id"] == "a"
     assert captured["action"] == "buy"
-    assert captured["cash_after"] == pytest.approx(INITIAL_CASH - BTC_ASK)
+    assert captured["cash_after"] == pytest.approx(INITIAL_CASH - SOL_ASK * 0.5)
 
 
 def test_rejected_trade_is_not_recorded(make_store):
@@ -237,7 +242,7 @@ def test_rejected_trade_is_not_recorded(make_store):
             calls.append(kw)
 
     store.attach_recorder(_Recorder())
-    result = store.execute_trade("a", "BTC-USD", 1.0, "sell")  # nothing held → rejected
+    result = store.execute_trade("a", "SOL-USD", 0.5, "sell")  # nothing held → rejected
     assert not result.success
     assert calls == []
     assert store.trade_log == []
@@ -288,8 +293,8 @@ def test_nan_quantity_rejected(make_store):
 def test_full_position_sell_after_fractional_buys(make_store):
     store = make_store(taker_bps=0)
     for qty in (0.1, 0.1, 0.7):
-        assert store.execute_trade("a", "BTC-USD", qty, "buy").success
-    result = store.execute_trade("a", "BTC-USD", 0.9, "sell")
+        assert store.execute_trade("a", "SOL-USD", qty, "buy").success
+    result = store.execute_trade("a", "SOL-USD", 0.9, "sell")
     assert result.success, result.message
 
 
@@ -298,7 +303,7 @@ def test_full_position_sell_after_fractional_buys(make_store):
 
 def test_store_without_ledger_stays_purely_in_memory(make_store):
     store = make_store(taker_bps=0)
-    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
 
     assert store.get_or_create("a").trade_count == 1
     assert len(store.trade_log) == 1
@@ -341,9 +346,9 @@ def test_attach_ledger_hydrates_persisted_accounts(make_store, make_ledger):
 
 def test_reopened_store_restores_cash_positions_and_counters(make_store_with_ledger):
     first = make_store_with_ledger(taker_bps=10)
-    assert first.execute_trade("a", "BTC-USD", 1.5, "buy").success
-    assert first.execute_trade("a", "SOL-USD", 4.0, "buy").success
-    assert first.execute_trade("a", "BTC-USD", 0.5, "sell").success
+    assert first.execute_trade("a", "SOL-USD", 0.5, "buy").success
+    assert first.execute_trade("a", "XRP-USD", 5.0, "buy").success
+    assert first.execute_trade("a", "SOL-USD", 0.2, "sell").success
     before = first.get_or_create("a")
 
     restarted = make_store_with_ledger(taker_bps=10)  # same DB file → simulated restart
@@ -366,8 +371,8 @@ def test_reopened_store_restores_cash_positions_and_counters(make_store_with_led
 
 def test_full_sell_then_reopen_leaves_no_position(make_store_with_ledger):
     first = make_store_with_ledger(taker_bps=0)
-    assert first.execute_trade("a", "BTC-USD", 1.0, "buy").success
-    assert first.execute_trade("a", "BTC-USD", 1.0, "sell").success
+    assert first.execute_trade("a", "SOL-USD", 0.5, "buy").success
+    assert first.execute_trade("a", "SOL-USD", 0.5, "sell").success
 
     restarted = make_store_with_ledger(taker_bps=0)
     acct = restarted.get_or_create("a")
@@ -376,12 +381,12 @@ def test_full_sell_then_reopen_leaves_no_position(make_store_with_ledger):
     assert acct.cost_basis == {}
     assert acct.avg_entry_ts == {}
     assert acct.trade_count == 2
-    assert acct.cash == pytest.approx(INITIAL_CASH - BTC_ASK + BTC_BID)
+    assert acct.cash == pytest.approx(INITIAL_CASH - SOL_ASK * 0.5 + SOL_BID * 0.5)
 
 
 def test_rejected_trade_is_not_persisted(make_store_with_ledger, make_ledger):
     store = make_store_with_ledger(taker_bps=0)
-    assert not store.execute_trade("a", "BTC-USD", 1.0, "sell").success  # nothing held
+    assert not store.execute_trade("a", "SOL-USD", 0.5, "sell").success  # nothing held
     assert not store.execute_trade("a", "DOGE-USD", 1.0, "buy").success  # no live price
 
     reopened = make_ledger()
@@ -393,7 +398,7 @@ def test_attach_ledger_refuses_to_discard_live_state(make_store, make_ledger):
     """Re-attaching would silently drop every account/trade the store already holds."""
     store = make_store(taker_bps=0)
     store.attach_ledger(make_ledger())
-    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
 
     with pytest.raises(RuntimeError, match="already holds"):
         store.attach_ledger(make_ledger())
@@ -402,7 +407,7 @@ def test_attach_ledger_refuses_to_discard_live_state(make_store, make_ledger):
 def test_attach_ledger_refuses_when_only_the_trade_log_is_populated(make_store, make_ledger):
     store = make_store(taker_bps=0)
     store.attach_ledger(make_ledger())
-    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
     store.accounts.clear()  # even a half-populated store must not be re-hydrated over
 
     with pytest.raises(RuntimeError, match="already holds"):
@@ -421,7 +426,7 @@ def test_broken_ledger_keeps_the_fill_in_memory_and_flags_degraded(
     store.attach_ledger(ledger)
     ledger.close()  # the DB handle dies under us (unmounted disk, disk full, ...)
 
-    result = store.execute_trade("a", "BTC-USD", 1.0, "buy")
+    result = store.execute_trade("a", "SOL-USD", 0.5, "buy")
 
     assert result.success, result.message  # same behaviour as before: the fill stands
     assert store.ledger_degraded is True
@@ -430,15 +435,15 @@ def test_broken_ledger_keeps_the_fill_in_memory_and_flags_degraded(
 
     acct = store.get_or_create("a")
     assert acct.trade_count == 1
-    assert acct.positions == pytest.approx({"BTC-USD": 1.0})
-    assert acct.cash == pytest.approx(INITIAL_CASH - BTC_ASK)
+    assert acct.positions == pytest.approx({"SOL-USD": 0.5})
+    assert acct.cash == pytest.approx(INITIAL_CASH - SOL_ASK * 0.5)
 
 
 def test_healthy_ledger_leaves_degraded_flag_false(make_store_with_ledger):
     store = make_store_with_ledger(taker_bps=0)
 
     assert store.ledger_degraded is False
-    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
     assert store.ledger_degraded is False
 
 
@@ -477,7 +482,7 @@ def test_degraded_fill_records_a_durable_marker_for_status(make_store, make_ledg
     store = make_store(taker_bps=0)
     store.attach_ledger(_FailingFills(ledger))
 
-    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
     assert store.ledger_degraded is True
 
     with Ledger(ledger.path, read_only=True) as reader:
@@ -500,11 +505,11 @@ def test_repeated_failures_write_the_degraded_marker_once(make_store, make_ledge
     store = make_store(taker_bps=0)
     store.attach_ledger(failing)
 
-    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
     assert len(failing.degraded_marks) == 1
     first_ts, first_agent = failing.degraded_marks[0]
 
-    assert store.execute_trade("a", "BTC-USD", 0.5, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.2, "buy").success
 
     assert failing.degraded_marks == [(first_ts, first_agent)]
     assert store.ledger_degraded is True
@@ -557,7 +562,7 @@ def test_mark_ledger_healthy_is_a_noop_without_a_ledger(make_store):
 
 def test_store_without_ledger_is_never_degraded(make_store):
     store = make_store(taker_bps=0)
-    assert store.execute_trade("a", "BTC-USD", 1.0, "buy").success
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
     assert store.ledger_degraded is False
 
 
@@ -573,7 +578,8 @@ def _run_parallel_trades(store: AccountStore, agent_id: str, thread_count: int) 
     def trade() -> None:
         barrier.wait(timeout=10)  # force every thread into execute_trade at once
         try:
-            results.append(store.execute_trade(agent_id, "SOL-USD", 0.1, "buy"))
+            # XRP keeps 32 concurrent buys (32 × $0.201) well inside the $100 wallet.
+            results.append(store.execute_trade(agent_id, "XRP-USD", 0.1, "buy"))
         except BaseException as exc:  # noqa: BLE001 - any escape is the bug under test
             failures.append(exc)
 

@@ -8,7 +8,7 @@ from datetime import datetime
 
 # ── Configuration ────────────────────────────────────────────────
 
-INITIAL_CASH = 100_000.0
+INITIAL_CASH = 100.0
 
 # ── Data model ───────────────────────────────────────────────────
 

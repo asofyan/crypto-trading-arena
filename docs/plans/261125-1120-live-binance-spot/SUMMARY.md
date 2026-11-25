@@ -167,8 +167,8 @@ percentage of session-start equity (`max_daily_loss_pct`, 10) so it also scales 
   _(done: `trading.paper.instrument_rules`, `trading.instrument_cache`, `arena/instruments.py`, `arena/risk.py`. `RiskGates` is tested but has no consumer until the live executor in phase 3; `trading.mode` deliberately deferred to phase 3 so nothing can claim `live` without a live executor. Cache CLI is `uv run python -m arena.instruments --refresh`, not a `manage_bot.py` subcommand. Side effect: findings B2/B5/B6/R5 fixed.)_
 - [x] **Phase 3: Binance Spot client + order journal** — signed REST, quantizer, idempotent live booking  
   _(done: `exchanges/binance_spot.py` (HMAC signing, clock offset, venue rate limits, error mapping, `credited_qty`), ledger v2 with in-place v1→v2 migration + `orders`/`equity_events`/`fills.client_order_id`, `LiveBinanceExecutor` (journal-first, dry-run, pre-submit cash/holdings checks, kill-switch on IP ban), `trading.mode`/`trading.live` config (fail-closed). ADR 0004–0005 written. Live fills in this DB: 0 — paper resumed after migration with all history intact.)_
-- [ ] **Phase 4: Restart safety** — startup reconciliation, ARMED/HALTED state machine, crash drills  
-  _(partially pre-implemented in phase 3: `orders` journal, `settle_fill` idempotency, `data/LIVE_HALT` sentinel, auto-halt on IP ban. Still to do: startup reconcile loop, equity sync/deposits, `manage_bot.py halt/resume/reconcile`, status surface.)_
+- [x] **Phase 4: Restart safety** — startup reconciliation, ARMED/HALTED state machine, crash drills  
+  _(done: `arena/reconcile.py` (baseline-aware comparison, two-sample equity sync), `arena/live_session.py` (LiveState + startup settle-then-compare, 30s balance refresher, disarm on drift, never silently re-arm), `LiveBinanceExecutor.settle_dangling` with six crash-point tests, `manage_bot.py halt|resume|reconcile|live-init` and live lines in `status`. ADR 0006–0007 written. 495 tests green.)_
 - [ ] **Phase 5: Testnet end-to-end** — real orders on `testnet.binance.vision`, soak + restart under load
 - [ ] **Phase 6: Real-money rollout** — one agent, tiny limits, staged enablement
 

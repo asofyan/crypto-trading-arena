@@ -78,6 +78,7 @@ def run_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(manage_bot, "PID_FILE", run / "bot.pid")
     monkeypatch.setattr(manage_bot, "LOG_FILE", run / "bot.log")
     monkeypatch.setattr(manage_bot, "DEFAULT_DB", tmp_path / "data" / "arena.db")
+    monkeypatch.setattr(manage_bot, "DEFAULT_HALT_PATH", tmp_path / "data" / "LIVE_HALT")
     monkeypatch.setattr(manage_bot, "STARTUP_PROBE_SECONDS", 0.2)
     # Keep the escalation ladder fast; the ordering under test is unchanged.
     monkeypatch.setattr(manage_bot, "SIGINT_GRACE_SECONDS", 0.3)
@@ -1109,3 +1110,294 @@ def test_start_forwards_no_ledger_and_status_warns(run_dir, monkeypatch, capsys)
 
     os.kill(info["pid"], signal.SIGKILL)
     manage_bot.remove_pidfile(expect_pid=info["pid"])
+
+
+# ── Live trading controls (halt / resume / reconcile / live-init) ──
+
+
+class _VenueBalance:
+    def __init__(self, free: float) -> None:
+        self.free = free
+        self.total = free
+
+
+class _VenueClient:
+    """Stands in for BinanceSpotClient: balances and open orders only."""
+
+    def __init__(self, balances: dict[str, float], *, open_orders: int = 0) -> None:
+        self._balances = balances
+        self._open = list(range(open_orders))
+        self.closed = False
+
+    def balances(self):
+        return {asset: _VenueBalance(amount) for asset, amount in self._balances.items()}
+
+    def open_orders(self):
+        return list(self._open)
+
+    def close(self):
+        self.closed = True
+
+
+def _live_trading_config(*, reserve: float = 5.0, agents=("a1",)):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        trading=SimpleNamespace(
+            mode="live",
+            live=SimpleNamespace(
+                agent_accounts={agent: "main" for agent in agents},
+                allow_symbols=["SOLUSDT"],
+                reserve_usdt=reserve,
+                recv_window_ms=5000,
+            ),
+        )
+    )
+
+
+EXCHANGE_INFO = {
+    "symbols": [
+        {
+            "symbol": "SOLUSDT",
+            "status": "TRADING",
+            "baseAsset": "SOL",
+            "quoteAsset": "USDT",
+            "filters": [
+                {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": True},
+            ],
+        }
+    ]
+}
+
+
+@pytest.fixture
+def live_venue(monkeypatch, run_dir, tmp_path):
+    """Point the live commands at fake venue credentials and a fake account."""
+
+    def _install(
+        balances: dict[str, float], *, open_orders: int = 0, agents=("a1",), reserve: float = 5.0
+    ):
+        flag = tmp_path / "data" / "LIVE_HALT"
+        client = _VenueClient(balances, open_orders=open_orders)
+        cfg = _live_trading_config(reserve=reserve, agents=agents)
+        monkeypatch.setattr(manage_bot, "_live_config_or_exit", lambda path: cfg)
+        monkeypatch.setattr(
+            manage_bot, "_venue_client_or_exit", lambda _cfg: (client, "main", EXCHANGE_INFO)
+        )
+        return SimpleNamespace(flag=flag, client=client, cfg=cfg)
+
+    return _install
+
+
+from types import SimpleNamespace  # noqa: E402  (used by the fixture above)
+
+
+def test_halt_writes_a_flag_with_the_reason(live_venue, run_dir, tmp_path):
+    venue = live_venue({"USDT": 100.0})
+    code = manage_bot.main(
+        ["halt", "--reason", "watching a whale", "--flag", str(venue.flag)]
+    )
+
+    assert code == 0
+    assert venue.flag.read_text().strip() == "watching a whale"
+
+
+def test_resume_refuses_while_the_bot_is_running(live_venue, monkeypatch, tmp_path):
+    venue = live_venue({"USDT": 100.0})
+    venue.flag.parent.mkdir(parents=True, exist_ok=True)
+    venue.flag.write_text("operator\n")
+    monkeypatch.setattr(manage_bot, "process_state", lambda **_: {"state": "running", "pid": 42})
+
+    code = manage_bot.main(["resume", "--flag", str(venue.flag)])
+
+    assert code == 1
+    assert venue.flag.exists()  # a halt is never cleared behind a running engine's back
+
+
+def test_resume_clears_the_flag_and_asks_the_engine_to_reconcile(live_venue, monkeypatch):
+    venue = live_venue({"USDT": 100.0})
+    venue.flag.parent.mkdir(parents=True, exist_ok=True)
+    venue.flag.write_text("operator\n")
+    monkeypatch.setattr(manage_bot, "process_state", lambda **_: {"state": "stopped", "pid": None})
+
+    code = manage_bot.main(["resume", "--flag", str(venue.flag)])
+
+    assert code == 0
+    assert not venue.flag.exists()
+    with Ledger(manage_bot.DEFAULT_DB, read_only=True) as ledger:
+        assert ledger.get_meta("live_state") == "RECONCILING"
+
+
+def test_reconcile_reports_a_clean_wallet(live_venue, capsys):
+    nonlocal_venue = live_venue({"USDT": 95.0, "SOL": 0.0}, reserve=0.0)
+    with Ledger(manage_bot.DEFAULT_DB) as ledger:
+        ledger.set_meta("live_baseline", json.dumps({"USDT": 0.0, "SOL": 0.0}))
+        ledger.persist_account("a1", AgentAccount(cash=95.0))
+
+    code = manage_bot.main(["reconcile"])
+
+    assert code == 0
+    assert "reconciled" in capsys.readouterr().out
+    assert nonlocal_venue.client.closed
+
+
+def test_reconcile_fails_on_a_shortfall(live_venue, capsys):
+    live_venue({"USDT": 95.0, "SOL": 0.0}, reserve=0.0)
+    with Ledger(manage_bot.DEFAULT_DB) as ledger:
+        ledger.set_meta("live_baseline", json.dumps({"USDT": 0.0, "SOL": 0.0}))
+        account = AgentAccount(cash=95.0)
+        account.positions["SOLUSDT"] = 0.5
+        account.cost_basis["SOLUSDT"] = 50.0
+        ledger.persist_account("a1", account)
+
+    code = manage_bot.main(["reconcile"])
+
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "NOT reconciled" in out and "short 0.5" in out
+    assert "--write-down" in out
+
+
+def test_reconcile_json_is_machine_readable(live_venue, capsys):
+    live_venue({"USDT": 95.0, "SOL": 0.0}, reserve=0.0)
+    with Ledger(manage_bot.DEFAULT_DB) as ledger:
+        ledger.set_meta("live_baseline", json.dumps({"USDT": 0.0, "SOL": 0.0}))
+        ledger.persist_account("a1", AgentAccount(cash=95.0))
+
+    assert manage_bot.main(["reconcile", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["armed"] is True
+    assert payload["ledger_cash"] == pytest.approx(95.0)
+
+
+def test_live_init_records_the_baseline_and_seeds_the_agent(live_venue, monkeypatch, capsys):
+    live_venue({"USDT": 100.0, "SOL": 0.0})
+    monkeypatch.setattr(manage_bot, "process_state", lambda **_: {"state": "stopped", "pid": None})
+
+    code = manage_bot.main(["live-init", "--fund", "95"])
+
+    assert code == 0
+    with Ledger(manage_bot.DEFAULT_DB, read_only=True) as ledger:
+        baseline = json.loads(ledger.get_meta("live_baseline"))
+        agent = ledger.load_accounts()["a1"]
+        events = ledger.equity_events()
+    # 100 free − 95 allocated − 5 reserve = 0 left unallocated
+    assert baseline == {"USDT": pytest.approx(0.0), "SOL": pytest.approx(0.0)}
+    assert agent.cash == pytest.approx(95.0)
+    assert agent.positions == {}
+    assert events[0]["kind"] == "initial_allocation"
+    assert "reconcile" in capsys.readouterr().out
+
+
+def test_a_pre_existing_base_holding_is_baselined_not_allocated(live_venue, monkeypatch):
+    live_venue({"USDT": 100.0, "SOL": 1.5})
+    monkeypatch.setattr(manage_bot, "process_state", lambda **_: {"state": "stopped", "pid": None})
+
+    assert manage_bot.main(["live-init", "--fund", "95"]) == 0
+
+    with Ledger(manage_bot.DEFAULT_DB, read_only=True) as ledger:
+        baseline = json.loads(ledger.get_meta("live_baseline"))
+    assert baseline["SOL"] == pytest.approx(1.5)
+
+
+def test_live_init_then_reconcile_arms(live_venue, monkeypatch, capsys):
+    """The baseline arithmetic must make the very next reconcile clean."""
+    live_venue({"USDT": 100.0, "SOL": 0.0})
+    monkeypatch.setattr(manage_bot, "process_state", lambda **_: {"state": "stopped", "pid": None})
+
+    assert manage_bot.main(["live-init", "--fund", "95"]) == 0
+    capsys.readouterr()
+
+    assert manage_bot.main(["reconcile", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["armed"] is True
+
+
+def test_live_init_refuses_more_than_the_wallet_holds(live_venue, monkeypatch, capsys):
+    live_venue({"USDT": 50.0, "SOL": 0.0})
+    monkeypatch.setattr(manage_bot, "process_state", lambda **_: {"state": "stopped", "pid": None})
+
+    code = manage_bot.main(["live-init", "--fund", "95"])
+
+    assert code == 1
+    assert "needs 100.00" in capsys.readouterr().out
+
+
+def test_live_init_refuses_to_overwrite_live_history(live_venue, monkeypatch, capsys):
+    live_venue({"USDT": 200.0, "SOL": 0.0})
+    monkeypatch.setattr(manage_bot, "process_state", lambda **_: {"state": "stopped", "pid": None})
+    with Ledger(manage_bot.DEFAULT_DB) as ledger:
+        ledger.persist_account("a1", AgentAccount(cash=10.0, trade_count=3))
+
+    assert manage_bot.main(["live-init", "--fund", "95"]) == 1
+    assert "already has live history" in capsys.readouterr().out
+
+    assert manage_bot.main(["live-init", "--fund", "95", "--force"]) == 0
+
+
+def test_live_init_needs_the_engine_stopped(live_venue, monkeypatch, capsys):
+    live_venue({"USDT": 100.0})
+    monkeypatch.setattr(manage_bot, "process_state", lambda **_: {"state": "running", "pid": 7})
+
+    assert manage_bot.main(["live-init", "--fund", "95"]) == 1
+    assert "needs the wallet ledger to itself" in capsys.readouterr().out
+
+
+def _write_live_config(tmp_path) -> str:
+    """A minimal *valid* live-mode config, so `status` reports mode=live."""
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agents": [{"name": "a1", "provider": "p", "model": "m"}],
+                "llm_providers": {"p": {"api_key": "k"}},
+                "trading": {
+                    "mode": "live",
+                    "live": {
+                        "accounts": {"main": {"api_key": "k", "api_secret": "s"}},
+                        "agent_accounts": {"a1": "main"},
+                        "allow_symbols": ["SOLUSDT"],
+                    },
+                },
+            }
+        )
+    )
+    return str(path)
+
+
+def test_status_shows_the_live_state(live_venue, tmp_path, capsys):
+    live_venue({"USDT": 95.0})
+    config = _write_live_config(tmp_path)
+    with Ledger(manage_bot.DEFAULT_DB) as ledger:
+        ledger.set_meta("live_state", "HALTED")
+        ledger.set_meta("live_halt_reason", "SOL short 0.5")
+
+    manage_bot.main(["status", "--config", config])
+
+    out = capsys.readouterr().out
+    assert "Live:    HALTED — SOL short 0.5" in out
+
+
+def test_status_prefers_the_halt_flag_over_the_recorded_state(live_venue, tmp_path, capsys):
+    venue = live_venue({"USDT": 95.0})
+    config = _write_live_config(tmp_path)
+    venue.flag.parent.mkdir(parents=True, exist_ok=True)
+    venue.flag.write_text("operator\n")
+    with Ledger(manage_bot.DEFAULT_DB) as ledger:
+        ledger.set_meta("live_state", "ARMED")
+
+    manage_bot.main(["status", "--config", config])
+
+    assert "LIVE_HALT is set" in capsys.readouterr().out
+
+
+def test_status_reports_paper_mode_instead_of_dormant_live_state(live_venue, tmp_path, capsys):
+    live_venue({"USDT": 95.0})
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"trading": {"mode": "paper"}}))
+    with Ledger(manage_bot.DEFAULT_DB) as ledger:
+        ledger.set_meta("live_state", "RECONCILING")
+
+    manage_bot.main(["status", "--config", str(config)])
+
+    assert "Live:    not in use (trading.mode = paper)" in capsys.readouterr().out

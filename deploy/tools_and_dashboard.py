@@ -15,6 +15,7 @@ from exchanges import (
 )
 from arena.account_store import AccountStore
 from arena.execution import LiveBinanceExecutor
+from arena.live_session import HALTED, LiveSession, LiveState
 from arena.fees import FeeModel
 from arena.instruments import SymbolRules, load_cache, parse_exchange_info
 from arena.ledger import DEFAULT_DB_PATH, Ledger, LedgerInUseError, LedgerSchemaError
@@ -108,17 +109,14 @@ def halt(reason: str, *, path: Path = DEFAULT_HALT_PATH) -> None:
     logging.getLogger(__name__).error("LIVE TRADING HALTED: %s (flag: %s)", reason, path)
 
 
-def build_live_executor(
+def build_live_runtime(
     store: AccountStore,
     trading: TradingConfig,
     ledger: Ledger | None,
+    state: LiveState,
 ) -> tuple[LiveBinanceExecutor | None, str]:
     """Wire real orders, or explain why not. Never trades without a ledger."""
     live = trading.live
-    if live.dry_run:
-        logging.getLogger(__name__).warning(
-            "live.dry_run is on: orders are journaled but never sent to the venue"
-        )
     if ledger is None:
         return None, "live mode needs wallet persistence; remove --no-ledger"
     if trading.exchange != "binance":
@@ -157,7 +155,7 @@ def build_live_executor(
             max_orders_per_minute=live.max_orders_per_minute,
             max_price_age_seconds=live.max_price_age_seconds,
         ),
-        is_halted=DEFAULT_HALT_PATH.exists,
+        is_halted=state.is_halted,
     )
     executor = LiveBinanceExecutor(
         store,
@@ -168,7 +166,10 @@ def build_live_executor(
         rules=rules,
         gates=gates,
         dry_run=live.dry_run,
-        on_fatal=lambda exc: halt(f"venue refused further orders: {exc}"),
+        on_fatal=lambda exc: (
+            state.set(HALTED, f"venue refused further orders: {exc}"),
+            halt(f"venue refused further orders: {exc}"),
+        ),
     )
     summary = (
         f"live {'(DRY-RUN, no orders sent)' if live.dry_run else '(REAL MONEY)'} "
@@ -314,11 +315,35 @@ async def main():
     # Built before the worker serves tool nodes: a live executor that cannot validate
     # its credentials must leave the arena in paper mode rather than half-armed.
     mode = trading.mode
+    session: LiveSession | None = None
+    live_client = None
     if mode == "live":
-        executor, live_summary = build_live_executor(store, trading, ledger)
+        live_state = LiveState(ledger) if ledger is not None else None
+        executor, live_summary = (
+            build_live_runtime(store, trading, ledger, live_state)
+            if live_state is not None
+            else (None, "live mode needs wallet persistence; remove --no-ledger")
+        )
         print(f"Execution: {live_summary}")
-        if executor is not None:
+        if executor is not None and live_state is not None:
             store.set_executor(executor)
+            live_client = executor.client
+            session = LiveSession(
+                client=live_client,
+                store=store,
+                ledger=ledger,
+                executor=executor,
+                rules=executor.rules,
+                mapped_agents=tuple(sorted(trading.live.agent_accounts)),
+                reserve_usdt=trading.live.reserve_usdt,
+                deposit_policy=trading.live.deposit_policy,
+                sync_tolerance_usdt=trading.live.sync_tolerance_usdt,
+                refresh_seconds=trading.live.balance_refresh_seconds,
+                state=live_state,
+            )
+            report = session.start()
+            print(report.summary())
+            print(f"Live session: {session.state.state} {session.state.reason}".strip())
         else:
             mode = "paper"
             print("Execution: falling back to PAPER — live trading is not armed")
@@ -371,6 +396,10 @@ async def main():
                     recorder.start_snapshot_loop(store, interval=args.snapshot_interval)
                 await worker.run()
     finally:
+        if session is not None:
+            session.stop()
+        if live_client is not None:
+            live_client.close()
         if recorder is not None:
             await recorder.close()
         # Close after the recorder so the final CSV snapshot reads coherent state.

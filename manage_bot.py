@@ -1,4 +1,4 @@
-"""Operator CLI for the arena bot: ``start``, ``stop``, ``status``.
+"""Operator CLI for the arena bot: ``start``, ``stop``, ``status``, ``live-*``.
 
 ``start backend`` launches the tools/dashboard worker detached (log in ``.run/bot.log``);
 ``start tui`` runs the same worker in the foreground with the Rich dashboard attached.
@@ -8,10 +8,21 @@ wallet state the SQLite ledger has persisted, which is how an operator sees that
 resumed the previous session instead of resetting every agent to ``$100``, and whether the
 engine hit a persistence failure (memory and disk diverged) that outlived the process.
 
+Live trading adds four commands, split by who is allowed to write the ledger:
+
+* ``live-init`` (engine stopped) declares which slice of the wallet the arena owns and
+  records the go-live baseline, so pre-existing holdings are never counted as drift.
+* ``reconcile`` (read-only) compares the wallet with the ledger, safe while the engine runs.
+* ``halt`` (any time) writes the ``data/LIVE_HALT`` flag the risk gates consult per order.
+* ``resume`` (engine stopped) clears that flag; the engine reconciles again before arming.
+
     uv run python manage_bot.py start backend
     uv run python manage_bot.py start tui --fresh
     uv run python manage_bot.py status --json
     uv run python manage_bot.py stop
+    uv run python manage_bot.py live-init --fund 95 --agent a1
+    uv run python manage_bot.py reconcile
+    uv run python manage_bot.py halt --reason "checking something"
 """
 
 from __future__ import annotations
@@ -32,6 +43,10 @@ from datetime import datetime
 from pathlib import Path
 
 from arena.ledger import Ledger, LedgerInUseError, LedgerSchemaError
+from arena.live_session import HALTED, RECONCILING, REASON_META_KEY, STATE_META_KEY
+from arena.models import AgentAccount
+from arena.reconcile import compare
+from arena.risk import DEFAULT_HALT_PATH
 
 MANAGED_MODULE = "deploy.tools_and_dashboard"
 RUN_DIR = Path(".run")
@@ -256,6 +271,13 @@ def wallet_state(db: Path | str | None = None) -> dict:
         with Ledger(path, read_only=True) as ledger:
             state["agents"] = ledger.summary()
             state["degraded"] = ledger.degraded_marker()
+            state["live"] = {
+                "state": ledger.get_meta(STATE_META_KEY),
+                "reason": ledger.get_meta(REASON_META_KEY) or "",
+                "orders": ledger.order_counts(),
+                "has_baseline": bool(ledger.get_meta("live_baseline")),
+                "halt_flag": DEFAULT_HALT_PATH.exists(),
+            }
     except FileNotFoundError:
         return state  # raced with --fresh archiving the database away
     except (LedgerInUseError, LedgerSchemaError, sqlite3.Error, OSError) as exc:
@@ -324,12 +346,27 @@ def process_state(now: datetime | None = None, info: dict | None = None) -> dict
     return state
 
 
-def build_status(db: Path | str | None = None, now: datetime | None = None) -> dict:
+def _trading_mode(config_path: str | None) -> str | None:
+    """Best-effort: a broken config must not stop ``status`` from reporting the wallet."""
+    if not config_path:
+        return None
+    try:
+        from config import load_config
+
+        return load_config(config_path).trading.mode
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def build_status(
+    db: Path | str | None = None, now: datetime | None = None, config_path: str | None = None
+) -> dict:
     """Machine-readable snapshot consumed by ``render_status`` and ``status --json``."""
     info = read_pidfile()
     return {
         "process": process_state(now=now, info=info),
         "wallet": wallet_state(resolve_db(db, info)),
+        "mode": _trading_mode(config_path),
     }
 
 
@@ -375,6 +412,10 @@ def render_status(status: dict) -> str:
         return "\n".join(lines)
     if not wallet["agents"]:
         lines.append(f"Wallet:  no wallet state yet ({wallet['db']})")
+        live = wallet.get("live")
+        if live is not None:
+            lines.append("")
+            lines.extend(render_live_status(live, status.get("mode")))
         return "\n".join(lines)
 
     lines.append(f"Wallet:  {wallet['db']}")
@@ -387,7 +428,51 @@ def render_status(status: dict) -> str:
             f"{row['trade_count']:>8}{row['realized_pnl']:>13,.2f}"
             f"{row['total_fees_paid']:>10,.2f}  {_short_ts(row['last_fill_ts'])}"
         )
+
+    live = wallet.get("live")
+    if live is not None:
+        lines.append("")
+        lines.extend(render_live_status(live, status.get("mode")))
     return "\n".join(lines)
+
+
+def render_live_status(live: dict, mode: str | None = None) -> list[str]:
+    """The live-trading lines of ``status``: armed or not, and why."""
+    if mode == "paper":
+        # A paper ledger can carry live bookkeeping state (a halt test, a resume); the
+        # honest answer to "is this trading real money?" is the configured mode.
+        return ["Live:    not in use (trading.mode = paper)"]
+
+    state = live.get("state")
+    if not state and not live.get("orders") and not live.get("halt_flag"):
+        return ["Live:    never armed (no live session recorded in this ledger)"]
+
+    lines = []
+    if live.get("halt_flag"):
+        # The flag outranks the recorded state: a halt set while the engine was running
+        # could not write the ledger, so the file is the newer truth.
+        lines.append("Live:    HALTED — data/LIVE_HALT is set")
+    elif state == HALTED:
+        lines.append(f"Live:    HALTED — {live.get('reason') or 'no reason recorded'}")
+    elif state == RECONCILING:
+        lines.append("Live:    RECONCILING — restart the engine to finish arming")
+    elif state:
+        lines.append(f"Live:    {state}" + (f" — {live['reason']}" if live.get("reason") else ""))
+    else:
+        lines.append("Live:    unknown (session state missing)")
+
+    orders = live.get("orders") or {}
+    if orders:
+        summary = ", ".join(f"{count} {state.lower()}" for state, count in sorted(orders.items()))
+        lines.append(f"Orders:  {summary}")
+    if not live.get("has_baseline"):
+        lines.append(
+            "         no go-live baseline recorded; run `manage_bot.py live-init` before "
+            "arming"
+        )
+    if state == HALTED or live.get("halt_flag"):
+        lines.append("         re-arm: `manage_bot.py stop && manage_bot.py resume`")
+    return lines
 
 
 # ── Launch plumbing ──────────────────────────────────────────────
@@ -844,7 +929,7 @@ def _stop_unreadable_pidfile() -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    status = build_status(args.db)
+    status = build_status(args.db, config_path=args.config)
     if args.json:
         print(json.dumps(status, indent=2))
     else:
@@ -853,6 +938,269 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 # ── CLI ──────────────────────────────────────────────────────────
+
+
+# ── Live trading controls ────────────────────────────────────────
+
+
+def _require_stopped(action: str) -> bool:
+    """Live-state writes need the ledger's writer lock, which a running engine holds."""
+    state = process_state(info=read_pidfile())
+    if state["state"] == "running":
+        print(
+            f"error: the bot is running (pid {state['pid']}); `{action}` needs the wallet "
+            f"ledger to itself.\n  Run `python manage_bot.py stop` first."
+        )
+        return False
+    return True
+
+
+def _live_config_or_exit(config_path: str):
+    from config import load_config_strict
+
+    try:
+        cfg = load_config_strict(config_path)
+    except Exception as exc:  # noqa: BLE001 — the loaders already explain themselves
+        print(f"error: cannot load {config_path}: {exc}")
+        raise SystemExit(1) from exc
+    if cfg.trading.mode != "live":
+        print(
+            f"error: {config_path} sets trading.mode = {cfg.trading.mode!r}; the live "
+            f"commands need 'live'"
+        )
+        raise SystemExit(1)
+    return cfg
+
+
+def _venue_client_or_exit(cfg):
+    from exchanges.binance_spot import (
+        BINANCE_SPOT_REST,
+        BINANCE_SPOT_TESTNET_REST,
+        BinanceSpotClient,
+    )
+
+    live = cfg.trading.live
+    account_name = sorted(set(live.agent_accounts.values()))[0]
+    account = live.accounts[account_name]
+    base_url = BINANCE_SPOT_TESTNET_REST if account.testnet else BINANCE_SPOT_REST
+    client = BinanceSpotClient(
+        account.api_key,
+        account.api_secret,
+        base_url=base_url,
+        recv_window_ms=live.recv_window_ms,
+    )
+    try:
+        client.sync_time()
+        info = client.exchange_info(sorted(live.allow_symbols))
+        client.remember_symbols(info)
+    except Exception as exc:  # noqa: BLE001 — credentials/network/venue
+        client.close()
+        print(f"error: cannot reach {base_url}: {exc}")
+        raise SystemExit(1) from exc
+    return client, account_name, info
+
+
+def cmd_halt(args: argparse.Namespace) -> int:
+    path = Path(args.flag)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    reason = args.reason or "operator halt"
+    path.write_text(reason + "\n", encoding="utf-8")
+    print(f"Live trading halted: {reason}")
+    print(f"  flag:    {path}")
+    print("  effect:  a running engine refuses the next order (checked per order)")
+    print("  re-arm:  python manage_bot.py stop && python manage_bot.py resume")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    if not _require_stopped("resume"):
+        return 1
+    flag = Path(args.flag)
+    info = read_pidfile()
+    db = resolve_db(args.db, info)
+    if not flag.exists() and not db.exists():
+        print("nothing to resume: no halt flag and no ledger")
+        return 0
+
+    with Ledger(db) as ledger:
+        # The recorded state is what survives; clearing the flag is the last step, so a
+        # crash in between leaves trading disarmed rather than secretly armed.
+        ledger.set_meta(STATE_META_KEY, RECONCILING)
+        ledger.set_meta(REASON_META_KEY, "")
+    if flag.exists():
+        flag.unlink()
+    print("Halt cleared. The next start reconciles against the venue and arms itself")
+    print("only if the wallet and the ledger agree — otherwise it stays HALTED.")
+    print("  next: python manage_bot.py start backend")
+    return 0
+
+
+def _ledger_view(db: Path) -> tuple[dict[str, float], float, dict[str, float], dict[str, str]]:
+    """Read the baseline, allocated cash, positions and agents from a stopped-or-running DB."""
+    with Ledger(db, read_only=True) as ledger:
+        raw_baseline = ledger.get_meta("live_baseline")
+        accounts = ledger.load_accounts()
+    baseline: dict[str, float] = {}
+    if raw_baseline:
+        try:
+            baseline = {str(k): float(v) for k, v in json.loads(raw_baseline).items()}
+        except (ValueError, TypeError):
+            baseline = {}
+    return baseline, accounts
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    from arena.instruments import parse_exchange_info
+
+    cfg = _live_config_or_exit(args.config)
+    client, account_name, info = _venue_client_or_exit(cfg)
+    try:
+        rules = parse_exchange_info(info)
+        balances = {asset: balance.total for asset, balance in client.balances().items()}
+        open_orders = len(client.open_orders())
+    finally:
+        client.close()
+
+    db = resolve_db(args.db, read_pidfile())
+    if not db.exists():
+        print(f"error: no ledger at {db}; run `live-init` after the first start")
+        return 1
+
+    with Ledger(db, read_only=True) as ledger:
+        raw_baseline = ledger.get_meta("live_baseline")
+        accounts = ledger.load_accounts()
+    baseline = {}
+    if raw_baseline:
+        baseline = {str(k): float(v) for k, v in json.loads(raw_baseline).items()}
+
+    mapped = [
+        agent
+        for agent, mapped_account in cfg.trading.live.agent_accounts.items()
+        if mapped_account == account_name
+    ]
+    positions: dict[str, float] = {}
+    cash = 0.0
+    for agent in mapped:
+        account = accounts.get(agent)
+        if account is None:
+            continue
+        cash += account.cash
+        for symbol, quantity in account.positions.items():
+            positions[symbol] = positions.get(symbol, 0.0) + quantity
+
+    report = compare(
+        balances=balances,
+        baseline=baseline,
+        ledger_positions=positions,
+        ledger_cash=cash,
+        rules=rules,
+        reserve_usdt=cfg.trading.live.reserve_usdt,
+        open_orders=open_orders,
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "armed": report.armed,
+                    "blocking": [d.detail for d in report.blocking],
+                    "notes": [d.detail for d in report.notes],
+                    "balances": report.balances,
+                    "baseline": report.baseline,
+                    "ledger_cash": report.ledger_cash,
+                    "ledger_positions": report.ledger_positions,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"Account: {account_name}  simulation: {'no' if args.json else 'read-only'}")
+        print(report.summary())
+        if not report.armed:
+            print("\n=> a start would stay HALTED. Fix the difference, or accept a")
+            print("   withdrawal with: python manage_bot.py reconcile --write-down <amount>")
+    return 0 if report.armed else 1
+
+
+def cmd_live_init(args: argparse.Namespace) -> int:
+    if not _require_stopped("live-init"):
+        return 1
+    from arena.instruments import parse_exchange_info
+
+    cfg = _live_config_or_exit(args.config)
+    live = cfg.trading.live
+    quote = "USDT"
+    client, account_name, info = _venue_client_or_exit(cfg)
+    try:
+        balances = client.balances()
+    finally:
+        client.close()
+    parse_exchange_info(info)  # fail early if the venue does not list our symbols
+
+    mapped = [
+        agent
+        for agent, mapped_account in live.agent_accounts.items()
+        if mapped_account == account_name
+    ]
+    agent = args.agent or (mapped[0] if len(mapped) == 1 else None)
+    if agent is None:
+        print(f"error: --agent is required when {len(mapped)} agents trade {account_name}")
+        return 1
+
+    free_quote = balances[quote].free if quote in balances else 0.0
+    required = args.fund + live.reserve_usdt
+    if required > free_quote + 1e-9:
+        print(
+            f"error: {quote} balance is {free_quote:,.2f}; fund {args.fund:,.2f} + reserve "
+            f"{live.reserve_usdt:,.2f} needs {required:,.2f}"
+        )
+        return 1
+
+    db = resolve_db(args.db, read_pidfile())
+    with Ledger(db) as ledger:
+        existing = ledger.load_accounts().get(agent)
+        if existing and (existing.positions or existing.trade_count) and not args.force:
+            print(
+                f"error: ledger already has live history for {agent} "
+                f"({existing.trade_count} fill(s), {len(existing.positions)} position(s))."
+                "\n  Use a dedicated live ledger (--db data/live.db) or pass --force."
+            )
+            return 1
+
+        # The baseline is everything the arena does *not* own: pre-existing base assets,
+        # plus the quote that stays unallocated. Without it, the first reconcile would
+        # report the funding itself as drift.
+        baseline = {asset: balance.total for asset, balance in balances.items()}
+        baseline[quote] = max(0.0, free_quote - args.fund - live.reserve_usdt)
+
+        account = existing or AgentAccount()
+        account.cash = args.fund
+        account.positions.clear()
+        account.cost_basis.clear()
+        account.avg_entry_ts.clear()
+        account.trade_count = 0
+        account.total_fees_paid = 0.0
+        account.realized_pnl = 0.0
+        ledger.persist_account(agent, account)
+        ledger.set_meta("live_baseline", json.dumps(baseline, sort_keys=True))
+        ledger.set_meta("live_session_start_equity", repr(float(args.fund)))
+        ledger.set_meta(STATE_META_KEY, RECONCILING)
+        ledger.set_meta(REASON_META_KEY, "")
+        ledger.record_equity_event(
+            kind="initial_allocation",
+            amount=args.fund,
+            equity_before=0.0,
+            equity_after=float(args.fund),
+            agent_id=agent,
+            note=f"{account_name}: {quote} {free_quote:,.2f} free, reserve {live.reserve_usdt:,.2f}",
+        )
+
+    print(f"Live ledger prepared: {db}")
+    print(f"  agent:     {agent} → {account_name}")
+    print(f"  allocated: {args.fund:,.2f} {quote} (reserve {live.reserve_usdt:,.2f})")
+    print(f"  baseline:  {json.dumps(baseline, sort_keys=True)}")
+    print("  next:      python manage_bot.py reconcile   (read-only check)")
+    print("             then start the engine; it arms itself only if reconciled")
+    return 0
 
 
 def _add_launch_flags(parser: argparse.ArgumentParser) -> None:
@@ -915,11 +1263,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stop.set_defaults(handler=cmd_stop)
 
+    halt = subparsers.add_parser(
+        "halt", help="stop live trading immediately (a flag every order checks)"
+    )
+    halt.add_argument("--reason", default="", help="why (written into the flag file)")
+    halt.add_argument("--flag", default=str(DEFAULT_HALT_PATH), help="halt flag path")
+    halt.set_defaults(handler=cmd_halt)
+
+    resume = subparsers.add_parser(
+        "resume", help="clear a halt and let the next start re-reconcile and arm"
+    )
+    resume.add_argument("--db", default=None, help=f"SQLite wallet ledger (default: {DEFAULT_DB})")
+    resume.add_argument("--flag", default=str(DEFAULT_HALT_PATH), help="halt flag path")
+    resume.set_defaults(handler=cmd_resume)
+
+    reconcile = subparsers.add_parser(
+        "reconcile", help="compare the wallet with the ledger (read-only, safe while running)"
+    )
+    reconcile.add_argument("--config", default="config.json", help="Path to config file")
+    reconcile.add_argument("--db", default=None, help=f"SQLite wallet ledger (default: {DEFAULT_DB})")
+    reconcile.add_argument("--json", action="store_true", help="machine-readable report")
+    reconcile.set_defaults(handler=cmd_reconcile)
+
+    live_init = subparsers.add_parser(
+        "live-init",
+        help="declare the arena's slice of the wallet and record the go-live baseline",
+    )
+    live_init.add_argument("--fund", type=float, required=True, help="quote amount to allocate")
+    live_init.add_argument("--agent", default=None, help="agent that will trade this account")
+    live_init.add_argument("--config", default="config.json", help="Path to config file")
+    live_init.add_argument("--db", default=None, help=f"SQLite wallet ledger (default: {DEFAULT_DB})")
+    live_init.add_argument(
+        "--force", action="store_true", help="reset an agent that already has live history"
+    )
+    live_init.set_defaults(handler=cmd_live_init)
+
     status = subparsers.add_parser("status", help="show process state and wallet balances")
     status.add_argument(
         "--db", default=None, help=f"SQLite wallet ledger path (default: {DEFAULT_DB})"
     )
     status.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    status.add_argument(
+        "--config",
+        default="config.json",
+        help="Path to config file, used to report the trading mode",
+    )
     status.set_defaults(handler=cmd_status)
 
     return parser

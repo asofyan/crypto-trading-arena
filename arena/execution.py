@@ -204,6 +204,14 @@ class LiveBinanceExecutor:
     def dry_run(self) -> bool:
         return self._dry_run
 
+    @property
+    def client(self) -> BinanceSpotClient:
+        return self._client
+
+    @property
+    def rules(self) -> dict[str, SymbolRules]:
+        return dict(self._rules)
+
     def execute(self, request: FillRequest) -> TradeResult:
         agent_id = request.agent_id
         symbol = request.product_id.upper().strip()
@@ -411,6 +419,100 @@ class LiveBinanceExecutor:
             fill.fee_asset or "?", result.success,
         )
         return result
+
+    # ── crash recovery ──────────────────────────────────────────
+
+    def settle_dangling(self) -> list[tuple[str, str]]:
+        """Resolve every order whose outcome this process never learned.
+
+        Runs before the first comparison at startup, so a crash between "POST sent" and
+        "fill booked" cannot leave the ledger and the wallet disagreeing. Booking is
+        idempotent per ``client_order_id``, so re-running this is free.
+
+        Returns ``(client_order_id, outcome)`` pairs for the log.
+        """
+        resolved: list[tuple[str, str]] = []
+        for order in self._ledger.dangling_orders():
+            try:
+                fill = self._client.get_order(order.symbol, order.client_order_id)
+            except Exception as exc:  # noqa: BLE001 — a lookup failure must not book anything
+                log.error(
+                    "live_executor: could not resolve %s: %s", order.client_order_id, exc
+                )
+                resolved.append((order.client_order_id, "lookup-failed"))
+                continue
+
+            if fill is None:
+                # The venue has never seen this id: the POST never landed. Nothing to
+                # book, and marking it expired frees the journal for the next start.
+                self._ledger.update_order(
+                    order.client_order_id,
+                    state="EXPIRED",
+                    error="venue has no record of this order; the POST never landed",
+                )
+                resolved.append((order.client_order_id, "never-landed"))
+                continue
+
+            if not fill.is_filled:
+                self._ledger.update_order(
+                    order.client_order_id,
+                    state=fill.status or "EXPIRED",
+                    venue_order_id=fill.venue_order_id,
+                    executed_qty=fill.executed_qty,
+                    cum_notional=fill.cum_notional,
+                    price=fill.price,
+                )
+                resolved.append((order.client_order_id, fill.status.lower() or "expired"))
+                continue
+
+            booked_quantity = fill.credited_qty if order.side.upper() == "BUY" else fill.executed_qty
+            if booked_quantity <= 0 or fill.price <= 0:
+                self._ledger.update_order(
+                    order.client_order_id,
+                    state="UNKNOWN",
+                    venue_order_id=fill.venue_order_id,
+                    executed_qty=fill.executed_qty,
+                    cum_notional=fill.cum_notional,
+                    error="fill has no usable quantity or price",
+                )
+                resolved.append((order.client_order_id, "unusable-fill"))
+                continue
+
+            result = self._store.apply_fill(
+                order.agent_id,
+                order.side.lower(),
+                order.symbol,
+                booked_quantity,
+                fill.price,
+                fill.fee,
+                client_order_id=order.client_order_id,
+                fee_asset=fill.fee_asset,
+                venue_order_id=fill.venue_order_id,
+            )
+            if result.success:
+                resolved.append((order.client_order_id, "booked"))
+                continue
+
+            # The fill happened at the venue but the ledger refuses it (a sell of a
+            # position the ledger no longer holds, say). Leave the row unresolved so the
+            # next comparison reports the shortfall and the session stays disarmed.
+            self._ledger.update_order(
+                order.client_order_id,
+                state="UNKNOWN",
+                venue_order_id=fill.venue_order_id,
+                executed_qty=fill.executed_qty,
+                cum_notional=fill.cum_notional,
+                error=f"venue filled but the ledger refused it: {result.message}",
+            )
+            log.error(
+                "live_executor: %s filled at the venue but could not be booked: %s",
+                order.client_order_id, result.message,
+            )
+            resolved.append((order.client_order_id, "unbookable"))
+
+        if resolved:
+            log.warning("live_executor: settled dangling orders: %s", resolved)
+        return resolved
 
     # ── helpers ─────────────────────────────────────────────────
 

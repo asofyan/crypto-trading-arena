@@ -540,6 +540,17 @@ class Ledger:
             (agent_id, *open_positions),
         )
 
+    def persist_account(
+        self, agent_id: str, account: AgentAccount, *, timestamp: str | None = None
+    ) -> None:
+        """Write an account snapshot that no fill produced (deposit, write-down, seeding)."""
+        with self._lock:
+            conn = self._db()
+            with conn:
+                self._persist_account_state(
+                    conn, agent_id, account, timestamp or datetime.now(timezone.utc).isoformat()
+                )
+
     # ── Order journal (live execution) ───────────────────────────
 
     def _persist_account_state(

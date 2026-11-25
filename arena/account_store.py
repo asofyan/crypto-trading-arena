@@ -135,6 +135,32 @@ class AccountStore:
             self._accounts[agent_id] = AgentAccount()
         return self._accounts[agent_id]
 
+    def apply_equity_adjustment(self, agent_id: str, amount: float) -> tuple[float, float]:
+        """Move cash without a fill (deposit adoption, operator write-down).
+
+        Returns ``(equity_before, equity_after)`` so the caller can journal the event
+        with the numbers the operator will later use to explain the equity curve.
+        Refuses to push cash below zero: writing down more than the agent holds is a
+        mistake, not an instruction.
+        """
+        with self._write_lock:
+            account = self.get_or_create(agent_id)
+            before = account.portfolio_value(self._price_book)
+            if account.cash + amount < 0:
+                raise ValueError(
+                    f"cannot adjust {agent_id} by {amount:,.2f}: it holds only "
+                    f"{account.cash:,.2f} cash"
+                )
+            account.cash += amount
+            if self._ledger is not None:
+                self._ledger.persist_account(agent_id, account)
+            after = account.portfolio_value(self._price_book)
+        log.info(
+            "account_store: equity adjustment agent=%s amount=%+.2f cash=%.2f",
+            agent_id, amount, account.cash,
+        )
+        return before, after
+
     @property
     def accounts(self) -> dict[str, AgentAccount]:
         return self._accounts

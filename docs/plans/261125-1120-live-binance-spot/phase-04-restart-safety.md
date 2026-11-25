@@ -1,5 +1,28 @@
 # Phase 04: Restart Safety — Reconciliation & Arming
 
+## Status: **done** (2026-11-25)
+
+Delivered: `arena/reconcile.py` (20 tests), `arena/live_session.py` (15 tests),
+`LiveBinanceExecutor.settle_dangling` (7 crash-point tests), `manage_bot.py`
+`halt`/`resume`/`reconcile`/`live-init` + live `status` lines (13 CLI tests).
+ADR 0006 (arming semantics) and 0007 (funding policy). 495 tests green, ruff clean.
+
+### Deviations from the plan below
+
+- **Drift disarms but does not write the halt flag.** A drift is a fact to be shown; only
+  a human (`halt`) or a hard venue failure (IP ban) makes the stop permanent. This is what
+  keeps "restart and carry on" working when the drift was transient.
+- **`resume` does not reconcile itself.** It clears the flag under the writer lock and sets
+  `live_state = RECONCILING`; the engine's own startup reconcile is the only code path that
+  arms. One implementation, and no way to arm from a CLI without the venue being checked.
+- **`live-init` declares the arena's slice** (`fund + reserve`) rather than seeding from a
+  balance snapshot: the baseline stores what is *left* unallocated, so funding the wallet
+  before running it does not look like drift.
+- **Only quote surplus is adopted.** Base-asset surplus is reported, never credited into a
+  position (see ADR 0007).
+- **`LiveState` always starts at `RECONCILING` in memory**, even when the ledger says
+  `ARMED`: the persisted value is for other processes, never proof for this one.
+
 ## Objective
 
 Guarantee the operator's requirement: *stop anytime, restart, resume from the last state based on

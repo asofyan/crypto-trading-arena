@@ -62,6 +62,16 @@ class FakeClient:
         self.calls: list[tuple[str, float, str]] = []
         self.journal_at_call: str | None = None
         self._ledger: Ledger | None = None
+        # Startup reconciliation: what the venue says about a dangling order.
+        self.reconcile_outcomes: dict[str, VenueFill | None] = {}
+        self.lookups: list[tuple[str, str]] = []
+        self.lookup_error: Exception | None = None
+
+    def get_order(self, symbol: str, client_order_id: str):
+        self.lookups.append((symbol, client_order_id))
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        return self.reconcile_outcomes.get(client_order_id)
 
     def place_market_buy(self, symbol: str, quote_qty: float, client_order_id: str):
         return self._respond("buy", symbol, quote_qty, client_order_id)
@@ -501,3 +511,113 @@ def test_unexpected_venue_errors_still_produce_a_readable_message(harness):
     assert not result.success
     assert "-9000" in result.message
     assert client.calls
+
+
+# ── Crash recovery: resolving orders whose outcome was never learned ─────
+
+
+def _journalled(ledger: Ledger, *, side: str = "buy", state: str = "PENDING") -> str:
+    client_order_id = "arena-agent-crash01"
+    ledger.save_order(
+        client_order_id=client_order_id,
+        agent_id="agent",
+        account="main",
+        symbol="SOLUSDT",
+        side=side,
+        state=state,
+        qty_requested=0.1,
+        quote_qty_requested=10.0,
+    )
+    return client_order_id
+
+
+def test_a_post_that_never_landed_is_resolved_to_expired(harness):
+    """Crash between journaling and the POST: the venue has never heard of the id."""
+    executor, store, ledger, client = harness()
+    client_order_id = _journalled(ledger)
+    client.reconcile_outcomes[client_order_id] = None
+
+    resolved = executor.settle_dangling()
+
+    assert resolved == [(client_order_id, "never-landed")]
+    assert ledger.get_order(client_order_id).state == "EXPIRED"
+    assert ledger.recent_fills() == []
+    assert store.get_or_create("agent").positions == {}
+    assert ledger.dangling_orders() == []
+
+
+def test_a_fill_the_crash_swallowed_is_booked_exactly_once(harness):
+    """Crash after the POST: the venue filled it, this process never found out."""
+    executor, store, ledger, client = harness()
+    client_order_id = _journalled(ledger)
+    client.reconcile_outcomes[client_order_id] = _fill(client_order_id=client_order_id)
+
+    first = executor.settle_dangling()
+    second = executor.settle_dangling()
+
+    assert first == [(client_order_id, "booked")]
+    assert second == []  # nothing left dangling, and the fill is idempotent anyway
+    assert len(ledger.recent_fills()) == 1
+    assert store.get_or_create("agent").positions["SOLUSDT"] == pytest.approx(0.0999)
+    assert ledger.get_order(client_order_id).state == "FILLED"
+
+
+def test_replaying_the_same_settlement_books_nothing_extra(harness):
+    executor, store, ledger, client = harness()
+    client_order_id = _journalled(ledger)
+    client.reconcile_outcomes[client_order_id] = _fill(client_order_id=client_order_id)
+    executor.settle_dangling()
+    cash_after_first = store.get_or_create("agent").cash
+
+    # Force the second pass by putting the row back into a dangling state.
+    ledger.update_order(client_order_id, state="UNKNOWN")
+    executor.settle_dangling()
+
+    assert store.get_or_create("agent").cash == pytest.approx(cash_after_first)
+    assert len(ledger.recent_fills()) == 1
+
+
+def test_a_dangling_order_the_venue_expired_books_nothing(harness):
+    executor, store, ledger, client = harness()
+    client_order_id = _journalled(ledger)
+    client.reconcile_outcomes[client_order_id] = _fill(
+        client_order_id=client_order_id, status="EXPIRED", executed_qty=0.0,
+        credited_qty=0.0, cum_notional=0.0,
+    )
+
+    assert executor.settle_dangling() == [(client_order_id, "expired")]
+    assert ledger.recent_fills() == []
+    assert ledger.get_order(client_order_id).state == "EXPIRED"
+
+
+def test_a_fill_the_ledger_refuses_stays_unresolved(harness):
+    """It happened at the venue but the account cannot book it: never paper over it."""
+    executor, store, ledger, client = harness()  # no SOL holdings
+    client_order_id = _journalled(ledger, side="sell")
+    client.reconcile_outcomes[client_order_id] = _fill(
+        client_order_id=client_order_id, side="SELL", executed_qty=0.1, credited_qty=0.1,
+        cum_notional=9.99, price=99.9, fee=0.00999, fee_asset="USDT",
+    )
+
+    assert executor.settle_dangling() == [(client_order_id, "unbookable")]
+    assert ledger.get_order(client_order_id).state == "UNKNOWN"
+    assert ledger.recent_fills() == []
+    # Still dangling, so the next reconcile reports the shortfall instead of hiding it.
+    assert ledger.dangling_orders() != []
+
+
+def test_a_lookup_failure_books_nothing_and_stays_dangling(harness):
+    executor, _, ledger, client = harness()
+    client_order_id = _journalled(ledger)
+    client.lookup_error = OSError("venue unreachable")
+
+    assert executor.settle_dangling() == [(client_order_id, "lookup-failed")]
+    assert ledger.get_order(client_order_id).state == "PENDING"
+    assert ledger.recent_fills() == []
+
+
+def test_settling_nothing_is_free(harness):
+    executor, _, ledger, _ = harness()
+
+    assert executor.settle_dangling() == []
+    assert ledger.recent_fills() == []

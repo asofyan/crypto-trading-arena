@@ -486,6 +486,7 @@ def build_command(
     data_dir: str,
     db: str,
     no_ledger: bool = False,
+    snapshot_interval: float | None = None,
 ) -> list[str]:
     """The exact argv used for the child bot process (also recorded in the pid file)."""
     command = [
@@ -505,6 +506,8 @@ def build_command(
         command.append("--no-ledger")
     if headless:
         command.append("--headless")
+    if snapshot_interval is not None:
+        command.extend(["--snapshot-interval", str(snapshot_interval)])
     return command
 
 
@@ -678,6 +681,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         data_dir=args.data_dir,
         db=str(db),
         no_ledger=args.no_ledger,
+        snapshot_interval=args.snapshot_interval,
     )
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1218,6 +1222,16 @@ def _add_launch_flags(parser: argparse.ArgumentParser) -> None:
         "--no-ledger",
         action="store_true",
         help="run without wallet persistence (volatile wallets)",
+    )
+    parser.add_argument(
+        "--snapshot-interval",
+        type=float,
+        default=None,
+        help=(
+            "Seconds between portfolio snapshots (default: the engine's own 600). "
+            "The read-only monitor builds its roster for idle agents from these, so a "
+            "shorter interval is what makes a non-trading agent visible sooner."
+        ),
     )
 
 

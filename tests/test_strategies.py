@@ -91,46 +91,40 @@ def test_swing_trend_prompt_defines_regime_entries_and_exits():
     assert "cash" in prompt
 
 
-# ── `scalper-perp` trades both directions on 1:1 leverage ───────
-# Every rule the agent cannot remember between invocations has to be written down,
-# including the fact that `sell` opens a short and that leverage is capped at 1:1.
+# ── `scalper-perp` reads the market, it does not follow a checklist ─
+# The operator asked for probability, not determinism: entry is the model's read, and
+# only the mechanics (net position, 1:1, product scope) are rules.
 
 
-def test_scalper_perp_prompt_is_short_horizon_and_directional():
+def test_scalper_perp_prompt_is_a_probabilistic_both_ways_scalper():
     prompt = STRATEGIES["scalper-perp"]
     assert "PERPETUAL FUTURES" in prompt
-    assert "1-minute" in prompt and "5-minute" in prompt and "15-minute" in prompt
     lowered = prompt.lower()
     assert "long" in lowered and "short" in lowered
+    # It must say the choice is judgement, not a setup to satisfy.
+    assert "no checklist to satisfy" in lowered
 
 
-def test_scalper_perp_prompt_explains_net_position_semantics():
-    """`sell` from flat must be documented as opening a short, not as a spot sale."""
+def test_scalper_perp_prompt_keeps_the_mechanics_that_are_not_strategy():
+    """Net-position semantics and the 1:1 cap are facts about the executor, not rules."""
     prompt = STRATEGIES["scalper-perp"]
     assert "flips you short" in prompt
     assert "flips you long" in prompt
-    assert "net" in prompt.lower()
-
-
-def test_scalper_perp_prompt_states_the_1to1_cap():
-    prompt = STRATEGIES["scalper-perp"]
     assert "1:1" in prompt
     assert "equity" in prompt.lower()
+    assert "get_portfolio" in prompt
+    assert "-PERP" in prompt
 
 
-def test_scalper_perp_prompt_only_trades_perp_products():
-    assert "-PERP" in STRATEGIES["scalper-perp"]
-
-
-def test_scalper_perp_prompt_gates_entries_on_the_disclosed_fee():
-    """The fee is disclosed per turn by the connector, so the rule must not hardcode it."""
+def test_scalper_perp_prompt_has_no_fixed_entry_or_exit_thresholds():
+    """A hard percentage would put the rulebook back; the operator removed it on purpose."""
     prompt = STRATEGIES["scalper-perp"]
-    assert "round-trip fee" in prompt.lower()
-    assert "bps" not in prompt
+    for token in ("-0.6%", "+1.0%", "0.8%", "three times", "10 closed 1-minute bars"):
+        assert token not in prompt, token
 
 
-def test_scalper_perp_prompt_has_a_stop_a_target_and_a_time_stop():
-    prompt = STRATEGIES["scalper-perp"]
-    for token in ("-0.6%", "+1.0%", "15 minutes"):
-        assert token in prompt, token
-    assert "never average a loser" in prompt.lower()
+def test_scalper_perp_prompt_leaves_sizing_and_exit_to_conviction():
+    lowered = STRATEGIES["scalper-perp"].lower()
+    assert "conviction" in lowered
+    assert "prove you wrong" in lowered
+    assert "cash is a position" in lowered

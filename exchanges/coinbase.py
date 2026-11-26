@@ -23,7 +23,7 @@ import websockets
 from calfkit import Client
 
 from arena.fees import FeeModel
-from arena.models import Candle, TIMEFRAMES
+from arena.models import Candle, TIMEFRAMES, Timeframe
 from arena.price_book import CandleBook
 from exchanges import (
     AGENT_INPUT_TOPIC,
@@ -37,6 +37,16 @@ logger = logging.getLogger(__name__)
 
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 COINBASE_REST_BASE = "https://api.exchange.coinbase.com"
+
+# Coinbase Exchange serves only these candle granularities. TIMEFRAMES is shared
+# with Binance, which also carries a 4h tier — requesting 14400 here returns 400
+# and aborts the whole product's poll, so filter instead of sending it.
+COINBASE_GRANULARITIES = frozenset({60, 300, 900, 3600, 21600, 86400})
+
+
+def coinbase_timeframes() -> list[Timeframe]:
+    """The TIMEFRAMES entries this venue can actually serve."""
+    return [tf for tf in TIMEFRAMES if tf.granularity in COINBASE_GRANULARITIES]
 
 DEFAULT_PRODUCTS = [
     "BTC-USD",
@@ -71,7 +81,7 @@ async def poll_rest(
 
             for product_id in products:
                 try:
-                    for tf in TIMEFRAMES:
+                    for tf in coinbase_timeframes():
                         start = now - tf.start_minutes_ago * 60
                         end = now - tf.end_minutes_ago * 60
                         resp = await client.get(
@@ -199,7 +209,7 @@ class CoinbaseKafkaConnector:
         if self._candle_book is not None and self._candle_book.has_data():
             prompt_parts.append(
                 "\n## Price History (OHLCV candlesticks)\n"
-                "Below are candlesticks at three granularities — coarser for "
+                "Below are candlesticks at several granularities — coarser for "
                 "broader trend context, finer for recent price action.\n\n"
                 f"{self._candle_book.format_prompt(self._products)}"
             )

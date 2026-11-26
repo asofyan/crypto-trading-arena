@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from arena.models import TIMEFRAMES
 from arena.price_book import CandleBook, PriceBook, _default_parse_row
 
 
@@ -109,12 +110,13 @@ def test_format_prompt_includes_every_timeframe_and_header():
     book = CandleBook()
     book.update_from_api("BTC-USD", 60, [[1_700_000_000, 1, 2, 1, 2, 1]])
     out = book.format_prompt(["BTC-USD"])
-    # All three timeframe section labels present...
+    # All four timeframe section labels present...
+    assert "1-daily candles" in out
     assert "15-min candles" in out
     assert "5-min candles" in out
     assert "1-min candles" in out
     # ...and the CSV header appears once per section.
-    assert out.count("product,time,open,high,low,close,volume") == 3
+    assert out.count("product,time,open,high,low,close,volume") == len(TIMEFRAMES)
     # 1-min section has the data row; coarser sections have none.
     assert "BTC-USD," in out
 

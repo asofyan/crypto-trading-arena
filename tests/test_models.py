@@ -87,22 +87,40 @@ def test_trade_log_entry_latency_is_optional():
 # ── TIMEFRAMES invariants ────────────────────────────────────────
 
 
+def test_four_hour_tier_carries_enough_bars_for_the_swing_rules():
+    """The swing strategy reads a 55-bar breakout plus a 50-bar average.
+
+    An undersized window would make those lookbacks computable only from a
+    truncated slice, so assert the tier actually ships the bars.
+    """
+    tf = next(t for t in TIMEFRAMES if t.granularity == 14400)
+    bars = (tf.start_minutes_ago - tf.end_minutes_ago) / (tf.granularity / 60)
+
+    assert bars >= 150, tf.label
+    # The forming bar must stay out: decisions use closed bars only.
+    assert tf.end_minutes_ago >= tf.granularity / 60
+
+
 def test_timeframes_windows_are_descending_and_contiguous():
     """Each window runs from farther-ago to nearer-ago, and they tile 180min → now.
 
     poll_rest derives REST start/end from these, so a broken window would request
     inverted or gapped candle ranges.
     """
-    assert len(TIMEFRAMES) == 3
+    assert len(TIMEFRAMES) == 5
     for tf in TIMEFRAMES:
         assert tf.start_minutes_ago > tf.end_minutes_ago, tf.label
 
     # Coarsest first, finest last; granularity strictly decreasing.
     granularities = [tf.granularity for tf in TIMEFRAMES]
     assert granularities == sorted(granularities, reverse=True)
-    assert granularities == [900, 300, 60]
+    assert granularities == [86400, 14400, 900, 300, 60]
 
-    # Contiguous coverage: each timeframe's end is the next one's start.
-    for coarser, finer in zip(TIMEFRAMES, TIMEFRAMES[1:]):
+    # The daily tier ends at yesterday's closed bar; the minute tier tiles to now.
+    assert TIMEFRAMES[0].end_minutes_ago == 1440
+
+    # Contiguous coverage within the minute tier: each window's end is the next
+    # one's start. (The daily and 4h tiers are separate coarse tiers, not tiled.)
+    for coarser, finer in zip(TIMEFRAMES[2:], TIMEFRAMES[3:]):
         assert coarser.end_minutes_ago == finer.start_minutes_ago
     assert TIMEFRAMES[-1].end_minutes_ago == 0  # finest window ends at "now"

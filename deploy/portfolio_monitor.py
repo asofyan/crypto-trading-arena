@@ -58,6 +58,12 @@ def latest_trades_file(data_dir: Path) -> Path | None:
     return files[-1] if files else None
 
 
+def latest_snapshots_file(data_dir: Path) -> Path | None:
+    """Newest `snapshots_*.csv` — the sibling the recorder writes per session."""
+    files = sorted(data_dir.glob("snapshots_*.csv"), key=lambda p: p.stat().st_mtime)
+    return files[-1] if files else None
+
+
 class PortfolioMirror:
     """Portfolio state rebuilt from a running arena's trades CSV.
 
@@ -71,6 +77,7 @@ class PortfolioMirror:
         self._data_dir = data_dir
         self._fee_model = fee_model
         self._path: Path | None = None
+        self._snapshot_path: Path | None = None
         self._offset = 0
         self._header_line: str | None = None
         self._rows = 0
@@ -83,6 +90,10 @@ class PortfolioMirror:
     def session_file(self) -> Path | None:
         return self._path
 
+    @property
+    def snapshot_file(self) -> Path | None:
+        return self._snapshot_path
+
     def _reset_session(self, path: Path) -> None:
         logger.info("mirroring session %s", path.name)
         self.store = AccountStore(PriceBook(), self._fee_model)
@@ -91,7 +102,6 @@ class PortfolioMirror:
         self._offset = 0
         self._header_line = None
         self._rows = 0
-
     def sync(self) -> bool:
         """Pick up the newest session file and replay any rows appended since.
 
@@ -100,7 +110,9 @@ class PortfolioMirror:
         """
         path = latest_trades_file(self._data_dir)
         if path is None:
-            return False
+            # An arena can run for a while before anyone fills: keep the idle
+            # agents visible from the snapshot rows instead of showing nothing.
+            return self._seed_idle_agents(None)
         if path != self._path:
             self._reset_session(path)
 
@@ -133,6 +145,50 @@ class PortfolioMirror:
             if self._apply(row):
                 changed = True
         self._offset += consumed
+        # Seed unconditionally: `changed or seed()` would skip the roster sync
+        # on exactly the polls that replay a fill.
+        seeded = self._seed_idle_agents(path)
+        return changed or seeded
+
+    def _seed_idle_agents(self, trades_path: Path | None) -> bool:
+        """Add accounts for agents that appear in the snapshot but never filled.
+
+        A fills-only roster hides exactly the agents that are behaving: a trend
+        follower that sits in cash for a week has no trade row, yet it is a live
+        wallet the arena snapshots every cycle. Snapshot rows are the ONLY
+        evidence the recorder leaves for a zero-trade agent, so they seed a card
+        at its snapshotted cash (positions stay empty — fills are what built
+        them, and there are none).
+
+        Returns True when a new account was added, so the caller repaints once.
+        """
+        if trades_path is not None:
+            path = trades_path.with_name(
+                trades_path.name.replace("trades_", "snapshots_", 1)
+            )
+        else:
+            path = latest_snapshots_file(self._data_dir)
+        self._snapshot_path = path
+        if path is None or not path.exists():
+            return False
+
+        latest: dict[str, dict[str, str]] = {}
+        with path.open(newline="") as f:
+            for row in csv.DictReader(f):
+                agent_id = row.get("agent_id")
+                if agent_id:
+                    latest[agent_id] = row
+
+        changed = False
+        for agent_id, row in latest.items():
+            if agent_id in self.store.accounts:
+                continue
+            account = self.store.get_or_create(agent_id)
+            try:
+                account.cash = float(row["cash"])
+            except (KeyError, TypeError, ValueError):
+                pass  # A truncated row still earns the agent a card at $100.
+            changed = True
         return changed
 
     def _apply(self, row: dict[str, str]) -> bool:
@@ -255,7 +311,7 @@ async def run(args: argparse.Namespace) -> None:
                     mirror.view.attach_live(state["live"])
                     mirror.view.rerender()
 
-    print(f"Monitoring {mirror.session_file} (read-only, no wallet of its own).")
+    print(f"Monitoring {mirror.session_file or mirror.snapshot_file} (read-only, no wallet of its own).")
     print(f"Price feed: {PRICE_TOPIC} as consumer group '{MONITOR_GROUP_ID}'.")
 
     # A bare @broker.subscriber is inert until a Worker runs the app; with an empty

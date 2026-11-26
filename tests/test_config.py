@@ -262,6 +262,28 @@ def test_extra_header_flag_rejects_malformed_pair(monkeypatch):
         agent_module.parse_args()
 
 
+# ── Strategy assignment: a typo dies at load, not at agent launch ─
+
+
+def test_unknown_strategy_fails_at_load_time(tmp_path):
+    path = _write(
+        tmp_path,
+        {"agents": [{"name": "a", "provider": "p", "model": "m", "strategy": "swing_trend"}]},
+    )
+
+    with pytest.raises(ValidationError, match="unknown strategy"):
+        load_config(path)
+
+
+def test_committed_schema_lists_every_strategy():
+    from arena.strategies import STRATEGIES
+
+    schema = json.loads(Path("config.schema.json").read_text())
+    strategy = _find_key(schema, "strategy")
+
+    assert sorted(strategy["enum"]) == sorted(STRATEGIES)
+
+
 # ── .env loading ────────────────────────────────────────────────
 # Every entrypoint reads config.json, but only deploy/*.py called load_dotenv.
 # With an env-referenced api_key, the exchange connectors crashed at startup

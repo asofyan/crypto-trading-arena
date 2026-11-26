@@ -45,9 +45,16 @@
         },
         "strategy": {
           "default": "default",
-          "description": "Trading strategy (selects system prompt).",
+          "description": "Trading strategy (selects system prompt); must exist in arena/strategies.py.",
           "title": "Strategy",
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "brainrot",
+            "default",
+            "momentum",
+            "scalper",
+            "swing-trend"
+          ]
         }
       },
       "required": [

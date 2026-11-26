@@ -7,6 +7,7 @@ builds the child process command from its own flag list.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 
@@ -69,6 +70,84 @@ def test_parse_args_accepts_opt_out_flags(monkeypatch, tmp_path):
     assert args.db == str(tmp_path / "custom.db")
     assert args.no_ledger is True
     assert args.headless is True
+
+
+# ── Agent entrypoint: config.json owns the strategy assignment ──
+# `--strategy` used to be required even with --from-config, so a launcher that
+# passed the wrong name silently ran a strategy the config never assigned.
+
+
+def _agent_config_file(tmp_path, *, strategy="scalper"):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "llm_providers": {
+                    "p": {"api_key": "sk-test", "base_url": "https://llm.example/v1"}
+                },
+                "agents": [
+                    {
+                        "name": "hungerg",
+                        "provider": "p",
+                        "model": "hungerg-free",
+                        "strategy": strategy,
+                    }
+                ],
+            }
+        )
+    )
+    return path
+
+
+def _parse_from_config(monkeypatch, path, *extra):
+    import deploy.agent as agent_module
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent",
+            "--from-config", "hungerg",
+            "--bootstrap-servers", "b:9092",
+            "--config-path", str(path),
+            *extra,
+        ],
+    )
+    return agent_module, agent_module.parse_args()
+
+
+def test_from_config_supplies_the_strategy_so_it_cannot_drift(monkeypatch, tmp_path):
+    from config import load_config
+
+    path = _agent_config_file(tmp_path, strategy="scalper")
+    module, args = _parse_from_config(monkeypatch, path)
+
+    assert module.apply_agent_config(args, load_config(path)) is True
+    assert args.strategy == "scalper"
+    assert args.name == "hungerg"
+    assert args.model_id == "hungerg-free"
+    assert args.base_url == "https://llm.example/v1"
+
+
+def test_explicit_strategy_overrides_config_with_a_notice(monkeypatch, tmp_path, capsys):
+    from config import load_config
+
+    path = _agent_config_file(tmp_path, strategy="scalper")
+    module, args = _parse_from_config(monkeypatch, path, "--strategy", "default")
+
+    assert module.apply_agent_config(args, load_config(path)) is True
+    assert args.strategy == "default"
+    assert "overrides config strategy" in capsys.readouterr().out
+
+
+def test_from_config_reports_an_unknown_agent(monkeypatch, tmp_path):
+    from config import load_config
+
+    path = _agent_config_file(tmp_path)
+    module, args = _parse_from_config(monkeypatch, path)
+    args.from_config = "nobody"
+
+    assert module.apply_agent_config(args, load_config(path)) is False
 
 
 def test_describe_wallet_reports_fresh_ledger(tmp_path):

@@ -15,11 +15,12 @@ from typing import Any
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from dotenv import find_dotenv, load_dotenv
 
 from arena.fees import DEFAULT_TAKER_BPS, MAX_TAKER_BPS
+from arena.strategies import STRATEGIES
 
 DEFAULT_CONFIG_PATH = Path("config.json")
 
@@ -70,6 +71,16 @@ class AgentConfig(BaseModel):
         None, description="Reasoning effort level for supported models."
     )
     strategy: str = Field("default", description="Trading strategy (selects system prompt).")
+
+    @field_validator("strategy")
+    @classmethod
+    def _known_strategy(cls, value: str) -> str:
+        """Reject a typo at load time; otherwise it only surfaces at agent launch."""
+        if value not in STRATEGIES:
+            raise ValueError(
+                f"unknown strategy {value!r}; available: {', '.join(sorted(STRATEGIES))}"
+            )
+        return value
 
 
 class FeeConfig(BaseModel):

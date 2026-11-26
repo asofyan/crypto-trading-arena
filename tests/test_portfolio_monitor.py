@@ -8,7 +8,12 @@ from pathlib import Path
 
 from arena.fees import FeeModel
 from arena.models import INITIAL_CASH
-from deploy.portfolio_monitor import MONITOR_GROUP_ID, PortfolioMirror, latest_trades_file
+from deploy.portfolio_monitor import (
+    MONITOR_GROUP_ID,
+    PortfolioMirror,
+    latest_snapshots_file,
+    latest_trades_file,
+)
 
 TRADE_FIELDS = [
     "timestamp",
@@ -61,6 +66,60 @@ def _buy(agent="a", product="SOLUSDT", qty=0.5, price=70.0, fee=None, cash=None)
         "cash_after": cash,
         "latency": 1.0,
     }
+
+
+SNAPSHOT_FIELDS = [
+    "timestamp",
+    "agent_id",
+    "cash",
+    "product_id",
+    "quantity",
+    "cost_basis",
+    "market_price",
+    "market_value",
+    "unrealized_pnl",
+    "portfolio_value",
+    "trade_count",
+    "realized_pnl",
+    "total_fees_paid",
+]
+
+
+def _write_snapshots(path: Path, rows: list[dict]) -> Path:
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SNAPSHOT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in SNAPSHOT_FIELDS})
+    return path
+
+
+def _snap(agent: str, cash: float, product: str = "", qty: float = 0.0) -> dict:
+    """One snapshot row, shaped exactly like the arena recorder writes it."""
+    return {
+        "timestamp": "2026-01-01T00:00:00",
+        "agent_id": agent,
+        "cash": cash,
+        "product_id": product,
+        "quantity": qty,
+        "cost_basis": 0.0,
+        "market_price": 0.0,
+        "market_value": 0.0,
+        "unrealized_pnl": 0.0,
+        "portfolio_value": cash,
+        "trade_count": 0 if not product else 1,
+        "realized_pnl": 0.0,
+        "total_fees_paid": 0.0,
+    }
+
+
+def test_latest_snapshots_file_picks_newest(tmp_path):
+    old = _write_snapshots(tmp_path / "snapshots_20260101_000000.csv", [])
+    time.sleep(0.01)
+    new = _write_snapshots(tmp_path / "snapshots_20260101_010000.csv", [])
+    assert latest_snapshots_file(tmp_path) == new
+    assert latest_snapshots_file(tmp_path / "empty") is None
+    assert old.exists()
 
 
 def test_latest_trades_file_picks_newest(tmp_path):
@@ -117,6 +176,57 @@ def test_partial_last_row_is_skipped(tmp_path, fee_model_10bps):
     mirror = PortfolioMirror(tmp_path, fee_model_10bps)
     mirror.sync()
     assert mirror.replayed_contracts == 0
+
+
+def test_idle_agent_without_a_fill_still_gets_a_card(tmp_path, fee_model_10bps):
+    """A trend follower that sits in cash has no trade row, only snapshot rows.
+
+    The TUI used to build its roster from fills alone, so the most disciplined
+    agent in the arena was the one missing from it.
+    """
+    _write_trades(tmp_path / "trades_20260101_000000.csv", [_buy(agent="hungerg")])
+    _write_snapshots(
+        tmp_path / "snapshots_20260101_000000.csv",
+        [_snap("hungerg", cash=49.65, product="SOLUSDT", qty=0.5), _snap("hy4", cash=100.0)],
+    )
+
+    mirror = PortfolioMirror(tmp_path, fee_model_10bps)
+    assert mirror.sync() is True
+
+    assert set(mirror.store.accounts) == {"hungerg", "hy4"}
+    idle = mirror.store.accounts["hy4"]
+    assert idle.cash == INITIAL_CASH
+    assert not idle.positions
+    # Replayed fills are the ground truth for agents that did trade.
+    assert mirror.store.accounts["hungerg"].cash < INITIAL_CASH
+
+
+def test_snapshot_rows_never_override_replayed_fills(tmp_path, fee_model_10bps):
+    _write_trades(tmp_path / "trades_20260101_000000.csv", [_buy(agent="a")])
+    _write_snapshots(
+        tmp_path / "snapshots_20260101_000000.csv",
+        [_snap("a", cash=999.0, product="SOLUSDT", qty=0.5)],
+    )
+
+    mirror = PortfolioMirror(tmp_path, fee_model_10bps)
+    mirror.sync()
+
+    account = mirror.store.accounts["a"]
+    assert account.cash == _buy(agent="a")["cash_after"]
+    assert account.positions["SOLUSDT"] == 0.5
+
+
+def test_monitor_shows_agents_before_the_first_fill(tmp_path, fee_model_10bps):
+    _write_snapshots(tmp_path / "snapshots_20260101_000000.csv", [_snap("a", cash=100.0)])
+
+    mirror = PortfolioMirror(tmp_path, fee_model_10bps)
+    assert mirror.sync() is True
+
+    assert mirror.session_file is None
+    assert mirror.snapshot_file is not None
+    assert mirror.store.accounts["a"].cash == INITIAL_CASH
+    # Nothing new on the next poll: no repaint churn from re-seeding.
+    assert mirror.sync() is False
 
 
 def test_newer_session_file_resets_state(tmp_path, fee_model_10bps):

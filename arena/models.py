@@ -131,13 +131,17 @@ class Candle:
 class Timeframe:
     """Defines a candle granularity and the time window it covers."""
 
-    granularity: int  # seconds (API param: 60, 300, 900)
+    granularity: int  # seconds (API param: 60, 300, 900, 86400)
     start_minutes_ago: int  # beginning of window (farther from now)
     end_minutes_ago: int  # end of window (closer to now)
     label: str  # human-readable label for the agent prompt
 
 
 TIMEFRAMES = [
+    Timeframe(86400, 129600, 1440, "1-daily candles (90d ago -> yesterday)"),
+    # 4h is the swing-trend decision tier: 240 bars (~40d) leaves room for a
+    # 55-bar breakout plus a 50-bar average, and the forming bar is excluded.
+    Timeframe(14400, 57600, 240, "4-hour candles (~240 bars, 40d ago -> last closed bar)"),
     Timeframe(900, 180, 90, "15-min candles (3h ago -> 90min ago)"),
     Timeframe(300, 90, 20, "5-min candles (90min ago -> 20min ago)"),
     Timeframe(60, 20, 0, "1-min candles (last 20 minutes)"),

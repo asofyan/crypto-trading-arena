@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 from calfkit import Agent, Client, OpenAIModelClient, Worker
 from arena.tools import calculator, execute_trade, get_portfolio
 from arena.strategies import STRATEGIES
-from config import load_config
+from config import ArenaConfig, load_config
 from exchanges import AGENT_INPUT_TOPIC
 
 load_dotenv()
@@ -57,9 +57,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--strategy",
-        required=True,
+        default=None,
         choices=list(STRATEGIES.keys()),
-        help="Trading strategy (selects system prompt)",
+        help=(
+            "Trading strategy (selects system prompt). Required unless --from-config "
+            "supplies one; an explicit flag overrides the config value."
+        ),
     )
     parser.add_argument(
         "--model-id",
@@ -113,33 +116,51 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def apply_agent_config(args: argparse.Namespace, config: ArenaConfig) -> bool:
+    """Copy a config.json agent assignment onto ``args``.
+
+    Returns False when the agent is absent, so the caller can list the known ones.
+    config.json owns the strategy too: a launcher that forgets ``--strategy`` must
+    not silently run a different strategy than the one the agent was assigned.
+    """
+    agent_config = config.get_agent_config(args.from_config)
+    if agent_config is None:
+        return False
+
+    args.name = agent_config.name
+    args.model_id = agent_config.model
+    args.reasoning_effort = agent_config.reasoning_effort
+
+    if args.strategy is None:
+        args.strategy = agent_config.strategy
+    elif args.strategy != agent_config.strategy:
+        print(
+            f"note: --strategy {args.strategy} overrides config strategy "
+            f"{agent_config.strategy!r} for {agent_config.name}"
+        )
+
+    provider_config = config.get_provider_config(agent_config.provider)
+    if provider_config:
+        args.api_key = provider_config.api_key or args.api_key
+        args.base_url = provider_config.base_url or args.base_url
+        args.extra_headers.update(provider_config.extra_headers)
+        if not args.model_id and provider_config.default_model:
+            args.model_id = provider_config.default_model
+    else:
+        print(f"WARNING: Provider '{agent_config.provider}' not configured. Using CLI/env values.")
+    return True
+
+
 async def main() -> None:
     args = parse_args()
 
     # Handle config-based deployment
     if args.from_config:
         config = load_config(args.config_path)
-        agent_config = config.get_agent_config(args.from_config)
-        if not agent_config:
+        if not apply_agent_config(args, config):
             print(f"ERROR: Agent '{args.from_config}' not found in config.")
             print(f"Available agents: {[a.name for a in config.agents]}")
             sys.exit(1)
-
-        # Set values from config
-        args.name = agent_config.name
-        args.model_id = agent_config.model
-        args.reasoning_effort = agent_config.reasoning_effort
-
-        # Get provider config
-        provider_config = config.get_provider_config(agent_config.provider)
-        if provider_config:
-            args.api_key = provider_config.api_key or args.api_key
-            args.base_url = provider_config.base_url or args.base_url
-            args.extra_headers.update(provider_config.extra_headers)
-            if not args.model_id and provider_config.default_model:
-                args.model_id = provider_config.default_model
-        else:
-            print(f"WARNING: Provider '{agent_config.provider}' not configured. Using CLI/env values.")
 
     # Validate required args
     if not args.name:
@@ -147,6 +168,9 @@ async def main() -> None:
         sys.exit(1)
     if not args.model_id:
         print("ERROR: --model-id is required (or use --from-config with configured model)")
+        sys.exit(1)
+    if not args.strategy:
+        print("ERROR: --strategy is required (or use --from-config with a configured strategy)")
         sys.exit(1)
 
     system_prompt = STRATEGIES.get(args.strategy)

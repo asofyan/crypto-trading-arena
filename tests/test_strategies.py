@@ -6,7 +6,13 @@ from arena.strategies import STRATEGIES
 
 
 def test_expected_strategies_are_registered():
-    assert set(STRATEGIES) == {"default", "momentum", "brainrot", "scalper"}
+    assert set(STRATEGIES) == {
+        "default",
+        "momentum",
+        "brainrot",
+        "scalper",
+        "swing-trend",
+    }
 
 
 def test_every_strategy_prompt_requests_reasoning():
@@ -56,3 +62,29 @@ def test_default_prompt_makes_holding_an_explicit_decision():
     prompt = STRATEGIES["default"].lower()
     assert "hold" in prompt
     assert "not trading" in prompt or "no edge" in prompt
+
+
+# ── `swing-trend` is calibrated on 4-hour bars ──────────────────
+# The prompt must name its timeframe and every lookback explicitly: the agent
+# recomputes them from raw candles on each invocation, with no indicator tool.
+
+
+def test_swing_trend_prompt_declares_the_4h_horizon():
+    prompt = STRATEGIES["swing-trend"]
+    assert "4-hour" in prompt
+    assert "daily" in prompt.lower()  # daily bars are context, not the trigger
+
+
+def test_swing_trend_prompt_states_the_optimised_lookbacks():
+    prompt = STRATEGIES["swing-trend"]
+    for token in ("20-bar", "50-bar", "55-bar", "4%"):
+        assert token in prompt, token
+
+
+def test_swing_trend_prompt_defines_regime_entries_and_exits():
+    prompt = STRATEGIES["swing-trend"].lower()
+    assert "flat" in prompt
+    assert "55-bar" in prompt
+    assert "pullback" in prompt
+    assert "exit" in prompt
+    assert "cash" in prompt

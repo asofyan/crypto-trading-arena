@@ -88,6 +88,19 @@ def test_parse_binance_ticker_missing_field_returns_none():
     assert conn._parse_binance_ticker({"s": "BTCUSDT"}) is None  # missing required keys
 
 
+def test_coinbase_skips_granularities_the_venue_cannot_serve():
+    """Coinbase rejects 4h (14400s); sending it would fail the whole product poll.
+
+    TIMEFRAMES carries one shared list, so the venue filter is what keeps the
+    Binance-only tier from breaking the Coinbase connector.
+    """
+    from exchanges.coinbase import COINBASE_GRANULARITIES, coinbase_timeframes
+
+    served = {tf.granularity for tf in coinbase_timeframes()}
+    assert 14400 not in served
+    assert served == {tf.granularity for tf in TIMEFRAMES} - {14400}
+    assert COINBASE_GRANULARITIES >= served
+
 def test_binance_interval_map_covers_every_timeframe_granularity():
     """Every TIMEFRAME granularity must map to a Binance interval, else poll_rest
     silently falls back to '1m' and fetches the wrong candle resolution."""

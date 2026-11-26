@@ -52,6 +52,8 @@ BINANCE_INTERVAL_MAP = {
     60: "1m",
     300: "5m",
     900: "15m",
+    14400: "4h",
+    86400: "1d",
 }
 
 DEFAULT_SYMBOLS = [

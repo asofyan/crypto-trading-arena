@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import csv
 import io
 import logging
+import os
+import signal
 from pathlib import Path
 
 from rich.console import Console
@@ -49,8 +52,18 @@ from exchanges import PRICE_TOPIC, TickerMessage
 # consumer group means a full copy of the price stream (fan-out), not a split of
 # the arena's partitions.
 MONITOR_GROUP_ID = "portfolio-monitor"
+# Every run gets its own group id. A fixed group resumes from whatever offset a previous
+# run committed, and this topic keeps history: a monitor started hours later would replay
+# that backlog (262k ticks in one case) and show prices from the wrong session while the
+# live edge raced away from it. The monitor keeps no state in Kafka — its state is the
+# trades CSV — so starting at the live edge is always the correct resume point.
 
 logger = logging.getLogger(__name__)
+
+
+def monitor_group_id() -> str:
+    """The consumer group for this run: unique per process, so it starts at the live edge."""
+    return f"{MONITOR_GROUP_ID}-{os.getpid()}"
 
 
 def latest_trades_file(data_dir: Path) -> Path | None:
@@ -294,6 +307,16 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run(args: argparse.Namespace) -> None:
+    # Signals first, before any await: a Ctrl-C while the config, the instrument cache
+    # or the Kafka connection is still booting must take the clean path too. Installing
+    # this after the boot left an early interrupt to the default handler, which cancels
+    # the loop mid-connect and hangs the process inside the TUI.
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(sig, stop.set)
+
     config = load_config_strict(args.config)
     fee_model = FeeModel(
         taker_bps=config.trading.fees.taker_bps,
@@ -324,7 +347,9 @@ async def run(args: argparse.Namespace) -> None:
     client = Client.connect(args.bootstrap_servers)
     state: dict[str, Live] = {}
 
-    @client.broker.subscriber(PRICE_TOPIC, group_id=MONITOR_GROUP_ID)
+    group_id = monitor_group_id()
+
+    @client.broker.subscriber(PRICE_TOPIC, group_id=group_id)
     async def handle_price_update(ticker: TickerMessage) -> None:
         mirror.update_price(ticker)
         if state:
@@ -340,25 +365,46 @@ async def run(args: argparse.Namespace) -> None:
                     mirror.view.rerender()
 
     print(f"Monitoring {mirror.session_file or mirror.snapshot_file} (read-only, no wallet of its own).")
-    print(f"Price feed: {PRICE_TOPIC} as consumer group '{MONITOR_GROUP_ID}'.")
+    print(f"Price feed: {PRICE_TOPIC} as consumer group '{group_id}' (always the live edge).")
 
     # A bare @broker.subscriber is inert until a Worker runs the app; with an empty
     # node list this worker does nothing but keep that price subscriber alive.
     worker = Worker(client, nodes=[])
     poller = asyncio.create_task(poll_trades())
+
+    if stop.is_set():
+        # The operator interrupted the boot; nothing is running yet, so just leave.
+        await client.aclose()
+        return
+
     try:
+        # start()/stop(), not run(): run() installs its own signal handlers, and inside
+        # a TUI that owns the screen its shutdown never completes — Ctrl-C looks dead.
+        # The documented embedded surface leaves the signals to us.
+        await worker.start()
         with Live(mirror.view._build_layout(), auto_refresh=False, screen=True) as live:
             state["live"] = live
             mirror.view.attach_live(live)
             mirror.view.rerender()
-            await worker.run()
+            await stop.wait()
     finally:
+        # Idempotent, and safe even when start() failed before _app existed.
+        await worker.stop()
         poller.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await poller
+        # Stop the consumer explicitly: the Kafka group is per run, and a half-closed
+        # client would hold the partition until the session times out.
+        await client.aclose()
 
 
 def main() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s — %(message)s")
-    asyncio.run(run(parse_args()))
+    try:
+        asyncio.run(run(parse_args()))
+    except KeyboardInterrupt:
+        # A SIGINT that lands before the loop installs its handler is still a clean exit.
+        pass
 
 
 if __name__ == "__main__":

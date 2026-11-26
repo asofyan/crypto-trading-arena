@@ -13,6 +13,7 @@ from arena.models import INITIAL_CASH
 from deploy.portfolio_monitor import (
     MONITOR_GROUP_ID,
     PortfolioMirror,
+    monitor_group_id,
     latest_snapshots_file,
     latest_trades_file,
 )
@@ -372,3 +373,19 @@ def test_a_perp_fill_replays_as_a_short_with_the_venue_step_and_fee(tmp_path):
     account = mirror.store.accounts["a"]
     assert account.positions["SOLUSDT-PERP"] == pytest.approx(-0.55)
     assert account.cash == pytest.approx(row["cash_after"], abs=0.01)
+
+
+def test_each_monitor_run_gets_its_own_consumer_group(monkeypatch):
+    """A fixed group would resume at a previous run's offset and replay the backlog.
+
+    This topic keeps history, so a monitor started hours later would show prices from
+    the wrong session while the live edge raced away from it.
+    """
+    monkeypatch.setattr("deploy.portfolio_monitor.os.getpid", lambda: 111)
+    first = monitor_group_id()
+    monkeypatch.setattr("deploy.portfolio_monitor.os.getpid", lambda: 222)
+    second = monitor_group_id()
+
+    assert first != second
+    assert first.startswith(MONITOR_GROUP_ID)
+    assert MONITOR_GROUP_ID != "tools-dashboard"

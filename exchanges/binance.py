@@ -26,7 +26,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 import websockets
@@ -279,6 +279,94 @@ def _iso_ms(value: Any) -> str:
     return ""
 
 
+def _ticker_message(
+    product_id: str,
+    stat: dict,
+    book: dict | None = None,
+) -> TickerMessage:
+    """One agent-facing ticker built from a REST board row.
+
+    `stat` is a 24h-ticker entry; `book` is the futures bookTicker row that carries the
+    touch, because `/fapi/v1/ticker/24hr` has no bid/ask at all. Spot's 24hr entry already
+    includes the touch, so `book` stays ``None`` there and the stat's own fields are used.
+    """
+    bid = (book or {}).get("bidPrice") or stat.get("bidPrice") or stat.get("lastPrice", "")
+    ask = (book or {}).get("askPrice") or stat.get("askPrice") or stat.get("lastPrice", "")
+    return TickerMessage(
+        product_id=product_id,
+        price=str(stat.get("lastPrice", "")),
+        best_bid=str(bid),
+        best_bid_size=str((book or {}).get("bidQty") or stat.get("bidQty") or "0"),
+        best_ask=str(ask),
+        best_ask_size=str((book or {}).get("askQty") or stat.get("askQty") or "0"),
+        side="",
+        last_size=str(stat.get("lastQty", "0")),
+        open_24h=str(stat.get("openPrice", "0")),
+        high_24h=str(stat.get("highPrice", "0")),
+        low_24h=str(stat.get("lowPrice", "0")),
+        volume_24h=str(stat.get("volume", "0")),
+        volume_30d="0",
+        trade_id=int(stat.get("lastId") or 0),
+        sequence=0,
+        time=_iso_ms(stat.get("closeTime")),
+    )
+
+
+async def poll_ticker_board(
+    symbols: list[str],
+    on_quote: Callable[[TickerMessage], Awaitable[None]],
+    interval: float = 10.0,
+    venue: BinanceVenue = SPOT_VENUE,
+    products: dict[str, str] | None = None,
+) -> None:
+    """Publish tickers from the venue's REST board, independently of the WebSocket.
+
+    The socket is the fast path, but a network that blackholes `fstream` would leave the
+    agents with no data at all — and the arena would look alive while nothing trades.
+    The board carries the same top of book at a coarser cadence: one all-symbols 24h call
+    (weight 40) plus the futures bookTicker call (weight 2) per cycle, so 10s costs about
+    250 weight/minute against a 2400 budget. See design D7.
+    """
+    mapping = products or {}
+    async with BinanceRESTClient(venue=venue) as client:
+        while True:
+            try:
+                stats = await client.get_24h_ticker()
+                rows = stats if isinstance(stats, list) else [stats]
+                books: dict[str, dict] = {}
+                if venue.book_ticker_path:
+                    payload = await client.get_book_ticker()
+                    entries = payload if isinstance(payload, list) else [payload]
+                    books = {
+                        str(entry.get("symbol", "")).upper(): entry
+                        for entry in entries
+                        if isinstance(entry, dict)
+                    }
+                by_symbol = {
+                    str(row.get("symbol", "")).upper(): row
+                    for row in rows
+                    if isinstance(row, dict)
+                }
+                for symbol in symbols:
+                    stat = by_symbol.get(symbol.upper())
+                    if stat is None:
+                        continue
+                    await on_quote(
+                        _ticker_message(
+                            mapping.get(symbol, venue.product_id_for(symbol)),
+                            stat,
+                            books.get(symbol.upper()),
+                        )
+                    )
+            except Exception:
+                # A failed cycle must not kill the loop: the dashboard keeps the last
+                # price and the next cycle retries.
+                logger.exception(
+                    "REST ticker board failed for %s; retrying in %.0fs", venue.name, interval
+                )
+            await asyncio.sleep(interval)
+
+
 async def _futures_price_board(client: BinanceRESTClient) -> dict[str, dict]:
     """One joined snapshot of the whole futures board: stats plus bid/ask.
 
@@ -416,6 +504,7 @@ class BinanceKafkaConnector:
         min_publish_interval: float = 0.0,
         candle_book: CandleBook | None = None,
         venue: BinanceVenue = SPOT_VENUE,
+        board_interval: float = 0.0,
     ) -> None:
         if not symbols:
             raise ValueError("At least one symbol must be specified")
@@ -438,6 +527,12 @@ class BinanceKafkaConnector:
 
         # Latest ticker per symbol — patched on every incoming message
         self._latest: dict[str, TickerMessage] = {}
+        # REST board as the fallback data path. `_ws_last_frame` is 0 until the socket
+        # delivers something, which is what lets `_on_board_quote` tell "the socket is
+        # just quiet between ticks" from "this network has no socket at all".
+        self._board_interval = board_interval
+        self._ws_last_frame = 0.0
+        self._board_noted = False
 
     async def start(self) -> None:
         """Start the connector. Blocks until shutdown is triggered."""
@@ -607,6 +702,29 @@ class BinanceKafkaConnector:
 
         raise last_error if last_error else ConnectionError("All Binance endpoints failed")
 
+    async def _on_board_quote(self, ticker: TickerMessage) -> None:
+        """Take one REST-board ticker, unless the WebSocket is demonstrably alive.
+
+        The socket delivers a tick per second per symbol, so a REST row that arrives
+        while frames are flowing would only be staler than what is already buffered.
+        Silence for two board cycles means the socket is not coming back on its own and
+        the board becomes the feed.
+        """
+        if self._board_interval <= 0:
+            return
+        if self._ws_last_frame and (time.time() - self._ws_last_frame) < 2 * self._board_interval:
+            return
+        if not self._board_noted:
+            self._board_noted = True
+            logger.warning(
+                "No WebSocket frame from %s; publishing from the REST ticker board "
+                "every %.0fs instead",
+                self._venue.name,
+                self._board_interval,
+            )
+        self._latest[ticker.product_id] = ticker
+        await self._client.broker.publish(ticker, PRICE_TOPIC)
+
     async def _consume_and_publish(self) -> None:
         """Connect to Binance WebSocket and buffer tickers for periodic publish."""
         self._latest.clear()
@@ -639,10 +757,31 @@ class BinanceKafkaConnector:
                     )
                 )
 
+            board_task: asyncio.Task | None = None
+            if self._board_interval > 0:
+                board_task = asyncio.create_task(
+                    poll_ticker_board(
+                        symbols=self._symbols,
+                        on_quote=self._on_board_quote,
+                        interval=self._board_interval,
+                        venue=self._venue,
+                        products=self._products,
+                    )
+                )
+
             try:
-                async for raw in ws:
+                # recv() with a timeout, not `async for`: a socket that connects and then
+                # never speaks (a blackholed `fstream`, an idle venue) must still notice
+                # SIGTERM, and `async for` would sit on that await forever — leaving a
+                # zombie connector that republishes the moment the feed returns.
+                while self._running:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
                     if not self._running:
                         break
+                    self._ws_last_frame = time.time()
 
                     try:
                         data = json.loads(raw)
@@ -693,6 +832,12 @@ class BinanceKafkaConnector:
                         await candle_task
                     except asyncio.CancelledError:
                         pass
+                if board_task is not None:
+                    board_task.cancel()
+                    try:
+                        await board_task
+                    except asyncio.CancelledError:
+                        pass
 
 
 def parse_args(
@@ -727,6 +872,16 @@ def parse_args(
             "Incoming data is buffered and only the latest per symbol is published "
             "when the interval elapses. 0 = publish immediately "
             "(default: 60 spot, 15 perp)."
+        ),
+    )
+    parser.add_argument(
+        "--board-interval",
+        type=float,
+        default=10.0,
+        help=(
+            "Seconds between REST ticker-board polls, used when the WebSocket is not "
+            "delivering (some networks blackhole fstream). 0 disables the fallback. "
+            "(default: 10)"
         ),
     )
     parser.add_argument(
@@ -774,6 +929,7 @@ async def run(
         min_publish_interval=args.min_interval,
         candle_book=candle_book,
         venue=venue,
+        board_interval=getattr(args, "board_interval", 10.0),
     )
 
     loop = asyncio.get_running_loop()
@@ -786,6 +942,13 @@ async def run(
     logger.info("  Symbols:     %s", ", ".join(symbols))
     logger.info("  Products:    %s", ", ".join(venue.product_id_for(s) for s in symbols))
     logger.info("  Min interval: %ss", args.min_interval)
+    board_interval = getattr(args, "board_interval", 10.0)
+    logger.info(
+        "  REST board:  %s",
+        f"every {board_interval:g}s (fallback when the socket is silent)"
+        if board_interval > 0
+        else "disabled",
+    )
     taker_bps = fee_model.taker_bps_for(perp=venue.is_perp)
     logger.info("  Taker fee:   %d bps (%.2f%%)", taker_bps, taker_bps / 100)
 

@@ -8,6 +8,7 @@ between the two `run()` entrypoints (finding B1).
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -594,3 +595,65 @@ def test_drop_forming_bars_keeps_a_fully_closed_window():
 
     assert bn.drop_forming_bars(rows, 60, now_ms) == rows
     assert bn.drop_forming_bars([], 60, now_ms) == []
+
+
+# ── REST ticker board: the fallback when the socket is blackholed ──
+
+FUTURES_STAT = {
+    "symbol": "XRPUSDT",
+    "lastPrice": "2.1040",
+    "lastQty": "120.5",
+    "openPrice": "2.05",
+    "highPrice": "2.13",
+    "lowPrice": "2.01",
+    "volume": "998877.6",
+    "closeTime": 1_700_000_000_000,
+    "lastId": 4242,
+}
+FUTURES_BOOK = {"symbol": "XRPUSDT", "bidPrice": "2.1039", "bidQty": "900", "askPrice": "2.1041", "askQty": "850"}
+
+
+def test_the_board_ticker_carries_the_futures_touch_and_product_id():
+    """fapi's 24h ticker has no bid/ask, so the touch must come from bookTicker."""
+    ticker = bn._ticker_message("XRPUSDT-PERP", FUTURES_STAT, FUTURES_BOOK)
+
+    assert ticker.product_id == "XRPUSDT-PERP"
+    assert ticker.price == "2.1040"
+    assert ticker.best_bid == "2.1039"
+    assert ticker.best_ask == "2.1041"
+    assert ticker.volume_24h == "998877.6"
+
+
+def test_the_board_ticker_falls_back_to_the_stat_touch_for_spot():
+    """Spot's 24h entry already includes bid/ask, so no book row is needed."""
+    stat = dict(FUTURES_STAT, bidPrice="2.1038", askPrice="2.1042", bidQty="10", askQty="20")
+
+    ticker = bn._ticker_message("XRPUSDT", stat)
+
+    assert ticker.best_bid == "2.1038"
+    assert ticker.best_ask == "2.1042"
+
+
+async def test_the_board_is_ignored_while_the_socket_is_delivering():
+    """A REST row that arrives next to live frames is staler than what is buffered."""
+    published: list = []
+
+    class _Broker:
+        async def publish(self, message, topic):
+            published.append((message, topic))
+
+    client = _FakeClient()
+    client.broker = _Broker()
+    conn = BinanceKafkaConnector(
+        client, "agent_router.input", ["XRPUSDT"], FeeModel(5), venue=bn.PERP_VENUE, board_interval=10
+    )
+    ticker = bn._ticker_message("XRPUSDT-PERP", FUTURES_STAT, FUTURES_BOOK)
+
+    conn._ws_last_frame = time.time()
+    await conn._on_board_quote(ticker)
+    assert conn._latest == {}
+
+    conn._ws_last_frame = time.time() - 60  # the socket has been silent for a minute
+    await conn._on_board_quote(ticker)
+    assert conn._latest["XRPUSDT-PERP"] is ticker
+    assert published and published[0][0] is ticker

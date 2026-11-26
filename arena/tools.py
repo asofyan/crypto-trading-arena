@@ -72,12 +72,16 @@ def _get_portfolio(agent_id: str) -> str:
         lines.append("Positions: none")
     else:
         lines.append(
-            "| Ticker | Qty | Avg Cost | Total Cost "
+            "| Ticker | Side | Qty | Avg Cost | Total Cost "
             "| Current Price | Mkt Value | P&L | Avg Time Held |"
         )
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for pid in sorted(account.positions):
             qty = account.positions[pid]
+            # Negative quantity is a short (perpetual futures); the sign on every
+            # money column already reflects it, so the label is what stops a short
+            # from reading like corrupt data.
+            side = "SHORT" if qty < 0 else "LONG"
             avg_cost = account.avg_cost_per_unit(pid)
             total_cost = account.cost_basis.get(pid, 0.0)
             hold_str = _format_hold_time(account.avg_entry_ts.get(pid))
@@ -89,13 +93,14 @@ def _get_portfolio(agent_id: str) -> str:
                 pnl = mkt_value - total_cost
                 pnl_sign = "+" if pnl >= 0 else ""
                 lines.append(
-                    f"| {pid} | {qty:g} | ${avg_cost:,.2f} | ${total_cost:,.2f} "
+                    f"| {pid} | {side} | {qty:g} | ${avg_cost:,.2f} | ${total_cost:,.2f} "
                     f"| ${current_price:,.2f} | ${mkt_value:,.2f} "
                     f"| {pnl_sign}${pnl:,.2f} | {hold_str} |"
                 )
             else:
                 lines.append(
-                    f"| {pid} | {qty:g} | ${avg_cost:,.2f} | ${total_cost:,.2f} "
+                    f"| {pid} | {side} | {qty:g} | ${avg_cost:,.2f} "
+                    f"| ${total_cost:,.2f} "
                     f"| N/A | N/A | N/A | {hold_str} |"
                 )
 
@@ -117,21 +122,33 @@ def execute_trade(ctx: ToolContext, product_id: str, quantity: float, action: st
     """Execute a buy or sell trade (fill-or-cancel). The order fills immediately at the current
     market price if possible, or returns an error if it cannot be filled — it never waits or queues.
     Buys execute at the best ask price, sells at the best bid.
-    Fractional share trading is allowed, but only to one decimal place (e.g., 0.5, 1.2).
+    Fractional trading is allowed, subject to the venue's step size for that symbol.
+
+    On a SPOT product (e.g. SOLUSDT) this is cash-funded: you cannot sell what you do not
+    hold, and only the quantity you own can be sold.
+
+    On a PERPETUAL FUTURES product (e.g. SOLUSDT-PERP) the position is a signed net
+    amount, so one tool covers both directions:
+    - flat: 'buy' opens a long, 'sell' opens a short.
+    - long: 'buy' adds, 'sell' reduces; selling more than you hold flips you short.
+    - short: 'sell' adds, 'buy' reduces/covers; buying more than you are short flips you long.
+    Leverage is fixed at 1:1: gross notional (sum of |position| x mark) may never exceed
+    account equity, so an order that would lever the book up is rejected with the size
+    you may use. Closing or reducing a position is never blocked.
 
     A taker fee (set by the deployment) is charged on every fill and applies to both
-    buys and sells. Buys cost: notional + fee. Sells proceed: notional − fee. The fee
+    buys and sells. Buys cost: notional + fee. Sells proceed: notional - fee. The fee
     rate in effect is reported alongside each ticker update you receive. Size positions
     so expected returns exceed the round-trip fee, or you will lose money on flat markets.
 
     Args:
-        product_id: Trading pair (e.g., BTC-USD, FARTCOIN-USD, SOL-USD)
-        quantity: Number of units to trade (positive, up to 1 decimal place)
+        product_id: Trading pair (e.g., BTC-USD, SOL-USD, SOLUSDT-PERP)
+        quantity: Number of units to trade (positive; snapped to the venue step size)
         action: 'buy' or 'sell'
 
     Returns:
-        Trade confirmation with execution price, fee charged, and remaining cash,
-        or an error message
+        Trade confirmation with execution price, fee charged, resulting net position,
+        cash, equity and gross notional, or an error message
     """
     log.debug(
         "execute_trade ENTER: agent=%s product=%s qty=%s action=%s tool_call_id=%s",

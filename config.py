@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from dotenv import find_dotenv, load_dotenv
 
-from arena.fees import DEFAULT_TAKER_BPS, MAX_TAKER_BPS
+from arena.fees import DEFAULT_PERP_TAKER_BPS, DEFAULT_TAKER_BPS, MAX_TAKER_BPS
 from arena.strategies import STRATEGIES
 
 DEFAULT_CONFIG_PATH = Path("config.json")
@@ -71,6 +71,14 @@ class AgentConfig(BaseModel):
         None, description="Reasoning effort level for supported models."
     )
     strategy: str = Field("default", description="Trading strategy (selects system prompt).")
+    markets: list[Literal["spot", "perp"]] = Field(
+        default_factory=lambda: ["spot", "perp"],
+        description=(
+            "Markets this agent's strategy is written for. Products outside this list "
+            "are refused by the executor, so a spot prompt cannot accidentally open a "
+            "short and a perp prompt cannot buy inventory."
+        ),
+    )
 
     @field_validator("strategy")
     @classmethod
@@ -94,6 +102,15 @@ class FeeConfig(BaseModel):
     taker_bps: int = Field(
         DEFAULT_TAKER_BPS,
         description="Taker fee in basis points (60 bps = 0.60%). 0 disables fees.",
+        ge=0,
+        le=MAX_TAKER_BPS,
+    )
+    perp_taker_bps: int = Field(
+        DEFAULT_PERP_TAKER_BPS,
+        description=(
+            "Taker fee in basis points for perpetual-futures products (5 bps = 0.05%, "
+            "Binance USDⓈ-M VIP 0). Applied to *-PERP fills instead of taker_bps."
+        ),
         ge=0,
         le=MAX_TAKER_BPS,
     )
@@ -233,6 +250,21 @@ class TradingConfig(BaseModel):
         default_factory=lambda: DEFAULT_BINANCE_SYMBOLS.copy(),
         description="Binance trading pair symbols to subscribe to.",
     )
+    binance_perp_symbols: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Binance USDⓈ-M perpetual contracts to trade, as venue symbols (SOLUSDT). "
+            "The arena addresses each as <SYMBOL>-PERP so it cannot collide with the "
+            "spot product of the same name. Empty disables perps entirely."
+        ),
+    )
+    perp_instrument_cache: str = Field(
+        "data/instruments-binance-perp.json",
+        description=(
+            "Cached fapi exchangeInfo rules for the perp products. Refresh with "
+            "`uv run python -m arena.instruments --perp`."
+        ),
+    )
     coinbase_products: list[str] = Field(
         default_factory=lambda: DEFAULT_COINBASE_PRODUCTS.copy(),
         description="Coinbase product IDs to subscribe to.",
@@ -277,6 +309,15 @@ class ArenaConfig(BaseModel):
         live = self.trading.live
         if self.trading.mode != "live":
             return self
+        if self.trading.binance_perp_symbols:
+            # A perp short credits its notional to the wallet, so it cannot be
+            # reconciled against a spot balance sheet, and this executor only speaks
+            # /api/v3. Refusing at load time beats a mysterious halt on the first order.
+            raise ValueError(
+                "perpetual futures are paper-only: trading.mode is 'live' and "
+                "trading.binance_perp_symbols is not empty. Set trading.mode to 'paper' "
+                "or empty binance_perp_symbols."
+            )
         if not live.accounts:
             raise ValueError("trading.mode is 'live' but trading.live.accounts is empty")
         if not live.agent_accounts:

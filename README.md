@@ -154,9 +154,20 @@ uv run python -m exchanges.coinbase --bootstrap-servers <broker-url>
 
 # Or, Binance (experimental)
 # uv run python -m exchanges.binance --bootstrap-servers <broker-url>
+
+# Perpetual futures are a separate connector and a separate product family:
+# uv run python -m exchanges.binance_perp --bootstrap-servers <broker-url>
 ```
 
-Optional: You can use the `--min-interval <seconds>` flag which controls how often agents are fed market data (default: 60s). Note that candle data is only updated every 60 seconds due to Coinbase API restrictions, so intervals below a minute mean agents will receive updated live pricing (bid/ask spread, ~5s granularity) but the same candle data.
+Optional: You can use the `--min-interval <seconds>` flag which controls how often agents are fed market data (default: 60s for spot, 15s for perps). Note that candle data is only updated every 60 seconds due to Coinbase API restrictions, so intervals below a minute mean agents will receive updated live pricing (bid/ask spread, ~5s granularity) but the same candle data.
+
+**Perpetual futures (paper only).** `exchanges.binance_perp` streams Binance USDⓈ-M contracts and
+publishes them as `<SYMBOL>-PERP` products (`SOLUSDT-PERP`), so they never collide with the spot
+product of the same name. Perp products are a *signed net position*: `sell` from flat opens a short,
+`buy` against a short covers it, and a fill larger than the position flips it. Leverage is fixed at
+**1:1** — gross notional (Σ |position| × mark) may not exceed equity — and the simulated taker fee is
+`trading.fees.perp_taker_bps` (default 5 bps, Binance USDⓈ-M VIP 0). No real futures orders are placed.
+Refresh the contract rules with `uv run python -m arena.instruments --perp`.
 
 <br>
 
@@ -191,6 +202,10 @@ uv run python -m deploy.agent \
 ```
 
 Once agents are deployed, market data flows to them and trades should hydrate the dashboard soon.
+
+Built-in strategies: `default`, `momentum`, `brainrot`, `scalper`, `swing-trend`, and `scalper-perp`
+(Binance perpetual futures, long **and** short, 1:1 leverage, decisions on 1/5/15-minute closed bars).
+`scalper-perp` only sees `*-PERP` products; every other strategy only sees spot.
 
 <br>
 
@@ -300,6 +315,10 @@ strict `xfail`s; see [docs/REVIEW_FINDINGS.md](docs/REVIEW_FINDINGS.md).
 | `exchanges/coinbase.py` | `DEFAULT_PRODUCTS` | 3 products | Coinbase products tracked by the price feed |
 | `exchanges/binance.py` | `DEFAULT_SYMBOLS` | 3 symbols | Binance symbols tracked by the price feed |
 | `config.json` | `trading.fees.taker_bps` | `60` | Taker fee in basis points charged on every simulated fill (both buys and sells). `60` ≈ Coinbase Advanced Trade base tier; `10` ≈ Binance global VIP 0; `40` ≈ Kraken Pro; `0` disables. Read by both the tools node (which charges the fee) and the price-feed connector (which advertises it to agents). |
+| `config.json` | `trading.fees.perp_taker_bps` | `5` | Taker fee for `*-PERP` products only. `5` = Binance USDⓈ-M VIP 0. Charged on the contract notional of every perp fill, open and close. |
+| `config.json` | `trading.binance_perp_symbols` | `[]` | Binance USDⓈ-M contracts to trade, as venue symbols (`SOLUSDT`). Each is addressed as `<SYMBOL>-PERP`. Empty disables perps. |
+| `config.json` | `trading.perp_instrument_cache` | `data/instruments-binance-perp.json` | Cached `fapi` `exchangeInfo` rules (step size, min notional). Refresh with `uv run python -m arena.instruments --perp`. |
+| `config.json` | `agents[].markets` | `["spot", "perp"]` | Markets an agent may trade. The executor refuses products outside this list, so a spot prompt cannot open a short. |
 
 <br>
 

@@ -21,6 +21,15 @@ class TradeResult:
 
 @dataclass
 class AgentAccount:
+    """One agent's wallet and book.
+
+    ``positions`` is **signed**: a spot holding is always positive, while a perpetual
+    contract may be long (``+q``) or short (``-q``). ``cost_basis`` carries the same
+    sign, so ``cost_basis / qty`` is the entry price on either side and
+    ``portfolio_value`` (``cash + Σ qty × mark``) stays a single formula. See
+    docs/plans/261126-0810-scalper-perp/design.md, D2/D3.
+    """
+
     cash: float = INITIAL_CASH
     positions: dict[str, float] = field(default_factory=dict)
     cost_basis: dict[str, float] = field(default_factory=dict)
@@ -35,12 +44,19 @@ class AgentAccount:
     realized_pnl: float = 0.0
 
     def portfolio_value(self, price_book: PriceBook) -> float:
-        """Total value: cash + mark-to-market of all positions using live prices."""
+        """Total value: cash + mark-to-market of all positions.
+
+        A position with no quote is valued at its average entry rather than dropped: a
+        short whose liability silently disappears would make equity — and every figure
+        built on it, from the dashboard to the leverage cap — read higher than the money
+        actually at risk. The 1:1 gate does not use this method; it refuses outright when
+        a mark is missing (`AccountStore._leverage_rejection`).
+        """
         positions_value = 0.0
         for pid, qty in self.positions.items():
             entry = price_book.get(pid)
-            if entry is not None:
-                positions_value += qty * float(entry["price"])
+            mark = float(entry["price"]) if entry is not None else self.avg_cost_per_unit(pid)
+            positions_value += qty * mark
         return self.cash + positions_value
 
     def avg_cost_per_unit(self, product_id: str) -> float:

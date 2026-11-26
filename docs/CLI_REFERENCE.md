@@ -147,6 +147,34 @@ uv run python -m exchanges.binance \
 
 ---
 
+## exchanges/binance_perp.py
+
+Stream Binance **USDⓈ-M perpetual futures** (`fstream` + `fapi`) to Kafka. Same flags as
+`exchanges.binance.py` except the defaults below, because it is the same connector bound to a
+different venue.
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--bootstrap-servers` | No | `localhost:9092` | Kafka broker address |
+| `--config` | No | `config.json` | Path to config file for symbols |
+| `--symbols` | No | From `trading.binance_perp_symbols` | Venue symbols to subscribe (overrides config) |
+| `--min-interval` | No | `15` | Minimum seconds between publishes |
+| `--log-level` | No | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+Products are published as `<SYMBOL>-PERP` (`SOLUSDT-PERP`), so a perp never collides with the
+spot product of the same name. Bid/ask come from `/fapi/v1/ticker/bookTicker` because the futures
+24h ticker carries no touch. The taker fee advertised to agents is `trading.fees.perp_taker_bps`.
+
+**Examples:**
+```bash
+uv run python -m exchanges.binance_perp --bootstrap-servers localhost:9092
+
+# Refresh the contract rules the paper engine snaps quantities to
+uv run python -m arena.instruments --perp
+```
+
+---
+
 ## exchanges/coinbase.py
 
 Stream real-time market data from Coinbase to Kafka.

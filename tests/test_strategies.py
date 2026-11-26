@@ -11,6 +11,7 @@ def test_expected_strategies_are_registered():
         "momentum",
         "brainrot",
         "scalper",
+        "scalper-perp",
         "swing-trend",
     }
 
@@ -88,3 +89,48 @@ def test_swing_trend_prompt_defines_regime_entries_and_exits():
     assert "pullback" in prompt
     assert "exit" in prompt
     assert "cash" in prompt
+
+
+# ── `scalper-perp` trades both directions on 1:1 leverage ───────
+# Every rule the agent cannot remember between invocations has to be written down,
+# including the fact that `sell` opens a short and that leverage is capped at 1:1.
+
+
+def test_scalper_perp_prompt_is_short_horizon_and_directional():
+    prompt = STRATEGIES["scalper-perp"]
+    assert "PERPETUAL FUTURES" in prompt
+    assert "1-minute" in prompt and "5-minute" in prompt and "15-minute" in prompt
+    lowered = prompt.lower()
+    assert "long" in lowered and "short" in lowered
+
+
+def test_scalper_perp_prompt_explains_net_position_semantics():
+    """`sell` from flat must be documented as opening a short, not as a spot sale."""
+    prompt = STRATEGIES["scalper-perp"]
+    assert "flips you short" in prompt
+    assert "flips you long" in prompt
+    assert "net" in prompt.lower()
+
+
+def test_scalper_perp_prompt_states_the_1to1_cap():
+    prompt = STRATEGIES["scalper-perp"]
+    assert "1:1" in prompt
+    assert "equity" in prompt.lower()
+
+
+def test_scalper_perp_prompt_only_trades_perp_products():
+    assert "-PERP" in STRATEGIES["scalper-perp"]
+
+
+def test_scalper_perp_prompt_gates_entries_on_the_disclosed_fee():
+    """The fee is disclosed per turn by the connector, so the rule must not hardcode it."""
+    prompt = STRATEGIES["scalper-perp"]
+    assert "round-trip fee" in prompt.lower()
+    assert "bps" not in prompt
+
+
+def test_scalper_perp_prompt_has_a_stop_a_target_and_a_time_stop():
+    prompt = STRATEGIES["scalper-perp"]
+    for token in ("-0.6%", "+1.0%", "15 minutes"):
+        assert token in prompt, token
+    assert "never average a loser" in prompt.lower()

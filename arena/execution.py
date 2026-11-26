@@ -6,6 +6,10 @@ and charges the configured taker fee; a live executor will ask the venue and han
 back what actually happened. Both call ``AccountStore.apply_fill``, so cash, cost
 basis, realised P&L, the trade log and the dashboard stay identical across modes —
 the only difference is where the price and the fee come from.
+
+Perpetual-futures products (``*-PERP``) are priced the same way — a sell still
+crosses to the bid — but they are charged the futures taker rate, and ``sell`` opens
+a short rather than selling inventory (the account store branches on the product id).
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Protocol
 from uuid import uuid4
 
-from arena.instruments import SymbolRules
+from arena.instruments import SymbolRules, is_perp_product
 from arena.models import TradeResult
 from arena.risk import PortfolioSnapshot, RiskGates
 from exchanges.binance_spot import (
@@ -52,6 +56,9 @@ class FillRequest:
     quantity: float
     action: str
     latency: float | None = None
+    # A replay books a fill that already happened (the monitor's CSV): it must not be
+    # re-gated against a price book the replay only partially knows.
+    replay: bool = False
 
 
 class Executor(Protocol):
@@ -104,7 +111,23 @@ class PaperExecutor:
             log.debug("paper_executor.execute REJECT: non-positive qty=%s", quantity)
             return TradeResult(False, "Quantity must be positive.")
 
+        # Market scope: a strategy written for spot has no vocabulary for a short, and a
+        # perp strategy reasons about leverage a spot agent cannot see. Enforced here so
+        # a confused model cannot act outside its mandate (see AccountStore agent_markets).
+        market = "perp" if is_perp_product(product_id) else "spot"
+        if not self._store.agent_allows(request.agent_id, market):
+            allowed = self._store.agent_markets(request.agent_id) or ()
+            return TradeResult(
+                False,
+                f"{request.agent_id} may only trade {', '.join(allowed) or 'no markets'}; "
+                f"{product_id} is a {market} product. Leave it to the agent that owns "
+                f"that market.",
+            )
+
         fee_model = self._store.fee_model
+        # Perps pay the futures taker rate; spot keeps the configured spot rate. The
+        # product id is the only input, so ledger replay and the monitor agree too.
+        perp = is_perp_product(product_id)
         price = float(entry["best_ask"] if action == "buy" else entry["best_bid"])
 
         # Venue rules when the symbol is known (Binance), else the coarse legacy rule:
@@ -139,9 +162,9 @@ class PaperExecutor:
                 return TradeResult(False, "Quantity must be positive.")
 
         if action == "buy":
-            fee = fee_model.buy_cost(price * order_qty).fee
+            fee = fee_model.buy_cost(price * order_qty, perp=perp).fee
         else:
-            fee = fee_model.sell_proceeds(price * order_qty).fee
+            fee = fee_model.sell_proceeds(price * order_qty, perp=perp).fee
 
         return self._store.apply_fill(
             request.agent_id,
@@ -151,7 +174,8 @@ class PaperExecutor:
             price,
             fee,
             latency=request.latency,
-            fee_bps=fee_model.taker_bps,
+            fee_bps=fee_model.taker_bps_for(perp=perp),
+            enforce_margin=not request.replay,
         )
 
 

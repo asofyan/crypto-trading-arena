@@ -23,7 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from arena.instruments import SymbolRules
+from arena.instruments import SymbolRules, is_perp_product
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +114,26 @@ def compare(
         )
 
     for symbol, expected in sorted(ledger_positions.items()):
+        if is_perp_product(symbol):
+            # A perpetual position is a hard stop: its signed quantity and the cash its
+            # short credited can never be proven against a spot balance sheet, so arming
+            # live on top of one would size real orders against equity that only exists
+            # in the paper ledger. Checked before the rule lookup on purpose — a rule
+            # accidentally present for a perp must not turn this into a spot comparison.
+            blocking.append(
+                Drift(
+                    kind="unreconcilable",
+                    subject=symbol,
+                    expected=expected,
+                    actual=0.0,
+                    detail=(
+                        f"{symbol}: the ledger holds a paper perpetual position that a "
+                        f"spot wallet cannot prove; close it or start live on a fresh "
+                        f"ledger"
+                    ),
+                )
+            )
+            continue
         rule = rules.get(symbol)
         if rule is None:
             continue  # a paper-only symbol: the venue knows nothing about it
@@ -152,8 +172,12 @@ def compare(
             )
 
     # Symbols the arena bought but the rules no longer cover would silently escape the
-    # comparison above; say so instead of implying a clean reconcile.
-    uncovered = sorted(set(ledger_positions) - set(rules))
+    # comparison above; say so instead of implying a clean reconcile. Perp symbols are
+    # already blocked above, so they are excluded here.
+    uncovered = [
+        symbol for symbol in sorted(set(ledger_positions) - set(rules))
+        if not is_perp_product(symbol)
+    ]
     if uncovered:
         notes.append(
             Drift(

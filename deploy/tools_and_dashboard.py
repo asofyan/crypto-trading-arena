@@ -17,7 +17,12 @@ from arena.account_store import AccountStore
 from arena.execution import LiveBinanceExecutor
 from arena.live_session import HALTED, LiveSession, LiveState
 from arena.fees import FeeModel
-from arena.instruments import SymbolRules, load_cache, parse_exchange_info
+from arena.instruments import (
+    SymbolRules,
+    load_cache,
+    parse_exchange_info,
+    perp_product_id,
+)
 from arena.ledger import DEFAULT_DB_PATH, Ledger, LedgerInUseError, LedgerSchemaError
 from arena.models import INITIAL_CASH, AgentAccount
 from arena.tools import (
@@ -201,28 +206,56 @@ def describe_wallet(accounts: dict[str, AgentAccount], path: str | Path) -> str:
 def resolve_instrument_rules(
     trading: TradingConfig,
 ) -> tuple[dict[str, SymbolRules], str]:
-    """Venue rules for the subscribed symbols, or the legacy 1-decimal fallback.
+    """Venue rules for every subscribed product, or the legacy 1-decimal fallback.
 
-    Returns the rules plus a one-line summary for the startup banner. An empty dict is
-    a supported outcome, not an error: every symbol then keeps the coarse paper rule,
-    which is what a Coinbase deployment or a cache-less first start needs.
+    Spot rules come from the spot `exchangeInfo` cache and perp rules from the `fapi`
+    cache, keyed by product id (`SOLUSDT-PERP`) so the price book, the ledger and the
+    executor all look up the same key. Returns the rules plus a one-line summary for
+    the startup banner. An empty dict is a supported outcome, not an error: every
+    symbol then keeps the coarse paper rule, which is what a Coinbase deployment or a
+    cache-less first start needs.
     """
     if trading.paper.instrument_rules == "simple":
         return {}, "simple (legacy 1-decimal rule)"
 
-    cached = load_cache(trading.instrument_cache)
-    if not cached:
+    subscribed = (
+        trading.binance_symbols if trading.exchange == "binance" else trading.coinbase_products
+    )
+    spot_cache = load_cache(trading.instrument_cache)
+    # Only read the perp cache when perps are configured: a missing file for a venue
+    # this deployment does not trade is not worth a warning.
+    perp_cache = (
+        load_cache(trading.perp_instrument_cache) if trading.binance_perp_symbols else {}
+    )
+
+    if not spot_cache and not perp_cache:
         return {}, (
             f"simple — no usable cache at {trading.instrument_cache} "
             "(run `uv run python -m arena.instruments --refresh`)"
         )
 
-    subscribed = (
-        trading.binance_symbols if trading.exchange == "binance" else trading.coinbase_products
-    )
-    rules = {s.upper(): cached[s.upper()] for s in subscribed if s.upper() in cached}
-    uncached = [s for s in subscribed if s.upper() not in cached]
-    summary = f"venue ({len(rules)}/{len(subscribed)} subscribed symbol(s) cached)"
+    rules: dict[str, SymbolRules] = {}
+    uncached: list[str] = []
+    for symbol in subscribed:
+        key = symbol.upper()
+        if key in spot_cache:
+            rules[key] = spot_cache[key]
+        else:
+            uncached.append(key)
+    for symbol in trading.binance_perp_symbols:
+        key = perp_product_id(symbol)
+        if key in perp_cache:
+            rules[key] = perp_cache[key]
+        else:
+            uncached.append(key)
+
+    total = len(subscribed) + len(trading.binance_perp_symbols)
+    summary = f"venue ({len(rules)}/{total} subscribed product(s) cached)"
+    if trading.binance_perp_symbols and not perp_cache:
+        summary += (
+            f"; no perp cache at {trading.perp_instrument_cache} (run "
+            "`uv run python -m arena.instruments --perp`)"
+        )
     if uncached:
         # Say it out loud: those symbols silently trade on the coarse rule instead.
         summary += f"; uncached: {', '.join(uncached)}"
@@ -285,8 +318,21 @@ async def main():
     arena_config = load_config_strict(args.config)
     trading = arena_config.trading
     taker_bps = trading.fees.taker_bps
-    store.set_fee_model(FeeModel(taker_bps=taker_bps))
+    perp_taker_bps = trading.fees.perp_taker_bps
+    store.set_fee_model(FeeModel(taker_bps=taker_bps, perp_taker_bps=perp_taker_bps))
     print(f"Trading fee: {taker_bps} bps ({taker_bps / 100:.2f}% taker) applied to every fill")
+    if trading.binance_perp_symbols:
+        print(
+            f"Perp fee:    {perp_taker_bps} bps ({perp_taker_bps / 100:.2f}% taker) on "
+            f"{len(trading.binance_perp_symbols)} perpetual contract(s), paper only "
+            f"(1:1 leverage)"
+        )
+
+    # Which market each agent is allowed to trade. A spot strategy must not be able to
+    # open a short just because the ticker batch also carried a -PERP product.
+    store.set_agent_markets({agent.name: agent.markets for agent in arena_config.agents})
+    for agent in arena_config.agents:
+        print(f"  - {agent.name}: {agent.strategy} ({', '.join(agent.markets)})")
 
     # Venue rules make paper rehearse the real constraints (step size, min notional),
     # so an order this engine accepts is an order the venue accepts.

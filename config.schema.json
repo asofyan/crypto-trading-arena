@@ -53,8 +53,25 @@
             "default",
             "momentum",
             "scalper",
+            "scalper-perp",
             "swing-trend"
           ]
+        },
+        "markets": {
+          "default": [
+            "spot",
+            "perp"
+          ],
+          "description": "Markets this agent's strategy is written for. Products outside this list are refused by the executor, so a spot prompt cannot accidentally open a short and a perp prompt cannot buy inventory.",
+          "items": {
+            "enum": [
+              "spot",
+              "perp"
+            ],
+            "type": "string"
+          },
+          "title": "Markets",
+          "type": "array"
         }
       },
       "required": [
@@ -66,7 +83,7 @@
       "type": "object"
     },
     "FeeConfig": {
-      "description": "Trading fee configuration. All simulated fills cross the spread, so only\nthe taker rate is applied. Expressed in basis points (1 bps = 0.01%).\n\nDefault 60 bps matches Coinbase Advanced Trade's base-tier taker rate. Set to\n10 for Binance global (VIP 0), 40 for Kraken Pro, or 0 to disable.",
+      "description": "Trading fee configuration. All simulated fills cross the spread, so only\nthe taker rate is applied. Expressed in basis points (1 bps = 0.01%).\n\nDefault 60 bps matches Coinbase Advanced Trade's base-tier taker rate. Set to\n10 for Binance global (VIP 0), 40 for Kraken Pro, or 0 to disable.\n\n``perp_taker_bps`` is separate because a perpetual contract is a different\ninstrument: Binance USD\u24c8-M futures charge 5 bps at VIP 0 (spot charges 10), and\nthe venue bills the contract notional on the open as well as the close.",
       "properties": {
         "taker_bps": {
           "default": 60,
@@ -74,6 +91,14 @@
           "maximum": 1000,
           "minimum": 0,
           "title": "Taker Bps",
+          "type": "integer"
+        },
+        "perp_taker_bps": {
+          "default": 5,
+          "description": "Taker fee in basis points for perpetual-futures products (5 bps = 0.05%, Binance USD\u24c8-M VIP 0). Applied to *-PERP fills instead of taker_bps.",
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "Perp Taker Bps",
           "type": "integer"
         }
       },
@@ -342,6 +367,14 @@
           "title": "Binance Symbols",
           "type": "array"
         },
+        "binance_perp_symbols": {
+          "description": "Binance USD\u24c8-M perpetual contracts to trade, as venue symbols (SOLUSDT). The arena addresses each as <SYMBOL>-PERP so it cannot collide with the spot product of the same name. Empty disables perps entirely.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Binance Perp Symbols",
+          "type": "array"
+        },
         "coinbase_products": {
           "description": "Coinbase product IDs to subscribe to.",
           "items": {
@@ -354,6 +387,12 @@
           "default": "data/instruments-binance.json",
           "description": "Cached exchangeInfo rules that quantities are snapped to. Refresh with `uv run python -m arena.instruments --refresh`.",
           "title": "Instrument Cache",
+          "type": "string"
+        },
+        "perp_instrument_cache": {
+          "default": "data/instruments-binance-perp.json",
+          "description": "Cached fapi exchangeInfo rules for the perp products. Refresh with `uv run python -m arena.instruments --perp`.",
+          "title": "Perp Instrument Cache",
           "type": "string"
         },
         "paper": {

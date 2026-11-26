@@ -19,10 +19,14 @@ import pytest
 import httpx
 
 from arena.instruments import (
+    BINANCE_PERP_EXCHANGE_INFO,
+    BINANCE_PERP_REST,
+    PERP_SUFFIX,
     SymbolRules,
     fetch_exchange_info,
     load_cache,
     parse_exchange_info,
+    perp_product_id,
     refresh_cache,
     save_cache,
 )
@@ -374,6 +378,51 @@ def test_load_cache_accepts_a_raw_exchange_info_payload(tmp_path):
 # ── Cache refresh over HTTP (MockTransport: no network in the suite) ─────
 
 
+def _futures_min_notional(notional: str) -> dict:
+    """A USDⓈ-M futures MIN_NOTIONAL filter, verbatim from fapi.
+
+    The venue ships ``notional`` only: there is no ``minNotional`` key and no
+    ``applyToMarket`` flag, which is why a parser reading the spot key alone sees 0.
+    """
+    return {"filterType": "MIN_NOTIONAL", "notional": notional}
+
+
+FUTURES_SOL = _symbol(
+    "SOLUSDT",
+    "SOL",
+    "USDT",
+    [
+        _price_filter("0.01000000"),
+        _lot_size("0.00100000", "0.00100000"),
+        {
+            "filterType": "MARKET_LOT_SIZE",
+            "minQty": "0.00000000",
+            "maxQty": "1000.00000000",
+            "stepSize": "0.00000000",
+        },
+        _futures_min_notional("5.00000000"),
+    ],
+)
+
+FUTURES_XRP = _symbol(
+    "XRPUSDT",
+    "XRP",
+    "USDT",
+    [_price_filter("0.00010000"), _lot_size("0.10000000", "0.10000000"),
+     _futures_min_notional("5.00000000")],
+)
+
+FUTURES_LINK = _symbol(
+    "LINKUSDT",
+    "LINK",
+    "USDT",
+    [_price_filter("0.00100000"), _lot_size("0.01000000", "0.01000000"),
+     _futures_min_notional("20.00000000")],
+)
+
+FUTURES_PAYLOAD = {"symbols": [FUTURES_SOL, FUTURES_XRP, FUTURES_LINK]}
+
+
 def _solusdt_payload() -> dict:
     return {
         "symbols": [
@@ -394,6 +443,146 @@ def _solusdt_payload() -> dict:
             }
         ]
     }
+
+
+# ── USDⓈ-M perpetual futures (design D6) ────────────────────
+
+
+def test_parse_futures_min_notional_reads_the_notional_key():
+    """fapi writes ``{"filterType":"MIN_NOTIONAL","notional":"5"}``: no
+    ``minNotional``, no ``applyToMarket``, and MARKET orders are not exempt.
+
+    Reading only the spot key leaves min_notional at 0, so paper would accept a $2.50
+    order the venue rejects — the exact silent-minimum hole design D6 calls out.
+    """
+    rules = parse_exchange_info({"symbols": [FUTURES_SOL]})["SOLUSDT"]
+
+    assert rules.min_notional == Decimal("5")
+    assert rules.min_notional_applies_to_market is True
+    assert rules.notional_ok(Decimal("0.1"), 25.0) is False  # 2.50 < 5
+    assert rules.notional_ok(Decimal("0.2"), 25.0) is True  # 5.00 exactly
+
+
+def test_parse_futures_keeps_every_real_venue_number():
+    rules = parse_exchange_info(FUTURES_PAYLOAD)
+    assert {s: r.min_notional for s, r in rules.items()} == {
+        "SOLUSDT": Decimal("5"),
+        "XRPUSDT": Decimal("5"),
+        "LINKUSDT": Decimal("20"),
+    }
+    assert rules["SOLUSDT"].step_size == Decimal("0.001")
+    assert rules["XRPUSDT"].step_size == Decimal("0.1")
+    assert rules["LINKUSDT"].tick_size == Decimal("0.001")
+
+
+def test_parse_prefers_min_notional_over_notional_when_both_are_present():
+    entry = _symbol(
+        "ADAUSDT",
+        "ADA",
+        "USDT",
+        [
+            _lot_size("1.00000000", "1.00000000"),
+            {"filterType": "MIN_NOTIONAL", "minNotional": "10", "notional": "99"},
+        ],
+    )
+    assert parse_exchange_info({"symbols": [entry]})["ADAUSDT"].min_notional == Decimal("10")
+
+
+def test_product_suffix_keys_rules_by_product_id():
+    rules = parse_exchange_info(FUTURES_PAYLOAD, product_suffix=PERP_SUFFIX)
+
+    assert PERP_SUFFIX == "-PERP"
+    assert set(rules) == {"SOLUSDT-PERP", "XRPUSDT-PERP", "LINKUSDT-PERP"}
+    sol = rules[perp_product_id("SOLUSDT")]
+    assert sol.symbol == "SOLUSDT-PERP"  # product id, not the venue symbol
+    assert (sol.base_asset, sol.quote_asset) == ("SOL", "USDT")
+    assert sol.min_notional == Decimal("5")
+    assert rules["LINKUSDT-PERP"].min_notional == Decimal("20")
+
+
+def test_parse_without_suffix_keeps_bare_spot_ids():
+    # The default must stay byte-identical to today's spot contract.
+    assert set(parse_exchange_info(FUTURES_PAYLOAD)) == {"SOLUSDT", "XRPUSDT", "LINKUSDT"}
+
+
+def test_cache_round_trip_keeps_perp_product_ids(tmp_path):
+    rules = parse_exchange_info(FUTURES_PAYLOAD, product_suffix=PERP_SUFFIX)
+    path = tmp_path / "instruments-binance-perp.json"
+    save_cache(rules, path)
+
+    loaded = load_cache(path)
+    assert loaded == rules
+    assert loaded["SOLUSDT-PERP"].symbol == "SOLUSDT-PERP"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert Decimal(raw["SOLUSDT-PERP"]["min_notional"]) == Decimal("5")  # Decimals as strings
+
+
+def test_refresh_cache_reads_the_futures_endpoint_and_keys_by_product_id(tmp_path):
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=FUTURES_PAYLOAD)
+
+    path = tmp_path / "instruments-binance-perp.json"
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    rules = refresh_cache(
+        path,
+        base_url=BINANCE_PERP_REST,
+        symbols=["solusdt", "xrpusdt", "linkusdt"],
+        endpoint=BINANCE_PERP_EXCHANGE_INFO,
+        product_suffix=PERP_SUFFIX,
+        client=client,
+    )
+
+    assert seen["url"].startswith(f"{BINANCE_PERP_REST}/fapi/v1/exchangeInfo")
+    # The venue only knows bare symbols; the suffix is an arena-side product id.
+    assert "SOLUSDT" in seen["url"] and "PERP" not in seen["url"]
+    assert set(rules) == {"SOLUSDT-PERP", "XRPUSDT-PERP", "LINKUSDT-PERP"}
+    assert load_cache(path)["SOLUSDT-PERP"].min_notional == Decimal("5")
+
+
+def test_refresh_cache_narrows_a_board_the_venue_returns_unasked(tmp_path):
+    """fapi ignores the `symbols` query and answers with every listing, so `--perp`
+    would otherwise cache ~800 contracts instead of the requested three."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=FUTURES_PAYLOAD)  # three contracts, one asked for
+
+    path = tmp_path / "perp.json"
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    rules = refresh_cache(path, symbols=["SOLUSDT"], product_suffix=PERP_SUFFIX, client=client)
+
+    assert set(rules) == {"SOLUSDT-PERP"}
+    assert set(load_cache(path)) == {"SOLUSDT-PERP"}
+
+
+def test_refresh_cache_perp_warns_about_a_contract_the_venue_does_not_list(tmp_path, caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"symbols": [FUTURES_SOL]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with caplog.at_level(logging.WARNING, logger="arena.instruments"):
+        refresh_cache(
+            tmp_path / "perp.json",
+            symbols=["SOLUSDT", "DOGEUSDT"],
+            product_suffix=PERP_SUFFIX,
+            client=client,
+        )
+
+    assert "DOGEUSDT-PERP" in caplog.text
+
+
+def test_fetch_exchange_info_defaults_to_the_spot_endpoint():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=_solusdt_payload())
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    fetch_exchange_info(client=client)
+    assert "/api/v3/exchangeInfo" in seen["url"]
 
 
 def test_fetch_exchange_info_sends_compact_symbol_filter():

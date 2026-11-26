@@ -1,10 +1,15 @@
-"""Venue instrument rules (Binance Spot): parse, quantise, and cache.
+"""Venue instrument rules (Binance Spot and USDⓈ-M perpetual futures).
 
 Trading sizes are only legal in the venue's own steps: SOLUSDT floors to 0.001 and
 refuses orders under 5 USDT, so any quantity the arena books must be snapped to those
 rules first. Parsing and quantising are pure decimal arithmetic over an exchangeInfo
 payload; only `refresh_cache`/`main` touch the network, so the trading path and the
 unit tests never do.
+
+One parser serves both markets because `fapi` returns the same payload shape; only the
+endpoint and the name of the notional floor (`notional` instead of `minNotional`) differ.
+Rules are keyed by *product id* — venue symbol plus `product_suffix` — so a perp
+`SOLUSDT-PERP` never collides with spot `SOLUSDT` (design D6).
 """
 
 from __future__ import annotations
@@ -19,6 +24,31 @@ from pathlib import Path
 import httpx
 
 log = logging.getLogger(__name__)
+
+# A perpetual-futures contract is addressed as ``<VENUE_SYMBOL>-PERP`` so it can never
+# collide with the spot product of the same name in the shared price book and ledger.
+# This suffix is the single definition of "this product is a perp": the accounting
+# layer, the executor and the connectors all ask the helpers below instead of
+# re-deriving it. See docs/plans/261126-0810-scalper-perp/design.md, D1.
+PERP_SUFFIX = "-PERP"
+
+
+def perp_product_id(symbol: str) -> str:
+    """The arena product id for a perpetual contract on `symbol`."""
+    return f"{symbol.strip().upper()}{PERP_SUFFIX}"
+
+
+def is_perp_product(product_id: str) -> bool:
+    """Whether a product id names a perpetual contract."""
+    return product_id.strip().upper().endswith(PERP_SUFFIX)
+
+
+def venue_symbol(product_id: str) -> str:
+    """The venue's own symbol for a product id (strips the perp suffix)."""
+    cleaned = product_id.strip().upper()
+    if cleaned.endswith(PERP_SUFFIX):
+        return cleaned[: -len(PERP_SUFFIX)]
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -59,12 +89,14 @@ class SymbolRules:
         return qty * px >= self.min_notional
 
 
-def parse_exchange_info(payload: dict) -> dict[str, SymbolRules]:
-    """Build rules from a GET /api/v3/exchangeInfo body, skipping untradable symbols.
+def parse_exchange_info(payload: dict, *, product_suffix: str = "") -> dict[str, SymbolRules]:
+    """Build rules from an exchangeInfo body, skipping untradable symbols.
 
-    A symbol missing LOT_SIZE (or carrying a zero step) cannot be sized, so it is
-    dropped rather than allowed to raise: one unknown listing must not take the engine
-    down at startup.
+    `product_suffix` is appended to the venue symbol to form the product id (``-PERP``
+    for USDⓈ-M futures, empty for spot), so the map is keyed the same way the price book
+    and the ledger are. A symbol missing LOT_SIZE (or carrying a zero step) cannot be
+    sized, so it is dropped rather than allowed to raise: one unknown listing must not
+    take the engine down at startup.
     """
     rules: dict[str, SymbolRules] = {}
     for entry in payload.get("symbols") or []:
@@ -73,7 +105,7 @@ def parse_exchange_info(payload: dict) -> dict[str, SymbolRules]:
             # never take the engine down at startup.
             log.warning("instruments: skipping malformed symbol entry %r", entry)
             continue
-        symbol_rules = _parse_symbol(entry)
+        symbol_rules = _parse_symbol(entry, product_suffix=product_suffix)
         if symbol_rules is not None:
             rules[symbol_rules.symbol] = symbol_rules
     return rules
@@ -149,7 +181,7 @@ def _number(filter_entry: dict | None, key: str) -> Decimal:
     return converted if converted is not None else Decimal(0)
 
 
-def _parse_symbol(entry: dict) -> SymbolRules | None:
+def _parse_symbol(entry: dict, *, product_suffix: str = "") -> SymbolRules | None:
     symbol = entry.get("symbol")
     if not symbol or entry.get("status") != "TRADING":
         log.debug("instruments: skipping %s (status %s)", symbol, entry.get("status"))
@@ -176,13 +208,16 @@ def _parse_symbol(entry: dict) -> SymbolRules | None:
         min_notional = _number(notional, "minNotional")
         applies_to_market = bool(notional.get("applyMinToMarket", True))
     else:
-        # Older payloads only carry the legacy filter, whose flag is spelled differently.
+        # Older spot payloads only carry the legacy filter, whose flag is spelled
+        # differently. USDⓈ-M futures use the same filter name but the key `notional`
+        # and no applyToMarket at all, so reading only `minNotional` would leave every
+        # futures minimum at 0 and let paper accept orders the venue rejects (design D6).
         legacy = _filter_value(filters, "MIN_NOTIONAL")
-        min_notional = _number(legacy, "minNotional")
+        min_notional = _number(legacy, "minNotional") or _number(legacy, "notional")
         applies_to_market = bool((legacy or {}).get("applyToMarket", True))
 
     return SymbolRules(
-        symbol=symbol,
+        symbol=f"{symbol}{product_suffix}",
         base_asset=str(entry.get("baseAsset", "")),
         quote_asset=str(entry.get("quoteAsset", "")),
         step_size=step_size,
@@ -219,6 +254,15 @@ def _rules_from_dict(data: dict) -> SymbolRules:
 
 BINANCE_SPOT_REST = "https://api.binance.com"
 BINANCE_SPOT_TESTNET_REST = "https://testnet.binance.vision"
+BINANCE_PERP_REST = "https://fapi.binance.com"
+BINANCE_PERP_TESTNET_REST = "https://testnet.binancefuture.com"
+BINANCE_PERP_EXCHANGE_INFO = "/fapi/v1/exchangeInfo"
+
+# The contracts the arena's perp strategy trades. `--perp` caches exactly these unless
+# `--symbols` says otherwise: the whole futures board would bury three reviewable lines
+# in ~500, and the engine only ever needs the contracts its strategies can trade. Listed
+# as venue symbols; the cache is keyed by product id.
+DEFAULT_PERP_SYMBOLS = ["SOLUSDT", "XRPUSDT", "LINKUSDT"]
 
 
 def fetch_exchange_info(
@@ -226,19 +270,22 @@ def fetch_exchange_info(
     base_url: str = BINANCE_SPOT_REST,
     symbols: list[str] | None = None,
     client: httpx.Client | None = None,
+    endpoint: str = "/api/v3/exchangeInfo",
 ) -> dict:
-    """GET /api/v3/exchangeInfo, optionally narrowed to `symbols` to keep it small."""
+    """GET a venue's exchangeInfo, optionally narrowed to `symbols` to keep it small."""
     params = {}
     if symbols:
         # Compact separators: the venue rejects the API with `", "` between symbols
-        # (HTTP 400), so this is not cosmetic.
+        # (HTTP 400), so this is not cosmetic. Symbols stay bare venue symbols: the
+        # product suffix is an arena-side id the venue has never heard of.
         params["symbols"] = json.dumps(
             [s.strip().upper() for s in symbols], separators=(",", ":")
         )
     own_client = client is None
     http = client or httpx.Client(timeout=15.0)
     try:
-        response = http.get(f"{base_url.rstrip('/')}/api/v3/exchangeInfo", params=params)
+        url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        response = http.get(url, params=params)
         response.raise_for_status()
         return response.json()
     finally:
@@ -252,19 +299,28 @@ def refresh_cache(
     base_url: str = BINANCE_SPOT_REST,
     symbols: list[str] | None = None,
     client: httpx.Client | None = None,
+    endpoint: str = "/api/v3/exchangeInfo",
+    product_suffix: str = "",
 ) -> dict[str, SymbolRules]:
     """Fetch the venue's rules and persist them, so the engine can start offline."""
-    payload = fetch_exchange_info(base_url=base_url, symbols=symbols, client=client)
-    rules = parse_exchange_info(payload)
+    payload = fetch_exchange_info(
+        base_url=base_url, symbols=symbols, client=client, endpoint=endpoint
+    )
+    rules = parse_exchange_info(payload, product_suffix=product_suffix)
     if symbols:
+        requested = [f"{s.strip().upper()}{product_suffix}" for s in symbols]
         # A requested symbol that came back without usable rules is worth saying out
         # loud: the engine will silently fall back to the coarse legacy rule for it.
-        missing = {s.upper() for s in symbols} - set(rules)
+        missing = [product_id for product_id in requested if product_id not in rules]
         if missing:
             log.warning(
                 "instruments: no usable rules for %s; those symbols keep the legacy rule",
                 ", ".join(sorted(missing)),
             )
+        # fapi ignores the `symbols` query and answers with the whole board (~800
+        # listings), so narrow on this side: the cache must hold what was asked for,
+        # not everything the venue lists. A no-op for spot, which does honour the filter.
+        rules = {pid: rules[pid] for pid in requested if pid in rules}
     save_cache(rules, path)
     return rules
 
@@ -276,8 +332,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--out",
-        default="data/instruments-binance.json",
-        help="cache path (default: %(default)s)",
+        default=None,
+        help=(
+            "cache path (default: data/instruments-binance.json, or "
+            "data/instruments-binance-perp.json with --perp)"
+        ),
     )
     parser.add_argument(
         "--symbols",
@@ -285,11 +344,23 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="symbols to cache (default: every tradable symbol the venue returns)",
     )
-    parser.add_argument("--base-url", default=BINANCE_SPOT_REST, help="REST base URL")
+    parser.add_argument(
+        "--perp",
+        action="store_true",
+        help=(
+            "cache USDⓈ-M perpetual futures rules from fapi instead of spot; keys carry "
+            "the -PERP suffix and default to " + ", ".join(DEFAULT_PERP_SYMBOLS)
+        ),
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="REST base URL (default: the spot or futures venue picked by --perp)",
+    )
     parser.add_argument(
         "--testnet",
         action="store_true",
-        help="use testnet.binance.vision instead of the live venue",
+        help="use the venue's testnet instead of the live venue",
     )
     parser.add_argument(
         "--refresh",
@@ -298,18 +369,43 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    base_url = BINANCE_SPOT_TESTNET_REST if args.testnet else args.base_url
+    if args.perp:
+        endpoint = BINANCE_PERP_EXCHANGE_INFO
+        product_suffix = PERP_SUFFIX
+        out = args.out or "data/instruments-binance-perp.json"
+        # Without --symbols, cache just the contracts this arena can trade; the whole
+        # board is ~500 listings and none of the others are reachable from a strategy.
+        symbols = args.symbols or list(DEFAULT_PERP_SYMBOLS)
+    else:
+        endpoint = "/api/v3/exchangeInfo"
+        product_suffix = ""
+        out = args.out or "data/instruments-binance.json"
+        symbols = args.symbols
+
+    if args.base_url:
+        base_url = args.base_url
+    elif args.perp:
+        base_url = BINANCE_PERP_TESTNET_REST if args.testnet else BINANCE_PERP_REST
+    else:
+        base_url = BINANCE_SPOT_TESTNET_REST if args.testnet else BINANCE_SPOT_REST
+
     try:
-        rules = refresh_cache(args.out, base_url=base_url, symbols=args.symbols)
+        rules = refresh_cache(
+            out,
+            base_url=base_url,
+            symbols=symbols,
+            endpoint=endpoint,
+            product_suffix=product_suffix,
+        )
     except httpx.HTTPError as exc:
         # A wall of httpx traceback is not an operator error message.
         print(f"ERROR: could not read exchangeInfo from {base_url}: {exc}")
         return 1
-    print(f"Cached {len(rules)} symbol(s) from {base_url} → {args.out}")
+    print(f"Cached {len(rules)} symbol(s) from {base_url}{endpoint} → {out}")
     for symbol in sorted(rules):
         rule = rules[symbol]
         print(
-            f"  {symbol:<10} step {rule.step_size:g}  min qty {rule.min_qty:g}  "
+            f"  {symbol:<14} step {rule.step_size:g}  min qty {rule.min_qty:g}  "
             f"min notional {rule.min_notional:g} {rule.quote_asset}"
         )
     return 0 if rules else 1

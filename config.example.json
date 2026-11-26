@@ -20,14 +20,30 @@
       "provider": "openai",
       "model": "gpt-5-nano",
       "max_workers": 1,
-      "strategy": "default"
+      "strategy": "default",
+      "markets": [
+        "spot"
+      ]
     },
     {
       "name": "claude",
       "provider": "openrouter",
       "model": "anthropic/claude-sonnet-4",
       "max_workers": 1,
-      "strategy": "default"
+      "strategy": "default",
+      "markets": [
+        "spot"
+      ]
+    },
+    {
+      "name": "scalper-perp",
+      "provider": "openrouter",
+      "model": "anthropic/claude-sonnet-4",
+      "max_workers": 1,
+      "strategy": "scalper-perp",
+      "markets": [
+        "perp"
+      ]
     }
   ],
   "trading": {
@@ -38,6 +54,8 @@
       "XRPUSDT",
       "LINKUSDT"
     ],
+    "binance_perp_symbols": [],
+    "perp_instrument_cache": "data/instruments-binance-perp.json",
     "coinbase_products": [
       "BTC-USD",
       "SOL-USD",
@@ -76,8 +94,9 @@
       "recv_window_ms": 5000
     },
     "fees": {
-      "_comment": "Taker fee in basis points (1 bps = 0.01%). 60 = Coinbase Advanced Trade base tier. Set to 10 for Binance global VIP 0, or 0 to disable.",
-      "taker_bps": 60
+      "_comment": "Taker fee in basis points (1 bps = 0.01%). 60 = Coinbase Advanced Trade base tier. Set to 10 for Binance global VIP 0, or 0 to disable. perp_taker_bps applies to *-PERP products only (5 = Binance USD\u24c8-M VIP 0); run `uv run python -m exchanges.binance_perp` to stream those contracts.",
+      "taker_bps": 60,
+      "perp_taker_bps": 5
     }
   }
 }

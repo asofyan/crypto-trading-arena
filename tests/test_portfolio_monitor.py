@@ -6,6 +6,8 @@ import csv
 import time
 from pathlib import Path
 
+import pytest
+
 from arena.fees import FeeModel
 from arena.models import INITIAL_CASH
 from deploy.portfolio_monitor import (
@@ -313,3 +315,60 @@ def test_replay_trusts_recorded_cash_when_the_fee_rate_disagrees(tmp_path, caplo
     assert account.positions["SOLUSDT"] == 0.5
     assert abs(account.cash - (INITIAL_CASH - 35.0)) < 1e-6  # recorded cash, not 34.965
     assert "taker_bps matches the running arena" in caplog.text
+
+
+# ── Paper perpetuals replay as signed positions ─────────────────
+
+
+def _perp_rules():
+    from decimal import Decimal
+
+    from arena.instruments import SymbolRules
+
+    return {
+        "SOLUSDT-PERP": SymbolRules(
+            symbol="SOLUSDT-PERP",
+            base_asset="SOL",
+            quote_asset="USDT",
+            step_size=Decimal("0.01"),
+            min_qty=Decimal("0.01"),
+            min_notional=Decimal("5"),
+            tick_size=Decimal("0.01"),
+        )
+    }
+
+
+def _perp_sell(qty=0.55, price=70.0):
+    """A recorded short open: 5 bps on the notional, credited to cash."""
+    notional = qty * price
+    fee = notional * 5 / 10_000
+    return {
+        "timestamp": "2026-01-01T00:00:00",
+        "agent_id": "a",
+        "action": "sell",
+        "product_id": "SOLUSDT-PERP",
+        "quantity": qty,
+        "price": price,
+        "total_value": notional,
+        "fee": fee,
+        "cash_after": INITIAL_CASH + notional - fee,
+        "latency": 1.0,
+    }
+
+
+def test_a_perp_fill_replays_as_a_short_with_the_venue_step_and_fee(tmp_path):
+    """0.55 is legal on a 0.01 step but not under the legacy 1-decimal rule.
+
+    With no venue rules the replay would drop the row and the short would vanish from
+    the monitor; with the wrong fee the replayed cash would not match the CSV.
+    """
+    row = _perp_sell()
+    _write_trades(tmp_path / "trades_20260101_000000.csv", [row])
+    fee_model = FeeModel(taker_bps=FEE_BPS, perp_taker_bps=5)
+
+    mirror = PortfolioMirror(tmp_path, fee_model, _perp_rules())
+    assert mirror.sync() is True
+
+    account = mirror.store.accounts["a"]
+    assert account.positions["SOLUSDT-PERP"] == pytest.approx(-0.55)
+    assert account.cash == pytest.approx(row["cash_after"], abs=0.01)

@@ -15,10 +15,10 @@ import pytest
 
 from arena.fees import FeeModel
 from arena.models import TIMEFRAMES
-from arena.price_book import CandleBook
+from arena.price_book import CandleBook, PriceBook
 from exchanges import AGENT_OUTPUT_TOPIC, TickerMessage
-from exchanges import coinbase as cb
 from exchanges import binance as bn
+from exchanges import coinbase as cb
 from exchanges.binance import BINANCE_INTERVAL_MAP, BinanceKafkaConnector, parse_binance_candle
 from exchanges.coinbase import CoinbaseKafkaConnector, parse_coinbase_candle
 
@@ -101,6 +101,7 @@ def test_coinbase_skips_granularities_the_venue_cannot_serve():
     assert served == {tf.granularity for tf in TIMEFRAMES} - {14400}
     assert COINBASE_GRANULARITIES >= served
 
+
 def test_binance_interval_map_covers_every_timeframe_granularity():
     """Every TIMEFRAME granularity must map to a Binance interval, else poll_rest
     silently falls back to '1m' and fetches the wrong candle resolution."""
@@ -128,7 +129,6 @@ def test_fee_disclosure_is_precomputed():
 
 
 # ── _publish_latest prompt assembly ──────────────────────────────
-
 
 async def test_publish_latest_includes_fee_and_essential_ticker_fields():
     client = _FakeClient()
@@ -230,6 +230,329 @@ async def test_binance_run_wires_a_candle_book(monkeypatch):
     # The connector must bind the shared inbox so the viewer can observe agent events.
     assert connect_kwargs.get("inbox_topic") == AGENT_OUTPUT_TOPIC
     assert captured.get("candle_book") is not None
+    assert captured.get("venue") is bn.SPOT_VENUE
+
+
+# ── Venue parameterisation (perp, design D7) ─────────────────────
+
+
+def test_spot_venue_describes_the_current_spot_contract():
+    venue = bn.SPOT_VENUE
+    assert venue.is_perp is False
+    assert venue.product_suffix == ""
+    assert venue.product_id_for("solusdt") == "SOLUSDT"  # bare ids, as today
+    assert venue.ws_urls == (
+        "wss://stream.binance.com:9443",
+        "wss://stream.binance.com:443",
+    )
+    assert venue.rest_urls == (
+        "https://api.binance.com",
+        "https://api1.binance.com",
+        "https://api2.binance.com",
+        "https://api3.binance.com",
+    )
+    assert venue.klines_path == "/api/v3/klines"
+    assert venue.ticker_path == "/api/v3/ticker/24hr"
+    assert venue.book_ticker_path is None
+
+
+def test_perp_venue_describes_the_futures_contract():
+    venue = bn.PERP_VENUE
+    assert venue.is_perp is True
+    assert venue.product_suffix == "-PERP"
+    assert venue.product_id_for("SOLUSDT") == "SOLUSDT-PERP"
+    assert venue.ws_urls == (
+        "wss://fstream.binance.com",
+        "wss://fstream.binance.com:443",
+    )
+    assert venue.rest_urls == ("https://fapi.binance.com",)
+    assert venue.klines_path == "/fapi/v1/klines"
+    assert venue.ticker_path == "/fapi/v1/ticker/24hr"
+    assert venue.book_ticker_path == "/fapi/v1/ticker/bookTicker"
+
+
+def test_parse_binance_ticker_publishes_the_perp_product_id():
+    payload = {
+        "s": "SOLUSDT", "c": "100.5", "b": "100.4", "B": "3.0", "a": "100.6",
+        "A": "4.0", "Q": "0.5", "o": "98", "h": "102", "l": "97",
+        "v": "15000", "n": 42, "E": 1_700_000_000_000,
+    }
+    perp = BinanceKafkaConnector(
+        _FakeClient(), "t", ["SOLUSDT"], FeeModel(0), venue=bn.PERP_VENUE
+    )
+    msg = perp._parse_binance_ticker(payload)
+    assert msg is not None and msg.product_id == "SOLUSDT-PERP"
+
+    # Cash market unchanged: the connector still publishes the bare venue symbol.
+    spot = BinanceKafkaConnector(_FakeClient(), "t", ["SOLUSDT"], FeeModel(0))
+    assert spot._parse_binance_ticker(payload).product_id == "SOLUSDT"
+
+
+def test_perp_disclosure_quotes_the_perp_rate_not_the_spot_rate():
+    fee = FeeModel(taker_bps=10, perp_taker_bps=5)
+    perp = BinanceKafkaConnector(
+        _FakeClient(), "t", ["SOLUSDT"], fee, venue=bn.PERP_VENUE
+    )
+    assert perp._fee_disclosure == fee.disclosure_prompt(perp=True)
+    assert "A taker fee of 5 bps" in perp._fee_disclosure  # the perp rate, not 10
+    assert "A taker fee of 10 bps" not in perp._fee_disclosure
+
+    spot = BinanceKafkaConnector(_FakeClient(), "t", ["SOLUSDT"], fee)
+    assert "A taker fee of 10 bps" in spot._fee_disclosure
+
+
+class _FuturesREST:
+    """Fake fapi REST client: two all-symbol boards, no per-symbol ticker calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def get_klines(self, symbol, interval, start_time=None, end_time=None, limit=1000):
+        self.calls.append(("klines", symbol))
+        return [[1_700_000_000_000, 20.0, 30.0, 10.0, 25.0, 100.0, 999]]
+
+    async def get_24h_ticker(self, symbol=None):
+        assert symbol is None, "futures 24hr must be requested for the whole board once"
+        self.calls.append(("24hr", symbol))
+        return [
+            {"symbol": "SOLUSDT", "lastPrice": "100.0", "lastQty": "0.5",
+             "volume": "15000", "closeTime": 1_700_000_000_000},
+            {"symbol": "XRPUSDT", "lastPrice": "2.0", "lastQty": "10",
+             "volume": "999", "closeTime": 1_700_000_000_000},
+            {"symbol": "DOGEUSDT", "lastPrice": "0.1"},  # not subscribed: dropped
+        ]
+
+    async def get_book_ticker(self, symbol=None):
+        assert symbol is None, "bookTicker must be requested for the whole board once"
+        self.calls.append(("book", symbol))
+        return [
+            {"symbol": "SOLUSDT", "bidPrice": "99.9", "bidQty": "5",
+             "askPrice": "100.1", "askQty": "6"},
+            {"symbol": "XRPUSDT", "bidPrice": "1.99", "bidQty": "7",
+             "askPrice": "2.01", "askQty": "8"},
+        ]
+
+
+async def test_poll_once_perp_joins_the_board_once_per_cycle():
+    """fapi's 24hr ticker has no bid/ask and weighs 40 *per symbol*; bookTicker weighs
+    2 for the whole board. One request each per cycle, joined by symbol (design D7)."""
+    client = _FuturesREST()
+    prices = PriceBook()
+    candles = CandleBook(parse_row=parse_binance_candle)
+
+    await bn._poll_once(
+        client,
+        ["SOLUSDT", "XRPUSDT"],
+        prices,
+        candles,
+        venue=bn.PERP_VENUE,
+        products={"SOLUSDT": "SOLUSDT-PERP", "XRPUSDT": "XRPUSDT-PERP"},
+    )
+
+    ticker_calls = [call for call in client.calls if call[0] in ("24hr", "book")]
+    assert ticker_calls == [("24hr", None), ("book", None)]  # exactly once, no symbol
+
+    snapshot = prices.snapshot()
+    assert set(snapshot) == {"SOLUSDT-PERP", "XRPUSDT-PERP"}  # product ids, not symbols
+    sol = snapshot["SOLUSDT-PERP"]
+    assert (sol["price"], sol["best_bid"], sol["best_ask"]) == ("100.0", "99.9", "100.1")
+    assert (sol["best_bid_size"], sol["best_ask_size"]) == ("5", "6")
+    assert (sol["last_size"], sol["volume_24h"]) == ("0.5", "15000")
+
+    # Candles are keyed by product id too, else format_prompt() finds nothing.
+    prompt = candles.format_prompt(["SOLUSDT-PERP"])
+    assert "SOLUSDT-PERP,2023-11-14T22:13:20Z" in prompt
+    assert "XRPUSDT-PERP" not in prompt
+
+
+async def test_poll_once_spot_still_calls_the_per_symbol_ticker():
+    """Regression guard: the spot path must stay one `24hr?symbol=` call per symbol."""
+
+    class _SpotREST:
+        def __init__(self) -> None:
+            self.ticker_calls: list[str | None] = []
+
+        async def get_klines(
+            self, symbol, interval, start_time=None, end_time=None, limit=1000
+        ):
+            return []
+
+        async def get_24h_ticker(self, symbol=None):
+            self.ticker_calls.append(symbol)
+            return {
+                "lastPrice": "100", "bidPrice": "99", "bidQty": "1",
+                "askPrice": "101", "askQty": "2", "lastQty": "3",
+                "volume": "5000", "closeTime": 1_700_000_000_000,
+            }
+
+    client = _SpotREST()
+    prices = PriceBook()
+    await bn._poll_once(
+        client, ["SOLUSDT"], prices, CandleBook(parse_row=parse_binance_candle)
+    )
+
+    assert client.ticker_calls == ["SOLUSDT"]
+    assert prices.snapshot()["SOLUSDT"]["best_bid"] == "99"
+
+
+async def test_poll_rest_perp_cycle_stores_quotes_under_product_ids(monkeypatch):
+    """End-to-end over a faked BinanceRESTClient (no network): the poller must build the
+    client for the futures venue and publish the joined quote as SOLUSDT-PERP."""
+    fake = _FuturesREST()
+    built: dict = {}
+
+    def _factory(*args, **kwargs):
+        built.update(kwargs)
+        return fake
+
+    monkeypatch.setattr(bn, "BinanceRESTClient", _factory)
+
+    class _SignalBook(PriceBook):
+        """PriceBook that trips an event on the first update, so the loop can be stopped."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_quote = asyncio.Event()
+
+        def update(self, data: dict) -> None:
+            super().update(data)
+            self.first_quote.set()
+
+    prices = _SignalBook()
+    task = asyncio.create_task(
+        bn.poll_rest(
+            ["SOLUSDT"],
+            prices,
+            CandleBook(parse_row=parse_binance_candle),
+            interval=3600.0,
+            venue=bn.PERP_VENUE,
+            products={"SOLUSDT": "SOLUSDT-PERP"},
+        )
+    )
+    try:
+        await asyncio.wait_for(prices.first_quote.wait(), timeout=5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert built["venue"] is bn.PERP_VENUE
+    snapshot = prices.snapshot()
+    assert set(snapshot) == {"SOLUSDT-PERP"}
+    assert (snapshot["SOLUSDT-PERP"]["price"], snapshot["SOLUSDT-PERP"]["best_ask"]) == (
+        "100.0",
+        "100.1",
+    )
+
+async def test_rest_client_uses_the_venue_paths(monkeypatch):
+    seen: list[str] = []
+
+    async def fake_request(self, method, path, **kwargs):
+        seen.append(path)
+        return []
+
+    monkeypatch.setattr(bn.BinanceRESTClient, "_request", fake_request)
+    async with bn.BinanceRESTClient(venue=bn.PERP_VENUE) as client:
+        await client.get_klines("SOLUSDT", "1m")
+        await client.get_24h_ticker()  # no symbol -> whole board
+        await client.get_book_ticker()
+
+    assert seen == [
+        "/fapi/v1/klines",
+        "/fapi/v1/ticker/24hr",
+        "/fapi/v1/ticker/bookTicker",
+    ]
+
+
+async def test_rest_client_rotates_only_within_the_venue_urls():
+    async with bn.BinanceRESTClient(venue=bn.PERP_VENUE) as client:
+        assert client._base_url == "https://fapi.binance.com"
+        # fapi publishes a single host; rotation must not wrap onto a spot URL.
+        client._rotate_url()
+        assert client._base_url == "https://fapi.binance.com"
+
+
+async def test_rest_client_refuses_book_ticker_on_a_venue_without_one():
+    async with bn.BinanceRESTClient() as client:
+        with pytest.raises(ValueError, match="bookTicker"):
+            await client.get_book_ticker()
+
+
+def test_parse_args_perp_defaults_to_the_futures_publish_interval(capsys):
+    assert bn.parse_args([]).min_interval == 60.0
+    assert bn.parse_args([], venue=bn.PERP_VENUE).min_interval == 15.0
+
+    with pytest.raises(SystemExit):
+        bn.parse_args(["--help"], venue=bn.PERP_VENUE)
+    assert "python -m exchanges.binance_perp" in capsys.readouterr().out
+
+
+async def test_binance_perp_run_reads_perp_symbols_and_fee(monkeypatch):
+    import config as config_module
+
+    captured, _ = _stub_run_env(monkeypatch, bn)
+    monkeypatch.setattr(bn, "BinanceKafkaConnector", _capturing(captured))
+    trading = SimpleNamespace(
+        binance_symbols=["BTCUSDT"],
+        binance_perp_symbols=["SOLUSDT", "XRPUSDT"],
+        fees=SimpleNamespace(taker_bps=10, perp_taker_bps=5),
+    )
+    monkeypatch.setattr(
+        config_module, "load_config_strict", lambda path: SimpleNamespace(trading=trading)
+    )
+    args = SimpleNamespace(config="config.json", symbols=None, min_interval=15.0,
+                           bootstrap_servers="x")
+
+    await bn.run(args, venue=bn.PERP_VENUE)
+
+    assert captured["venue"] is bn.PERP_VENUE
+    assert captured["symbols"] == ["SOLUSDT", "XRPUSDT"]
+    assert captured["fee_model"] == FeeModel(taker_bps=10, perp_taker_bps=5)
+
+
+async def test_binance_perp_run_survives_a_config_without_the_perp_key(monkeypatch):
+    """The perp symbol list arrives with the config change; until then the entrypoint
+    must fall back instead of raising AttributeError at startup."""
+    import config as config_module
+
+    captured, _ = _stub_run_env(monkeypatch, bn)
+    monkeypatch.setattr(bn, "BinanceKafkaConnector", _capturing(captured))
+    trading = SimpleNamespace(
+        binance_symbols=["BTCUSDT"], fees=SimpleNamespace(taker_bps=10, perp_taker_bps=5)
+    )
+    monkeypatch.setattr(
+        config_module, "load_config_strict", lambda path: SimpleNamespace(trading=trading)
+    )
+    args = SimpleNamespace(config="config.json", symbols=None, min_interval=15.0,
+                           bootstrap_servers="x")
+
+    await bn.run(args, venue=bn.PERP_VENUE)
+
+    assert captured["symbols"] == list(bn.DEFAULT_SYMBOLS)
+
+
+async def test_binance_perp_entrypoint_pins_the_futures_venue(monkeypatch):
+    from exchanges import binance_perp as bp
+
+    seen: dict = {}
+
+    async def fake_run(args, *, venue=None, agent_topic=None):
+        seen.update(args=args, venue=venue, agent_topic=agent_topic)
+
+    monkeypatch.setattr(bp, "binance_run", fake_run)
+    args = SimpleNamespace()
+
+    await bp.run(args)
+
+    assert seen["args"] is args
+    assert seen["venue"] is bn.PERP_VENUE
+    assert bp.parse_args([]).min_interval == 15.0
 
 
 @pytest.mark.xfail(
@@ -245,3 +568,29 @@ async def test_coinbase_run_wires_a_candle_book(monkeypatch):
     await cb.run(args)
     assert connect_kwargs.get("inbox_topic") == AGENT_OUTPUT_TOPIC
     assert captured.get("candle_book") is not None
+
+
+# ── Closed-bar guarantee for the strategy prompts ───────────────
+
+
+def test_drop_forming_bars_strips_the_in_progress_candle():
+    """A window ending at "now" returns the forming bar last; prompts promise closed bars."""
+    now_ms = 1_700_000_060_000
+    rows = [
+        [now_ms - 120_000, "1", "1", "1", "1", "0"],
+        [now_ms - 60_000, "1", "1", "1", "1", "0"],   # closed 60s before now
+        [now_ms, "1", "1", "1", "1", "0"],            # still forming
+    ]
+
+    kept = bn.drop_forming_bars(rows, 60, now_ms)
+
+    assert len(kept) == 2
+    assert kept[-1][0] == now_ms - 60_000
+
+
+def test_drop_forming_bars_keeps_a_fully_closed_window():
+    now_ms = 1_700_000_000_000
+    rows = [[now_ms - 900_000, "1", "1", "1", "1", "0"], [now_ms - 300_000, "1", "1", "1", "1", "0"]]
+
+    assert bn.drop_forming_bars(rows, 60, now_ms) == rows
+    assert bn.drop_forming_bars([], 60, now_ms) == []

@@ -40,6 +40,7 @@ from calfkit import Client, Worker
 from arena.account_store import AccountStore
 from arena.dashboard import PortfolioView
 from arena.fees import FeeModel
+from arena.instruments import SymbolRules
 from arena.price_book import PriceBook
 from config import load_config_strict
 from exchanges import PRICE_TOPIC, TickerMessage
@@ -73,9 +74,18 @@ class PortfolioMirror:
     code, not a copy of it.
     """
 
-    def __init__(self, data_dir: Path, fee_model: FeeModel) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        fee_model: FeeModel,
+        rules: dict[str, SymbolRules] | None = None,
+    ) -> None:
         self._data_dir = data_dir
         self._fee_model = fee_model
+        # Venue rules make the replay accept exactly what the arena accepted: without
+        # them a legal perp size (0.55 SOLUSDT-PERP) trips the legacy 1-decimal rule and
+        # the position silently disappears from this view.
+        self._rules = dict(rules or {})
         self._path: Path | None = None
         self._snapshot_path: Path | None = None
         self._offset = 0
@@ -83,8 +93,14 @@ class PortfolioMirror:
         self._rows = 0
         self._fee_warnings = 0
         # Set by _reset_session so every caller sees the active objects.
-        self.store = AccountStore(PriceBook(), fee_model)
+        self.store = self._new_store()
         self.view = PortfolioView(self.store)
+
+    def _new_store(self) -> AccountStore:
+        """A fresh store over the same price book, fee model and venue rules."""
+        store = AccountStore(PriceBook(), self._fee_model)
+        store.set_instrument_rules(self._rules)
+        return store
 
     @property
     def session_file(self) -> Path | None:
@@ -96,7 +112,7 @@ class PortfolioMirror:
 
     def _reset_session(self, path: Path) -> None:
         logger.info("mirroring session %s", path.name)
-        self.store = AccountStore(PriceBook(), self._fee_model)
+        self.store = self._new_store()
         self.view = PortfolioView(self.store)
         self._path = path
         self._offset = 0
@@ -213,7 +229,9 @@ class PortfolioMirror:
                 "best_ask": price,
             }
         )
-        result = self.store.execute_trade(agent_id, product_id, quantity, action)
+        result = self.store.execute_trade(
+            agent_id, product_id, quantity, action, replay=True
+        )
         if not result.success:
             logger.warning("could not replay %s %s %s: %s", agent_id, action, product_id,
                            result.message)
@@ -276,8 +294,18 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run(args: argparse.Namespace) -> None:
-    fee_model = FeeModel(taker_bps=load_config_strict(args.config).trading.fees.taker_bps)
-    mirror = PortfolioMirror(Path(args.data_dir), fee_model)
+    config = load_config_strict(args.config)
+    fee_model = FeeModel(
+        taker_bps=config.trading.fees.taker_bps,
+        perp_taker_bps=config.trading.fees.perp_taker_bps,
+    )
+    # Imported here, not at module scope: the deploy CLI owns the spot+perp merge and
+    # importing it eagerly would drag its arena.tools singletons into this read-only
+    # process for no reason.
+    from deploy.tools_and_dashboard import resolve_instrument_rules
+
+    rules, _summary = resolve_instrument_rules(config.trading)
+    mirror = PortfolioMirror(Path(args.data_dir), fee_model, rules)
 
     if not mirror.sync() and mirror.session_file is None:
         print(f"ERROR: no trades_*.csv in {args.data_dir} — nothing to monitor yet.")

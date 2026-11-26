@@ -1,10 +1,17 @@
 """Binance exchange connector — WebSocket consumer, REST poller,
 and Kafka connector in a single module.
 
+The module serves two markets from one implementation: Binance **spot** and Binance
+**USDⓈ-M perpetual futures**. Everything that differs between them — WS/REST hosts, the
+klines and ticker paths, and whether product ids carry the ``-PERP`` suffix — lives in a
+`BinanceVenue`, so the ticker parser, the candle parser and the Kafka contract stay
+single-sourced. See docs/plans/261126-0810-scalper-perp/design.md, D7.
+
 Usage:
     uv run python -m exchanges.binance
     uv run python -m exchanges.binance --symbols SOLUSDT XRPUSDT LINKUSDT
     uv run python -m exchanges.binance --min-interval 30
+    uv run python -m exchanges.binance_perp --symbols SOLUSDT XRPUSDT LINKUSDT
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,7 +33,8 @@ import websockets
 
 from calfkit import Client
 
-from arena.fees import FeeModel
+from arena.fees import DEFAULT_PERP_TAKER_BPS, FeeModel
+from arena.instruments import PERP_SUFFIX
 from arena.models import Candle, TIMEFRAMES
 from arena.price_book import CandleBook, PriceBook
 from exchanges import (
@@ -38,14 +47,63 @@ from exchanges import (
 
 logger = logging.getLogger(__name__)
 
-BINANCE_WS_URL = "wss://stream.binance.com:9443"
-BINANCE_WS_URL_FALLBACK = "wss://stream.binance.com:443"
-BINANCE_REST_URLS = [
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-]
+
+@dataclass(frozen=True)
+class BinanceVenue:
+    """One Binance market's addressing: hosts, REST paths, and product-id shape.
+
+    Frozen and data-only on purpose: a venue is a constant, never runtime state, so a
+    connector can log which market it is streaming from a single field.
+    """
+
+    name: str
+    ws_urls: tuple[str, ...]
+    rest_urls: tuple[str, ...]
+    klines_path: str
+    ticker_path: str
+    book_ticker_path: str | None
+    product_suffix: str
+
+    @property
+    def is_perp(self) -> bool:
+        return bool(self.product_suffix)
+
+    @property
+    def label(self) -> str:
+        return "USDⓈ-M perpetual futures" if self.is_perp else "spot"
+
+    def product_id_for(self, symbol: str) -> str:
+        """The arena product id for a venue symbol (spot ids stay bare)."""
+        return f"{symbol.strip().upper()}{self.product_suffix}"
+
+
+SPOT_VENUE = BinanceVenue(
+    name="binance",
+    ws_urls=("wss://stream.binance.com:9443", "wss://stream.binance.com:443"),
+    rest_urls=(
+        "https://api.binance.com",
+        "https://api1.binance.com",
+        "https://api2.binance.com",
+        "https://api3.binance.com",
+    ),
+    klines_path="/api/v3/klines",
+    ticker_path="/api/v3/ticker/24hr",
+    # Spot's 24hr ticker already carries bid/ask and its size, so no second call.
+    book_ticker_path=None,
+    product_suffix="",
+)
+
+PERP_VENUE = BinanceVenue(
+    name="binance_perp",
+    ws_urls=("wss://fstream.binance.com", "wss://fstream.binance.com:443"),
+    rest_urls=("https://fapi.binance.com",),
+    klines_path="/fapi/v1/klines",
+    ticker_path="/fapi/v1/ticker/24hr",
+    # Futures' 24hr ticker has no bid/ask at all; bookTicker (weight 2, all symbols)
+    # supplies the touch. See design D7.
+    book_ticker_path="/fapi/v1/ticker/bookTicker",
+    product_suffix=PERP_SUFFIX,
+)
 
 # Binance interval mapping (seconds -> Binance format)
 BINANCE_INTERVAL_MAP = {
@@ -80,19 +138,20 @@ def parse_binance_candle(row: list) -> Candle:
 
 
 class BinanceRESTClient:
-    """Binance REST API client with automatic failover."""
+    """Binance REST client for one venue, with automatic failover."""
 
-    def __init__(self) -> None:
+    def __init__(self, venue: BinanceVenue = SPOT_VENUE) -> None:
+        self._venue = venue
         self._url_index = 0
         self._client = httpx.AsyncClient(timeout=15.0)
 
     @property
     def _base_url(self) -> str:
-        return BINANCE_REST_URLS[self._url_index]
+        return self._venue.rest_urls[self._url_index]
 
     def _rotate_url(self) -> str:
         """Rotate to next fallback URL."""
-        self._url_index = (self._url_index + 1) % len(BINANCE_REST_URLS)
+        self._url_index = (self._url_index + 1) % len(self._venue.rest_urls)
         logger.info("Switching to fallback URL: %s", self._base_url)
         return self._base_url
 
@@ -107,7 +166,7 @@ class BinanceRESTClient:
         """Make request with automatic retry on different base URLs."""
         last_error = None
 
-        for _ in range(len(BINANCE_REST_URLS)):
+        for _ in range(len(self._venue.rest_urls)):
             url = f"{self._base_url}{path}"
             try:
                 response = await self._client.request(method, url, **kwargs)
@@ -146,57 +205,192 @@ class BinanceRESTClient:
         if end_time:
             params["endTime"] = end_time
 
-        return await self._request("GET", "/api/v3/klines", params=params)
+        return await self._request("GET", self._venue.klines_path, params=params)
 
-    async def get_24h_ticker(self, symbol: str) -> dict:
-        """Fetch 24h rolling window ticker statistics."""
-        params = {"symbol": symbol.upper()}
-        return await self._request("GET", "/api/v3/ticker/24hr", params=params)
+    async def get_24h_ticker(self, symbol: str | None = None) -> Any:
+        """Fetch 24h rolling window statistics for `symbol`, or the whole board if None."""
+        params = {"symbol": symbol.upper()} if symbol else None
+        return await self._request("GET", self._venue.ticker_path, params=params)
+
+    async def get_book_ticker(self, symbol: str | None = None) -> Any:
+        """Fetch best bid/ask for `symbol`, or the whole board if None.
+
+        Futures only: spot's 24hr ticker already carries the touch.
+        """
+        if self._venue.book_ticker_path is None:
+            raise ValueError(
+                f"{self._venue.name} has no bookTicker REST path; "
+                "its 24hr ticker already carries bid/ask"
+            )
+        params = {"symbol": symbol.upper()} if symbol else None
+        return await self._request("GET", self._venue.book_ticker_path, params=params)
+
+
+def drop_forming_bars(rows: list[list], granularity_seconds: int, now_ms: int) -> list[list]:
+    """Strip trailing candles that have not closed yet.
+
+    A request whose endTime is "now" comes back with the in-progress candle as its last
+    row. The strategy prompts promise that the newest row of every table is a *closed*
+    bar — a scalper reading the forming 1-minute bar would trade a high that is not a
+    high yet. Rows are keyed by their open time, so a row closes at
+    ``open + granularity``.
+    """
+    closed = list(rows)
+    while closed and isinstance(closed[-1], list) and (
+        closed[-1][0] + granularity_seconds * 1000 > now_ms
+    ):
+        closed.pop()
+    return closed
+
+
+async def _refresh_candles(
+    client: BinanceRESTClient,
+    symbol: str,
+    product_id: str,
+    candle_book: CandleBook,
+    now_ms: int,
+) -> None:
+    """Refresh every timeframe for one symbol.
+
+    Candles are stored under the *product id* because that is what `format_prompt`
+    indexes by; the venue is only ever asked for its own bare symbol.
+    """
+    for tf in TIMEFRAMES:
+        start_ms = now_ms - tf.start_minutes_ago * 60 * 1000
+        end_ms = now_ms - tf.end_minutes_ago * 60 * 1000
+        interval_str = BINANCE_INTERVAL_MAP.get(tf.granularity, "1m")
+
+        resp = await client.get_klines(
+            symbol=symbol,
+            interval=interval_str,
+            start_time=start_ms,
+            end_time=end_ms,
+        )
+        if tf.end_minutes_ago == 0:
+            # Only the window that ends at "now" can contain a forming bar.
+            resp = drop_forming_bars(resp, tf.granularity, now_ms)
+        candle_book.update_from_api(product_id, tf.granularity, resp)
+
+
+def _iso_ms(value: Any) -> str:
+    """A venue millisecond timestamp as ISO-8601, or "" when the venue omitted it."""
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat()
+    return ""
+
+
+async def _futures_price_board(client: BinanceRESTClient) -> dict[str, dict]:
+    """One joined snapshot of the whole futures board: stats plus bid/ask.
+
+    ``/fapi/v1/ticker/24hr`` carries no bid/ask and weighs 40 per *symbol*, so calling it
+    per symbol would spend 120 weight per cycle for data the all-symbol form returns in
+    one request; ``/fapi/v1/ticker/bookTicker`` (weight 2, all symbols) adds the touch.
+    See design D7.
+    """
+    try:
+        stats = await client.get_24h_ticker()
+        books = await client.get_book_ticker()
+    except Exception:
+        # One failed cycle must not kill the poller: the dashboard keeps the last price.
+        logger.exception("REST poll failed for the futures ticker board")
+        return {}
+
+    board: dict[str, dict] = {}
+    for stat in stats or []:
+        symbol = str(stat.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        board[symbol] = {
+            "price": stat.get("lastPrice", ""),
+            "best_bid": "",
+            "best_bid_size": "0",
+            "best_ask": "",
+            "best_ask_size": "0",
+            "side": "",
+            "last_size": stat.get("lastQty", "0"),
+            "volume_24h": stat.get("volume", "0"),
+            "time": _iso_ms(stat.get("closeTime")),
+        }
+
+    for book in books or []:
+        symbol = str(book.get("symbol") or "").upper()
+        quote = board.get(symbol)
+        if quote is None:
+            continue
+        quote["best_bid"] = book.get("bidPrice", "")
+        quote["best_bid_size"] = book.get("bidQty", "0")
+        quote["best_ask"] = book.get("askPrice", "")
+        quote["best_ask_size"] = book.get("askQty", "0")
+
+    return board
+
+
+async def _poll_once(
+    client: BinanceRESTClient,
+    symbols: list[str],
+    price_book: PriceBook,
+    candle_book: CandleBook,
+    venue: BinanceVenue = SPOT_VENUE,
+    products: dict[str, str] | None = None,
+) -> None:
+    """One poll cycle: multi-timeframe candles plus the current price for each symbol."""
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    mapping = products or {}
+
+    board: dict[str, dict] = {}
+    if venue.is_perp:
+        board = await _futures_price_board(client)
+
+    for symbol in symbols:
+        product_id = mapping.get(symbol, venue.product_id_for(symbol))
+        try:
+            await _refresh_candles(client, symbol, product_id, candle_book, now_ms)
+
+            if venue.is_perp:
+                quote = board.get(symbol.upper())
+                if quote is None:
+                    continue
+                price_book.update({"product_id": product_id, **quote})
+                continue
+
+            resp = await client.get_24h_ticker(symbol)
+            price_book.update({
+                "product_id": product_id,
+                "price": resp["lastPrice"],
+                "best_bid": resp["bidPrice"],
+                "best_bid_size": resp["bidQty"],
+                "best_ask": resp["askPrice"],
+                "best_ask_size": resp["askQty"],
+                "side": "",
+                "last_size": resp["lastQty"],
+                "volume_24h": resp["volume"],
+                "time": datetime.fromtimestamp(
+                    resp["closeTime"] / 1000, tz=timezone.utc
+                ).isoformat(),
+            })
+        except Exception:
+            logger.exception("REST poll failed for %s", symbol)
+
 
 async def poll_rest(
     symbols: list[str],
     price_book: PriceBook,
     candle_book: CandleBook,
     interval: float = 60.0,
+    venue: BinanceVenue = SPOT_VENUE,
+    products: dict[str, str] | None = None,
 ) -> None:
-    """Poll Binance REST API for multi-timeframe candles and current prices."""
-    async with BinanceRESTClient() as client:
+    """Poll the venue's REST API for multi-timeframe candles and current prices."""
+    async with BinanceRESTClient(venue=venue) as client:
         while True:
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-            for symbol in symbols:
-                try:
-                    for tf in TIMEFRAMES:
-                        start_ms = now_ms - tf.start_minutes_ago * 60 * 1000
-                        end_ms = now_ms - tf.end_minutes_ago * 60 * 1000
-                        interval_str = BINANCE_INTERVAL_MAP.get(tf.granularity, "1m")
-
-                        resp = await client.get_klines(
-                            symbol=symbol,
-                            interval=interval_str,
-                            start_time=start_ms,
-                            end_time=end_ms,
-                        )
-                        candle_book.update_from_api(symbol, tf.granularity, resp)
-
-                    resp = await client.get_24h_ticker(symbol)
-                    price_book.update({
-                        "product_id": symbol,
-                        "price": resp["lastPrice"],
-                        "best_bid": resp["bidPrice"],
-                        "best_bid_size": resp["bidQty"],
-                        "best_ask": resp["askPrice"],
-                        "best_ask_size": resp["askQty"],
-                        "side": "",
-                        "last_size": resp["lastQty"],
-                        "volume_24h": resp["volume"],
-                        "time": datetime.fromtimestamp(
-                            resp["closeTime"] / 1000, tz=timezone.utc
-                        ).isoformat(),
-                    })
-                except Exception:
-                    logger.exception("REST poll failed for %s", symbol)
-
+            await _poll_once(
+                client,
+                symbols,
+                price_book,
+                candle_book,
+                venue=venue,
+                products=products,
+            )
             await asyncio.sleep(interval)
 
 
@@ -221,6 +415,7 @@ class BinanceKafkaConnector:
         fee_model: FeeModel,
         min_publish_interval: float = 0.0,
         candle_book: CandleBook | None = None,
+        venue: BinanceVenue = SPOT_VENUE,
     ) -> None:
         if not symbols:
             raise ValueError("At least one symbol must be specified")
@@ -229,12 +424,17 @@ class BinanceKafkaConnector:
         # broadcast topic (all agents subscribe under distinct consumer groups), NOT a
         # per-agent private topic — see docs/calfkit-0.12-migration.md, constraint #2.
         self._agent_gw = client.agent(topic=agent_topic)
+        self._venue = venue
+        # `_symbols` stays the venue's own symbols: both the WS stream names and the
+        # REST paths are the venue's vocabulary. Everything agent- or ledger-facing
+        # speaks product ids instead, hence the mapping (design D1/D7).
         self._symbols = symbols
+        self._products = {s.upper(): venue.product_id_for(s) for s in symbols}
         self._min_interval = min_publish_interval
         self._running = True
         self._candle_book = candle_book
         # Fixed for the connector's lifetime, so build the agent-facing line once.
-        self._fee_disclosure = fee_model.disclosure_prompt()
+        self._fee_disclosure = fee_model.disclosure_prompt(perp=venue.is_perp)
 
         # Latest ticker per symbol — patched on every incoming message
         self._latest: dict[str, TickerMessage] = {}
@@ -275,8 +475,11 @@ class BinanceKafkaConnector:
     def _parse_binance_ticker(self, data: dict) -> TickerMessage | None:
         """Parse Binance 24hr ticker data into TickerMessage."""
         try:
+            symbol = data["s"]
             return TickerMessage(
-                product_id=data["s"],
+                # fstream's 24hrTicker carries the same fields as spot's, so the parser is
+                # shared; only the product id differs (SOLUSDT vs SOLUSDT-PERP).
+                product_id=self._products.get(str(symbol).upper(), symbol),
                 price=data["c"],
                 best_bid=data["b"],
                 best_bid_size=data["B"],
@@ -333,9 +536,9 @@ class BinanceKafkaConnector:
         if self._candle_book is not None and self._candle_book.has_data():
             prompt_parts.append(
                 "\n## Price History (OHLCV candlesticks)\n"
-                "Below are candlesticks at three granularities — coarser for "
+                "Below are candlesticks at several granularities — coarser for "
                 "broader trend context, finer for recent price action.\n\n"
-                f"{self._candle_book.format_prompt(self._symbols)}"
+                f"{self._candle_book.format_prompt(list(self._products.values()))}"
             )
 
         await self._agent_gw.send(
@@ -387,11 +590,8 @@ class BinanceKafkaConnector:
         await ws.close()
 
     async def _connect_with_fallback(self, streams: str) -> websockets.ClientConnection:
-        """Connect to Binance WebSocket with fallback endpoints."""
-        urls_to_try = [
-            f"{BINANCE_WS_URL}/stream?streams={streams}",
-            f"{BINANCE_WS_URL_FALLBACK}/stream?streams={streams}",
-        ]
+        """Connect to the venue's WebSocket with fallback endpoints."""
+        urls_to_try = [f"{base}/stream?streams={streams}" for base in self._venue.ws_urls]
 
         last_error = None
         for url in urls_to_try:
@@ -416,8 +616,9 @@ class BinanceKafkaConnector:
         ws = await self._connect_with_fallback(streams)
         async with ws:
             logger.info(
-                "Subscribed to %d symbols on 24hrTicker: %s",
+                "Subscribed to %d %s symbols on 24hrTicker: %s",
                 len(self._symbols),
+                self._venue.label,
                 ", ".join(self._symbols),
             )
 
@@ -433,6 +634,8 @@ class BinanceKafkaConnector:
                         price_book=PriceBook(),
                         candle_book=self._candle_book,
                         interval=60.0,
+                        venue=self._venue,
+                        products=self._products,
                     )
                 )
 
@@ -492,9 +695,12 @@ class BinanceKafkaConnector:
                         pass
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, venue: BinanceVenue = SPOT_VENUE
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream Binance market data to a Kafka topic.",
+        prog=f"python -m exchanges.{venue.name}",
+        description=f"Stream Binance {venue.label} market data to a Kafka topic.",
     )
     parser.add_argument(
         "--bootstrap-servers",
@@ -515,11 +721,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--min-interval",
         type=float,
-        default=60.0,
+        default=15.0 if venue.is_perp else 60.0,
         help=(
             "Minimum seconds between publishes per symbol. "
             "Incoming data is buffered and only the latest per symbol is published "
-            "when the interval elapses. 0 = publish immediately (default: 60)."
+            "when the interval elapses. 0 = publish immediately "
+            "(default: 60 spot, 15 perp)."
         ),
     )
     parser.add_argument(
@@ -531,15 +738,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def run(args: argparse.Namespace, agent_topic: str = AGENT_INPUT_TOPIC) -> None:
+async def run(
+    args: argparse.Namespace,
+    agent_topic: str = AGENT_INPUT_TOPIC,
+    venue: BinanceVenue = SPOT_VENUE,
+) -> None:
     # Load the fee rate (and symbols, when not given via CLI) from config, which
     # is the single source of truth shared with the tools node. load_config_strict
     # fails loud if the file exists but is invalid, rather than guessing the fee.
     from config import load_config_strict
 
     config = load_config_strict(args.config)
-    symbols = args.symbols or config.trading.binance_symbols or list(DEFAULT_SYMBOLS)
-    fee_model = FeeModel(taker_bps=config.trading.fees.taker_bps)
+    trading = config.trading
+    if venue.is_perp:
+        # `binance_perp_symbols` lands with the perp config change; getattr keeps this
+        # entrypoint startable against a config that predates it.
+        configured = getattr(trading, "binance_perp_symbols", None) or []
+    else:
+        configured = trading.binance_symbols
+    symbols = args.symbols or configured or list(DEFAULT_SYMBOLS)
+    fee_model = FeeModel(
+        taker_bps=trading.fees.taker_bps,
+        perp_taker_bps=getattr(trading.fees, "perp_taker_bps", DEFAULT_PERP_TAKER_BPS),
+    )
 
     candle_book = CandleBook(parse_row=parse_binance_candle)
     # Bind a shared, durable invoker inbox so agent step-events are observable by the
@@ -552,20 +773,21 @@ async def run(args: argparse.Namespace, agent_topic: str = AGENT_INPUT_TOPIC) ->
         fee_model=fee_model,
         min_publish_interval=args.min_interval,
         candle_book=candle_book,
+        venue=venue,
     )
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, connector.stop)
 
-    logger.info("Starting Binance -> Kafka connector")
+    logger.info("Starting Binance %s -> Kafka connector", venue.label)
     logger.info("  Agent topic: %s", agent_topic)
     logger.info("  Broker:      %s", args.bootstrap_servers)
     logger.info("  Symbols:     %s", ", ".join(symbols))
+    logger.info("  Products:    %s", ", ".join(venue.product_id_for(s) for s in symbols))
     logger.info("  Min interval: %ss", args.min_interval)
-    logger.info(
-        "  Taker fee:   %d bps (%.2f%%)", fee_model.taker_bps, fee_model.taker_bps / 100
-    )
+    taker_bps = fee_model.taker_bps_for(perp=venue.is_perp)
+    logger.info("  Taker fee:   %d bps (%.2f%%)", taker_bps, taker_bps / 100)
 
     await connector.start()
 

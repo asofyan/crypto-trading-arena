@@ -1,14 +1,28 @@
-"""In-memory trading account store, keyed by agent_id."""
+"""In-memory trading account store, keyed by agent_id.
+
+Two instrument shapes share this store:
+
+* **spot** (``SOLUSDT``) — long only, cash funded. The original arithmetic: a buy
+  capitalises its fee into the cost basis, a sell realises against it.
+* **perpetual futures** (``SOLUSDT-PERP``) — a *signed net position* (``+q`` long,
+  ``-q`` short), 1:1 leverage (gross notional may never exceed equity), and the fee
+  expensed against the wallet on every fill, the way the venue charges it.
+
+Which branch a fill takes is decided by the product id alone (see
+``arena.instruments.is_perp_product``), so every caller — paper executor, ledger
+replay, portfolio monitor — agrees without extra wiring.
+"""
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 
 from arena.execution import Executor, FillRequest, PaperExecutor
 from arena.fees import FeeModel
-from arena.instruments import SymbolRules
+from arena.instruments import SymbolRules, is_perp_product
 from arena.ledger import Ledger
 from arena.models import AgentAccount, TradeLogEntry, TradeRecorder, TradeResult
 from arena.price_book import PriceBook
@@ -19,6 +33,21 @@ log = logging.getLogger(__name__)
 # (0.1+0.1+0.7−0.9 = 1.1e−16), and venue steps go far finer than the old 1-decimal
 # rounding. Smaller than any venue's minimum step, so no real quantity is swallowed.
 _QTY_EPSILON = 1e-9
+
+# Margin comparisons at 1:1 work in quote currency, where a float round-trip is good to
+# ~1e-13. A micro-dollar of tolerance absorbs that dust and nothing an operator would
+# ever call a position: never a fee, never a venue step, never a real allowance.
+_MARGIN_EPSILON = 1e-6
+
+# A quote older than this cannot be trusted to size a leveraged position: the connector
+# republishes every 15s (perp) or 60s (spot), so a minute of silence means the feed is
+# broken, not that the market stood still.
+_MARK_STALENESS_SECONDS = 60.0
+
+# The markets a product can belong to. The executor uses these names to keep an agent
+# inside the scope its strategy was written for (a spot agent must never open a short).
+SPOT_MARKET = "spot"
+PERP_MARKET = "perp"
 
 
 class AccountStore:
@@ -48,6 +77,10 @@ class AccountStore:
         # every symbol keeps the coarse 1-decimal paper rule, which is what keeps the
         # unit suite and a Coinbase/offline deployment working unchanged.
         self._instrument_rules: dict[str, SymbolRules] = {}
+        # agent_id → markets it may trade (e.g. {"scalper-perp": ("perp",)}). Agents
+        # absent here keep the pre-existing behaviour and may trade anything: this is a
+        # guard for strategies that cannot mean both markets, not a permission system.
+        self._agent_markets: dict[str, tuple[str, ...]] = {}
         # Set when a ledger write fails: the fill still counted in memory, so the
         # disk is now behind. Surfaced by PortfolioView's header badge and by the
         # durable meta row that `manage_bot.py status` reads from another process.
@@ -125,6 +158,25 @@ class AccountStore:
         """Install venue rules at startup, before the first fill can arrive."""
         self._instrument_rules = dict(rules)
 
+    def set_agent_markets(self, markets: dict[str, tuple[str, ...] | list[str]]) -> None:
+        """Restrict each agent to the markets its strategy was written for.
+
+        A spot prompt has no vocabulary for a short position, and a perp prompt reasons
+        about leverage a spot agent cannot see. Keeping the two apart here — not only in
+        the system prompt — means a confused model cannot invent the other instrument.
+        """
+        self._agent_markets = {
+            agent: tuple(m.lower() for m in allowed) for agent, allowed in markets.items()
+        }
+
+    def agent_markets(self, agent_id: str) -> tuple[str, ...] | None:
+        """Markets `agent_id` may trade, or ``None`` when it is unrestricted."""
+        return self._agent_markets.get(agent_id)
+
+    def agent_allows(self, agent_id: str, market: str) -> bool:
+        allowed = self._agent_markets.get(agent_id)
+        return allowed is None or market in allowed
+
     @property
     def fee_model(self) -> FeeModel:
         return self._fee_model
@@ -195,10 +247,17 @@ class AccountStore:
         quantity: float,
         action: str,
         latency: float | None = None,
+        *,
+        replay: bool = False,
     ) -> TradeResult:
-        """Route one trade intent through the active executor."""
+        """Route one trade intent through the active executor.
+
+        ``replay`` books a fill that already happened elsewhere (the CSV the arena wrote)
+        and therefore skips the leverage gate: the recorded fill is the truth, and
+        re-deriving margin from a partially reconstructed price book would reject it.
+        """
         return self._executor.execute(
-            FillRequest(agent_id, product_id, quantity, action, latency)
+            FillRequest(agent_id, product_id, quantity, action, latency, replay=replay)
         )
 
     def apply_fill(
@@ -214,23 +273,27 @@ class AccountStore:
         client_order_id: str | None = None,
         fee_asset: str | None = None,
         venue_order_id: str | None = None,
+        enforce_margin: bool = True,
     ) -> TradeResult:
         """Book one already-priced fill: cash, cost basis, P&L, trade log, ledger.
 
         The account's own constraints still decide whether the fill may be booked
-        (cash on a buy, holdings on a sell) — the executor already decided *what*
-        filled and at what price. ``fee_bps`` only shapes the confirmation text:
-        paper passes the configured rate, a live fill passes the rate implied by the
-        venue's commission (or ``None`` when it cannot be stated cleanly).
+        (cash on a buy, holdings on a sell, the 1:1 cap on leverage) — the executor
+        already decided *what* filled and at what price. ``fee_bps`` only shapes the
+        confirmation text: paper passes the configured rate, a live fill passes the rate
+        implied by the venue's commission (or ``None`` when it cannot be stated cleanly).
 
         ``client_order_id`` switches persistence from "append a fill" to "settle this
         journal entry", which is what makes a post-crash replay a no-op: the check runs
         *before* the in-memory account moves, so memory and disk cannot disagree.
+
+        ``enforce_margin=False`` is for replaying a fill the arena already accepted (see
+        ``execute_trade(replay=True)``); it never skips the cash/holdings checks.
         """
         with self._write_lock:
             return self._apply_fill_locked(
                 agent_id, action, product_id, quantity, price, fee, latency, fee_bps,
-                client_order_id, fee_asset, venue_order_id,
+                client_order_id, fee_asset, venue_order_id, enforce_margin,
             )
 
     def _apply_fill_locked(
@@ -246,6 +309,7 @@ class AccountStore:
         client_order_id: str | None = None,
         fee_asset: str | None = None,
         venue_order_id: str | None = None,
+        enforce_margin: bool = True,
     ) -> TradeResult:
         product_id = product_id.upper().strip()
         action = action.lower().strip()
@@ -277,6 +341,15 @@ class AccountStore:
         # reduce to a clean bps figure (base-asset or BNB-denominated fees).
         fee_rate = f" @ {fee_bps} bps" if fee_bps is not None else ""
 
+        if is_perp_product(product_id):
+            # A perp is a signed net position, not inventory: the spot rules below
+            # (no selling what you do not hold, fees capitalised into basis) would
+            # read a short as a negative holding and reject every close.
+            return self._apply_perp_fill_locked(
+                agent_id, action, product_id, quantity, price, fee, latency, fee_rate,
+                client_order_id, fee_asset, venue_order_id, enforce_margin,
+            )
+
         if action == "buy":
             notional = price * quantity
             cash_out = notional + fee
@@ -292,6 +365,27 @@ class AccountStore:
                     f"(${notional:,.2f} + ${fee:,.2f} fee) "
                     f"but only have ${account.cash:,.2f}.",
                 )
+            if enforce_margin and any(
+                is_perp_product(pid) for pid in account.positions
+            ):
+                # A perp short credits its notional to cash, so "can I afford it" no
+                # longer implies "is it 1:1": this buy could be funded by borrow-shaped
+                # proceeds and push gross notional past equity. A pure spot book needs no
+                # check (cash >= notional already implies gross <= equity), so this
+                # leaves spot-only deployments — and their quotes — untouched.
+                positions_after = dict(account.positions)
+                positions_after[product_id] = (
+                    account.positions.get(product_id, 0.0) + quantity
+                )
+                rejection = self._leverage_rejection(
+                    account,
+                    positions_after,
+                    account.cash - cash_out,
+                    product_id=product_id,
+                    price=price,
+                )
+                if rejection is not None:
+                    return rejection
             account.cash -= cash_out
             existing_qty = account.positions.get(product_id, 0)
             now_ts = datetime.now().timestamp()
@@ -373,6 +467,267 @@ class AccountStore:
             f"(${notional:,.2f} − ${fee:,.2f} fee{fee_rate}). "
             f"Cash remaining: ${account.cash:,.2f}.",
         )
+
+    # ── perpetual futures ───────────────────────────────────────
+
+    def _apply_perp_fill_locked(
+        self,
+        agent_id: str,
+        action: str,
+        product_id: str,
+        quantity: float,
+        price: float,
+        fee: float,
+        latency: float | None,
+        fee_rate: str,
+        client_order_id: str | None,
+        fee_asset: str | None,
+        venue_order_id: str | None,
+        enforce_margin: bool = True,
+    ) -> TradeResult:
+        """Book one perpetual-futures fill as a change to a signed net position.
+
+        ``buy`` adds ``+qty`` and ``sell`` adds ``-qty``, so one rule covers opening,
+        adding, reducing, closing and flipping. Cash moves by ``-delta*price - fee``
+        (opening a short credits its notional, as the venue's wallet does), and
+        ``equity = cash + Σ qty*mark`` therefore needs no separate margin account.
+
+        The 1:1 leverage cap is enforced here, not in the executor, because the spot
+        and perp paths disagree about what "enough money" means: a perp may always be
+        closed (even into a negative wallet), while opening more gross notional than
+        equity is what the cap forbids. See design D3/D4.
+        """
+        account = self.get_or_create(agent_id)
+        delta = quantity if action == "buy" else -quantity
+
+        pos_old = account.positions.get(product_id, 0.0)
+        if abs(pos_old) <= _QTY_EPSILON:
+            pos_old = 0.0
+        # A missing basis next to a live position means the row predates this model or
+        # was hand-edited; adopt this fill's price as the entry so a close cannot book
+        # the whole notional as profit, and let the next fill rebuild the average.
+        basis_old = account.cost_basis.get(product_id, 0.0) if pos_old else 0.0
+        if pos_old and basis_old == 0.0:
+            basis_old = pos_old * price
+        entry_old = basis_old / pos_old if pos_old else 0.0
+
+        pos_new = pos_old + delta
+        if abs(pos_new) <= _QTY_EPSILON:
+            pos_new = 0.0
+
+        positions_after = dict(account.positions)
+        if pos_new == 0.0:
+            positions_after.pop(product_id, None)
+        else:
+            positions_after[product_id] = pos_new
+
+        cash_after = account.cash - delta * price - fee
+        # Growing exposure is exactly "this fill leaves a bigger net position in this
+        # contract": opening, adding on the same side, or flipping past the old size.
+        # Reducing and closing never grow it, which is what keeps an underwater
+        # position exitable no matter what the marks say.
+        grows = abs(pos_new) > abs(pos_old) + _QTY_EPSILON
+
+        if grows and enforce_margin:
+            rejection = self._leverage_rejection(
+                account,
+                positions_after,
+                cash_after,
+                product_id=product_id,
+                price=price,
+            )
+            if rejection is not None:
+                return rejection
+
+        # Realise only the part of the fill that closes the existing lot; the rest is
+        # a new position at this fill price (a flip passes through both steps at once).
+        closing = pos_old != 0.0 and (pos_old > 0) != (delta > 0)
+        closed_qty = min(abs(delta), abs(pos_old)) if closing else 0.0
+        closed_signed = (-closed_qty if pos_old > 0 else closed_qty) if closing else 0.0
+        closed_pnl = (
+            closed_qty * (price - entry_old) * (1.0 if pos_old > 0 else -1.0)
+            if closed_qty
+            else 0.0
+        )
+
+        remainder = delta - closed_signed
+        basis_new = (pos_old + closed_signed) * entry_old + remainder * price
+
+        account.cash = cash_after
+        account.realized_pnl += closed_pnl - fee
+        account.total_fees_paid += fee
+        account.trade_count += 1
+
+        now_ts = datetime.now().timestamp()
+        if pos_new == 0.0:
+            account.positions.pop(product_id, None)
+            account.cost_basis.pop(product_id, None)
+            account.avg_entry_ts.pop(product_id, None)
+        else:
+            account.positions[product_id] = pos_new
+            account.cost_basis[product_id] = basis_new
+            if pos_old and closed_qty and closed_qty >= abs(pos_old) - _QTY_EPSILON:
+                # The old lot is fully gone (opened fresh or flipped): this is a new
+                # position, so its holding time starts now.
+                account.avg_entry_ts[product_id] = now_ts
+            elif pos_old and closed_qty:
+                # Partial reduce: the remaining units keep their original entry time.
+                account.avg_entry_ts.setdefault(product_id, now_ts)
+            else:
+                # Opening or adding: weight by |qty| so the denominator can never be 0.
+                previous_ts = account.avg_entry_ts.get(product_id, now_ts)
+                account.avg_entry_ts[product_id] = (
+                    abs(pos_old) * previous_ts + abs(delta) * now_ts
+                ) / (abs(pos_old) + abs(delta))
+
+        self._record_trade(
+            agent_id, action, product_id, quantity, price, fee, latency,
+            client_order_id, fee_asset, venue_order_id,
+        )
+
+        gross_now = self._gross_notional(account.positions)
+        equity_now = account.portfolio_value(self._price_book)
+        gross_text = f"${gross_now:,.2f}" if gross_now is not None else "unpriced"
+        side_label = "long" if pos_new > 0 else "short" if pos_new < 0 else "flat"
+        if pos_old == 0.0:
+            action_note = f"opened {side_label}"
+        elif pos_new == 0.0:
+            action_note = "closed"
+        elif (pos_old > 0) != (pos_new > 0):
+            # Crossing zero is a flip whatever the resulting size — the old lot is gone.
+            action_note = f"flipped to {side_label}"
+        elif abs(pos_new) > abs(pos_old):
+            action_note = "added to"
+        else:
+            action_note = "reduced"
+
+        notional = abs(delta) * price
+        cash_note = (
+            f"paid ${notional + fee:,.2f} (${notional:,.2f} + ${fee:,.2f} fee{fee_rate})"
+            if delta > 0
+            else f"received ${notional - fee:,.2f} "
+            f"(${notional:,.2f} − ${fee:,.2f} fee{fee_rate})"
+        )
+        log.debug(
+            "account_store.apply_fill PERP OK: agent=%s %s %s %s @ $%.6f "
+            "pos %.6f -> %.6f cash=%.2f gross=%s equity=%.2f realized=%+.2f",
+            agent_id, action, quantity, product_id, price, pos_old, pos_new,
+            account.cash, gross_text, equity_now, closed_pnl - fee,
+        )
+        return TradeResult(
+            True,
+            f"{action.capitalize()} {quantity:g} {product_id} @ ${price:,.2f}: "
+            f"{cash_note}. Position {action_note}: net {pos_new:g} ({side_label}). "
+            f"Cash ${account.cash:,.2f}, equity ${equity_now:,.2f}, "
+            f"gross {gross_text} (1:1 cap ${equity_now:,.2f}). "
+            f"Realized P&L on this fill: ${closed_pnl - fee:+,.2f}.",
+        )
+
+    def _leverage_rejection(
+        self,
+        account: AgentAccount,
+        positions_after: dict[str, float],
+        cash_after: float,
+        *,
+        product_id: str,
+        price: float,
+    ) -> TradeResult | None:
+        """The 1:1 cap, as a refusal message: ``None`` means the fill may proceed.
+
+        Called on every path that can *grow* exposure. Missing or stale marks fail
+        closed — an unpriced book cannot prove the account is not levered — but only
+        here, so closing a position is never blocked by a bad feed.
+        """
+        gross_after = self._gross_notional(positions_after, fill=(product_id, price))
+        equity_after = self._equity_after(
+            account, positions_after, cash_after, fill=(product_id, price)
+        )
+        if gross_after is None or equity_after is None:
+            return TradeResult(
+                False,
+                f"No live mark for every held product, so the 1:1 leverage cap cannot "
+                f"be checked for {product_id}. Refusing to add exposure on a "
+                f"partially-priced or stale book; wait for the next price update.",
+            )
+        if equity_after <= 0:
+            return TradeResult(
+                False,
+                f"Account equity is ${equity_after:,.2f} — there is no margin left to "
+                f"open {product_id}. Close a position instead.",
+            )
+        if gross_after > equity_after + _MARGIN_EPSILON:
+            held_here = abs(positions_after.get(product_id, 0.0)) * price
+            allowed = max(0.0, equity_after - (gross_after - held_here))
+            return TradeResult(
+                False,
+                f"This order would exceed the 1:1 leverage cap: gross notional "
+                f"${gross_after:,.2f} against equity ${equity_after:,.2f}. "
+                f"At most ${allowed:,.2f} of {product_id} can be held at this "
+                f"equity — reduce the quantity.",
+            )
+        return None
+
+    def _mark_price(self, product_id: str) -> float | None:
+        """The live mark for one product, or ``None`` when it is missing or stale.
+
+        No entry-price fallback: a mark that is really the cost basis would make the
+        leverage gate look satisfied while the position is actually underwater.
+        """
+        entry = self._price_book.get(product_id)
+        if entry is None:
+            return None
+        received_at = entry.get("_received_at")
+        if received_at is not None:
+            age = time.time() - float(received_at)
+            if age > _MARK_STALENESS_SECONDS:
+                log.warning(
+                    "account_store: refusing to size leverage on a %.0fs-old %s quote",
+                    age, product_id,
+                )
+                return None
+        return float(entry["price"])
+
+    def _gross_notional(
+        self,
+        positions: dict[str, float],
+        *,
+        fill: tuple[str, float] | None = None,
+    ) -> float | None:
+        """Σ |qty| × mark — the exposure the 1:1 cap measures; ``None`` if unpriced.
+
+        ``fill`` supplies the mark for the product being traded before the price book
+        has learned this fill's price, so the gate never prices a fresh position at 0.
+        """
+        total = 0.0
+        for product_id, quantity in positions.items():
+            if fill is not None and product_id == fill[0]:
+                mark = fill[1]
+            else:
+                mark = self._mark_price(product_id)
+            if mark is None:
+                return None
+            total += abs(quantity) * mark
+        return total
+
+    def _equity_after(
+        self,
+        account: AgentAccount,
+        positions: dict[str, float],
+        cash: float,
+        *,
+        fill: tuple[str, float] | None = None,
+    ) -> float | None:
+        """Mark-to-market equity if this fill were booked; ``None`` when a mark is missing."""
+        equity = cash
+        for product_id, quantity in positions.items():
+            if fill is not None and product_id == fill[0]:
+                mark = fill[1]
+            else:
+                mark = self._mark_price(product_id)
+            if mark is None:
+                return None
+            equity += quantity * mark
+        return equity
 
     def _record_trade(
         self,

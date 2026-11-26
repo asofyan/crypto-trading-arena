@@ -230,3 +230,42 @@ def test_a_shortfall_is_never_an_adoption():
 
     assert sync.observe(report, {"a1": 95.0}) is None
     assert sync.observe(report, {"a1": 95.0}) is None
+
+
+# ── Paper perpetuals cannot be proved against a spot wallet ─────
+
+
+def test_a_paper_perp_position_blocks_arming_live():
+    """A short's proceeds live only in the paper ledger; a spot wallet cannot prove it."""
+    report = _compare(
+        ledger_positions={"SOLUSDT-PERP": -1.0},
+        ledger_cash=150.0,
+    )
+
+    assert report.armed is False
+    kinds = {drift.kind for drift in report.blocking}
+    assert "unreconcilable" in kinds
+    assert any("SOLUSDT-PERP" in drift.detail for drift in report.blocking)
+
+
+def test_a_spot_position_without_rules_stays_a_note_not_a_blocker():
+    """Pre-existing behaviour: an uncached spot symbol is a warning, not a halt."""
+    report = _compare(ledger_positions={"DOGEUSDT": 10.0})
+
+    assert report.armed is True
+    assert not report.blocking
+    assert any("DOGEUSDT" in drift.detail for drift in report.notes)
+
+
+def test_a_perp_position_blocks_arming_even_when_rules_cover_it():
+    """The guard must not depend on the perp rule cache being absent from `rules`."""
+    perp_rules = parse_exchange_info(SOLUSDT_INFO, product_suffix="-PERP")
+
+    report = _compare(
+        ledger_positions={"SOLUSDT-PERP": -2.0},
+        ledger_cash=150.0,
+        rules=perp_rules,
+    )
+
+    assert report.armed is False
+    assert any(drift.kind == "unreconcilable" for drift in report.blocking)

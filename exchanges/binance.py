@@ -931,12 +931,12 @@ def parse_args(
     parser.add_argument(
         "--min-interval",
         type=float,
-        default=15.0 if venue.is_perp else 60.0,
+        default=60.0,
         help=(
             "Minimum seconds between publishes per symbol. "
             "Incoming data is buffered and only the latest per symbol is published "
             "when the interval elapses. 0 = publish immediately "
-            "(default: 60 spot, 15 perp)."
+            "(default: 60s; a shorter interval spends the agent's LLM budget faster)."
         ),
     )
     parser.add_argument(

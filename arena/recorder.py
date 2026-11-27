@@ -44,6 +44,8 @@ class TickRow(BaseModel):
     best_bid: float
     best_ask: float
     spread_bps: float
+    source: str | None = None
+    quote_time: str | None = None
 
 
 class SnapshotRow(BaseModel):
@@ -135,7 +137,14 @@ class DataRecorder:
     # ── Tick recording ───────────────────────────────────────────
 
     def record_tick(
-        self, *, product_id: str, price: float | str, best_bid: float | str, best_ask: float | str
+        self,
+        *,
+        product_id: str,
+        price: float | str,
+        best_bid: float | str,
+        best_ask: float | str,
+        source: str | None = None,
+        quote_time: str | None = None,
     ) -> None:
         """Record one quote, skipping rows whose prices cannot be read."""
         try:
@@ -152,6 +161,8 @@ class DataRecorder:
             best_bid=bid_f,
             best_ask=ask_f,
             spread_bps=(ask_f - bid_f) / mid * 1e4 if mid else 0.0,
+            source=source,
+            quote_time=quote_time,
         )
         self._ticks_writer.writerow(row.model_dump())
         self._ticks_file.flush()

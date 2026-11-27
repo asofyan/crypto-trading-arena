@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import logging
+import os
+import signal
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -15,6 +17,7 @@ from exchanges import (
     TickerMessage,
 )
 from arena.account_store import AccountStore
+from arena.single_call import DECISION_TOPIC, SnapshotDecision
 from arena.execution import LiveBinanceExecutor
 from arena.hold_watchdog import HoldWatchdog
 from arena.live_session import HALTED, LiveSession, LiveState
@@ -271,6 +274,12 @@ def build_futures_session(store: AccountStore, trading: TradingConfig, ledger: L
             raise ValueError(f"Missing futures instrument rules: {sorted(expected - rules.keys())}")
         store.set_instrument_rules(rules)
         gates = build_risk_gates(trading, tuple(sorted(rules)), state)
+        def on_futures_fatal(exc: Exception) -> None:
+            reason = f"venue refused further orders: {exc}"
+            state.set(HALTED, reason)
+            if not account.testnet:
+                halt(reason)
+
         executor = LiveBinanceFuturesExecutor(
             store, client, ledger,
             account=account_name,
@@ -279,10 +288,7 @@ def build_futures_session(store: AccountStore, trading: TradingConfig, ledger: L
             gates=gates,
             dry_run=live.dry_run,
             max_price_slippage_bps=live.max_price_slippage_bps,
-            on_fatal=lambda exc: (
-                state.set(HALTED, f"venue refused further orders: {exc}"),
-                halt(f"venue refused further orders: {exc}"),
-            ),
+            on_fatal=on_futures_fatal,
             on_unresolved=lambda reason: state.set(HALTED, reason),
         )
         session = FuturesLiveSession(
@@ -430,7 +436,12 @@ def clear_degraded_marker_when_serving(worker: Worker, store: AccountStore) -> N
     worker.after_startup(lambda _ctx: store.mark_ledger_healthy())
 
 
-async def main():
+async def wait_for_demo_ledger_reload(session, *, interval: float = 5.0) -> None:
+    while not session.ledger_reload_required or session.state.halt_file_reason() is not None:
+        await asyncio.sleep(interval)
+
+
+async def main() -> bool:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
@@ -540,6 +551,7 @@ async def main():
     session: LiveSession | None = None
     live_client = None
     quote_source = None
+    demo = False
     if futures:
         try:
             session, live_client = build_futures_session(store, trading, ledger)
@@ -613,6 +625,17 @@ async def main():
         store.attach_recorder(recorder)
         print(f"\nCSV recording enabled → {args.data_dir}/ (snapshots every {args.snapshot_interval}s)")
 
+    @client.broker.subscriber(DECISION_TOPIC, group_id="tools-dashboard")
+    async def handle_snapshot_decision(intent: SnapshotDecision) -> None:
+        if ledger is None:
+            logging.getLogger(__name__).warning("Snapshot decision requires a ledger")
+            return
+        result = await asyncio.to_thread(store.execute_snapshot_decision, intent)
+        logging.getLogger(__name__).info(
+            "Snapshot decision for %s: %s", intent.agent_id, result.message
+        )
+        view.rerender()
+
     # ── Price subscriber ─────────────────────────────────────────
     @client.broker.subscriber(PRICE_TOPIC, group_id="tools-dashboard")
     async def handle_price_update(ticker: TickerMessage) -> None:
@@ -636,6 +659,8 @@ async def main():
                 price=ticker.price,
                 best_bid=ticker.best_bid,
                 best_ask=ticker.best_ask,
+                source=ticker.source,
+                quote_time=ticker.time,
             )
         view.rerender()
 
@@ -645,6 +670,17 @@ async def main():
     else:
         print("\nStarting portfolio dashboard (prices via Kafka)...")
 
+    reload_requested = False
+
+    async def request_reload() -> None:
+        nonlocal reload_requested
+        await wait_for_demo_ledger_reload(session)
+        logging.getLogger(__name__).warning("Restarting Demo tool server to reload the ledger")
+        reload_requested = True
+        # Use the same graceful shutdown path as an operator restart.
+        signal.raise_signal(signal.SIGINT)
+
+    reload_task = asyncio.create_task(request_reload()) if demo else None
     try:
         if hold_watchdog is not None:
             hold_watchdog.start()
@@ -659,6 +695,9 @@ async def main():
                     recorder.start_snapshot_loop(store, interval=args.snapshot_interval)
                 await worker.run()
     finally:
+        if reload_task is not None:
+            reload_task.cancel()
+            await asyncio.gather(reload_task, return_exceptions=True)
         # Stop the watchdog before the session and ledger close: a close it books needs
         # a writer, and a task cancelled after teardown would trade into a closed book.
         if hold_watchdog is not None:
@@ -672,10 +711,12 @@ async def main():
         # Close after the recorder so the final CSV snapshot reads coherent state.
         if ledger is not None:
             ledger.close()
+    return reload_requested
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        if asyncio.run(main()):
+            os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
     except KeyboardInterrupt:
         print("\nTools and price feed stopped.")

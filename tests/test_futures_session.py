@@ -76,7 +76,10 @@ def make_session(ledger, venue, tmp_path, *, environment="demo", reserve=10, **s
         venue,
         store,
         ledger,
-        SimpleNamespace(settle_dangling=lambda: (recovered.append("settled"), [])[1]),
+        SimpleNamespace(
+            restart_required=False,
+            settle_dangling=lambda: (recovered.append("settled"), [])[1],
+        ),
         {
             "BTCUSDT-PERP": SymbolRules(
                 symbol="BTCUSDT", base_asset="BTC", quote_asset="USDT",
@@ -184,7 +187,7 @@ def test_futures_wallet_reconciles_signed_open_cost_basis(tmp_path, quantity):
         assert session.state.state == HALTED
         venue.wallet = "249.5"
         assert session.recheck().armed
-        assert session.state.state == HALTED
+        assert session.state.state == ARMED
 
 
 def test_reconciliation_errors_fail_closed(tmp_path):
@@ -195,6 +198,41 @@ def test_reconciliation_errors_fail_closed(tmp_path):
         venue.fail = True
         assert not session.recheck().armed
         assert session.state.is_halted()
+        assert not session.recheck().armed
+        venue.fail = False
+        assert session.recheck().armed
+        assert session.state.state == ARMED
+
+
+def test_failed_startup_retries_bootstrap(tmp_path):
+    venue = Venue()
+    venue.fail = True
+    with Ledger(tmp_path / "futures.db") as ledger:
+        session, _, _ = make_session(ledger, venue, tmp_path)
+        assert not session.start().armed
+        venue.fail = False
+        assert session.recheck().armed
+        assert session.state.state == ARMED
+
+
+@pytest.mark.parametrize(("environment", "operator_halt"), [("production", False), ("demo", True)])
+def test_recovery_respects_other_halts(tmp_path, environment, operator_halt):
+    venue = Venue()
+    with Ledger(tmp_path / "futures.db") as ledger:
+        session, _, _ = make_session(ledger, venue, tmp_path, environment=environment)
+        assert session.start().armed
+        venue.fail = True
+        assert not session.recheck().armed
+        if operator_halt:
+            session.state.halt_path.write_text("operator halt")
+        else:
+            session.state.set(HALTED, "venue refused further orders")
+        assert not session.recheck().armed
+        venue.fail = False
+        assert session.recheck().armed
+        assert session.state.state == HALTED
+        if not operator_halt:
+            assert session.state.reason == "venue refused further orders"
 
 
 def test_halt_file_keeps_reconciled_session_disarmed(tmp_path):
@@ -379,6 +417,32 @@ def test_wallet_moves_during_funding_scan(tmp_path):
         assert len(ledger.equity_events()) == 1
 
 
+@pytest.mark.parametrize("startup_fails", [False, True])
+def test_refresher_retries_failed_reconciliation_in_five_seconds(
+    tmp_path, monkeypatch, startup_fails,
+):
+    venue = Venue()
+    venue.fail = startup_fails
+    failures = [True, False] if startup_fails else [True, True, False]
+    expected_delays = [5, 5, 60] if startup_fails else [60, 5, 5, 60]
+    delays = []
+    with Ledger(tmp_path / "futures.db") as ledger:
+        session, _, _ = make_session(ledger, venue, tmp_path, refresh_seconds=60)
+        assert session.start().armed is not startup_fails
+
+        def wait(delay):
+            delays.append(delay)
+            if not failures:
+                return True
+            venue.fail = failures.pop(0)
+            return False
+
+        monkeypatch.setattr(session._stop, "wait", wait)
+        session._refresh_loop()
+        assert delays == expected_delays
+        assert session.state.state == ARMED
+
+
 def test_refresher_lives_through_failure_and_stops(tmp_path, monkeypatch):
     finished = Event()
     retries = []
@@ -441,3 +505,30 @@ def test_duplicate_funding_id_rolls_back_cash_and_checkpoint_atomically(tmp_path
         assert len(ledger.equity_events()) == 2
         assert ledger.get_meta(another.meta_key) is None
         assert ledger.get_meta(FUTURES_FUNDING_CHECKPOINT_META_KEY) == str(start + 1000)
+
+
+@pytest.mark.parametrize("reason", ["order needs reconciliation", "venue refused further orders"])
+def test_demo_rearms_after_external_halt_when_reconciled(tmp_path, reason):
+    venue = Venue()
+    with Ledger(tmp_path / "futures.db") as ledger:
+        session, _, _ = make_session(ledger, venue, tmp_path)
+        assert session.start().armed
+        session.state.set(HALTED, reason)
+        venue.fail = True
+        assert not session.recheck().armed
+        assert session.state.is_halted()
+
+        venue.fail = False
+        assert session.recheck().armed
+        assert session.state.state == ARMED
+
+
+def test_demo_stays_disarmed_when_booking_requires_reload(tmp_path):
+    with Ledger(tmp_path / "futures.db") as ledger:
+        session, _, _ = make_session(ledger, Venue(), tmp_path)
+        assert session.start().armed
+        session.state.set(HALTED, "failed to book order")
+        session._executor.restart_required = True
+
+        assert not session.recheck().armed
+        assert session.state.is_halted()

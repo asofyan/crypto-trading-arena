@@ -111,6 +111,8 @@ class RoundRobinModel(PydanticModelClient):
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
         rate_limit_cooldown_seconds: float = DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        single_attempt: bool = False,
+        paid_fallback: str | None = None,
     ) -> None:
         super().__init__()
         self.models = list(models)
@@ -119,8 +121,11 @@ class RoundRobinModel(PydanticModelClient):
         self.cooldown_seconds = cooldown_seconds
         self.rate_limit_cooldown_seconds = rate_limit_cooldown_seconds
         self._clock = clock
+        self._single_attempt = single_attempt
+        self._paid_fallback = paid_fallback
         self._resting_until = [0.0] * len(self.models)
         self._cursor = 0
+        self._retired: set[int] = set()
 
     @property
     def model_name(self) -> str:
@@ -143,6 +148,26 @@ class RoundRobinModel(PydanticModelClient):
         """
         return self.models[0].profile
 
+    def _slot(self, model_id: str) -> int:
+        return [model.model_name for model in self.models].index(model_id)
+
+    def retire_model(self, model_id: str) -> None:
+        index = self._slot(model_id)
+        if len(self._retired | {index}) == len(self.models):
+            raise ValueError("Cannot retire the last active model")
+        self._retired.add(index)
+
+    def replace_model(self, model_id: str, replacement: Model) -> None:
+        index = self._slot(model_id)
+        if any(
+            other != index and model.model_name == replacement.model_name
+            for other, model in enumerate(self.models)
+        ):
+            raise ValueError("Replacement would duplicate a model in the pool")
+        self.models[index] = replacement
+        self._retired.discard(index)
+        self._resting_until[index] = 0.0
+
     async def request(
         self,
         messages: list[ModelMessage],
@@ -152,12 +177,21 @@ class RoundRobinModel(PydanticModelClient):
         """Ask each model in rotation order; return the first answer."""
         last_error: BaseException | None = None
         order = self._rotation()
-        if all(self._resting_until[index] > self._clock() for index in order):
-            # Every model is inside its quota window. Probing all of them on every tick
-            # would spend the account's whole request budget on 429s; one probe keeps
-            # the earliest recovery detected and the bill at one call per tick.
+        if self._single_attempt:
+            primary = order[0]
+            attempts = [primary]
+            if self.models[primary].model_name.endswith(":free") and self._paid_fallback:
+                attempts.extend(
+                    index for index in order
+                    if index != primary and self.models[index].model_name == self._paid_fallback
+                )
+            order = attempts
+        elif all(self._resting_until[index] > self._clock() for index in order):
+            # Probe only one model when the whole pool is cooling down.
             order = order[:1]
         for index in order:
+            if index in self._retired:
+                continue
             # Claim the slot before awaiting: concurrent requests (max_workers > 1)
             # must not both start on the same model.
             self._cursor = (index + 1) % len(self.models)
@@ -167,7 +201,8 @@ class RoundRobinModel(PydanticModelClient):
             except Exception as error:
                 if not is_transient(error):
                     raise
-                self._rest(index, error)
+                if self.models[index] is model:
+                    self._rest(index, error)
                 last_error = error
                 continue
             logger.debug("pool served this request with %s", model.model_name)
@@ -188,6 +223,8 @@ class RoundRobinModel(PydanticModelClient):
         resting: list[int] = []
         for offset in range(size):
             index = (start + offset) % size
+            if index in self._retired:
+                continue
             bucket = resting if self._resting_until[index] > now else fresh
             bucket.append(index)
         return [*fresh, *resting]

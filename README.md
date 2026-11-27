@@ -160,7 +160,7 @@ uv run python -m exchanges.coinbase --bootstrap-servers <broker-url>
 # uv run python -m exchanges.binance_perp --bootstrap-servers <broker-url>
 ```
 
-Optional: You can use the `--min-interval <seconds>` flag which controls how often agents are fed market data (default: 60s for spot, 15s for perps). Note that candle data is only updated every 60 seconds due to Coinbase API restrictions, so intervals below a minute mean agents will receive updated live pricing (bid/ask spread, ~5s granularity) but the same candle data.
+Optional: You can use the `--min-interval <seconds>` flag which controls how often agents are fed market data (default: 60s for both spot and perps; a shorter interval costs the agent's LLM request budget proportionally). Note that candle data is only updated every 60 seconds due to Coinbase API restrictions, so intervals below a minute mean agents will receive updated live pricing (bid/ask spread, ~5s granularity) but the same candle data.
 
 **Perpetual futures.** `exchanges.binance_perp` streams Binance USDⓈ-M contracts and
 publishes them as `<SYMBOL>-PERP` products (`SOLUSDT-PERP`), so they never collide with the spot

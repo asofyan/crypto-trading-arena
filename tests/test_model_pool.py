@@ -338,3 +338,114 @@ def test_model_ids_are_normalized(value, expected):
 def test_unusable_model_pools_are_rejected(value):
     with pytest.raises(ValueError):
         normalize_model_ids(value)
+
+
+async def test_retirement_and_replacement_preserve_the_round_robin_slot():
+    free = FakeModel("free")
+    paid = FakeModel("paid")
+    pool = RoundRobinModel([free, paid], clock=FakeClock())
+    pool.retire_model("free")
+    assert [await _ask(pool), await _ask(pool)] == ["answer from paid"] * 2
+
+    pool.replace_model("free", FakeModel("new"))
+    assert [await _ask(pool), await _ask(pool)] == ["answer from new", "answer from paid"]
+    assert free.calls == 0
+
+
+async def test_replaced_inflight_failure_cannot_cool_down_the_new_model():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class DelayedFailure(FakeModel):
+        async def request(self, *args):
+            started.set()
+            await release.wait()
+            raise FakeHTTPError(429)
+
+    pool = RoundRobinModel([DelayedFailure("old"), FakeModel("paid")], clock=FakeClock())
+    request = asyncio.create_task(_ask(pool))
+    await started.wait()
+    pool.replace_model("old", FakeModel("new"))
+    release.set()
+
+    assert await request == "answer from paid"
+    assert await _ask(pool) == "answer from new"
+
+
+def test_pool_guards_model_slot_updates():
+    pool = RoundRobinModel([FakeModel("one"), FakeModel("two")])
+    with pytest.raises(ValueError, match="duplicate"):
+        pool.replace_model("one", FakeModel("two"))
+    with pytest.raises(ValueError, match="last"):
+        pool.retire_model("two")
+        pool.retire_model("one")
+
+
+async def test_inflight_request_skips_a_slot_retired_during_its_first_attempt():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class DelayedFailure(FakeModel):
+        async def request(self, *args):
+            started.set()
+            await release.wait()
+            raise FakeHTTPError(503)
+
+    retiring = FakeModel("retiring")
+    pool = RoundRobinModel([DelayedFailure("slow"), retiring, FakeModel("paid")])
+    request = asyncio.create_task(_ask(pool))
+    await started.wait()
+    pool.retire_model("retiring")
+    release.set()
+
+    assert await request == "answer from paid"
+    assert retiring.calls == 0
+
+
+async def test_single_attempt_defers_fallback_until_next_tick():
+    throttled = FakeModel("throttled", FakeHTTPError(429))
+    standby = FakeModel("standby")
+    pool = RoundRobinModel([throttled, standby], clock=FakeClock(), single_attempt=True)
+
+    with pytest.raises(FakeHTTPError):
+        await _ask(pool)
+
+    assert throttled.calls == 1
+    assert standby.calls == 0
+    assert await _ask(pool) == "answer from standby"
+
+
+@pytest.mark.parametrize("error", [FakeHTTPError(429), FakeTransportError("free")])
+async def test_single_decision_falls_back_directly_to_paid_model(error):
+    primary = FakeModel("primary:free", error)
+    other_free = FakeModel("secondary:free")
+    paid = FakeModel("openai/gpt-oss-20b")
+    pool = RoundRobinModel(
+        [primary, other_free, paid],
+        single_attempt=True,
+        paid_fallback=paid.model_name,
+    )
+
+    assert await _ask(pool) == "answer from openai/gpt-oss-20b"
+    assert (primary.calls, other_free.calls, paid.calls) == (1, 0, 1)
+
+
+@pytest.mark.parametrize("error", [None, FakeHTTPError(429)])
+async def test_single_decision_stops_at_a_success_or_paid_failure(error):
+    primary = FakeModel("primary:free", error)
+    other_free = FakeModel("secondary:free")
+    paid = FakeModel("openai/gpt-oss-20b", FakeHTTPError(503))
+    pool = RoundRobinModel(
+        [primary, other_free, paid],
+        single_attempt=True,
+        paid_fallback=paid.model_name,
+    )
+
+    if error is None:
+        assert await _ask(pool) == "answer from primary:free"
+        assert paid.calls == 0
+    else:
+        with pytest.raises(FakeHTTPError, match="503"):
+            await _ask(pool)
+        assert paid.calls == 1
+    assert (primary.calls, other_free.calls) == (1, 0)

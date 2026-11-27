@@ -530,9 +530,11 @@ async def test_rest_client_refuses_book_ticker_on_a_venue_without_one():
             await client.get_book_ticker()
 
 
-def test_parse_args_perp_defaults_to_the_futures_publish_interval(capsys):
+def test_parse_args_defaults_to_one_minute_for_both_venues(capsys):
+    # One tick per minute is the LLM budget: at 3.35 requests per tick, 15s spends the
+    # free tier's 1000 requests/day in about 75 minutes.
     assert bn.parse_args([]).min_interval == 60.0
-    assert bn.parse_args([], venue=bn.PERP_VENUE).min_interval == 15.0
+    assert bn.parse_args([], venue=bn.PERP_VENUE).min_interval == 60.0
 
     with pytest.raises(SystemExit):
         bn.parse_args(["--help"], venue=bn.PERP_VENUE)
@@ -601,7 +603,7 @@ async def test_binance_perp_entrypoint_pins_the_futures_venue(monkeypatch):
     # The perp connector is the one that feeds a lean scalper at all: losing this
     # forward leaves every `payload: lean` agent starving with no error.
     assert seen["lean_topic"] == bp.AGENT_INPUT_TOPIC_LEAN
-    assert bp.parse_args([]).min_interval == 15.0
+    assert bp.parse_args([]).min_interval == 60.0
 
 
 @pytest.mark.xfail(

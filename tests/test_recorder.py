@@ -139,11 +139,16 @@ async def test_close_writes_final_snapshot_on_cancel(tmp_path, make_store):
 def test_records_a_market_tick_with_the_spread_it_crossed(tmp_path):
     rec = DataRecorder(data_dir=str(tmp_path))
 
-    rec.record_tick(product_id="SOLUSDT-PERP", price=100.0, best_bid=99.99, best_ask=100.01)
+    rec.record_tick(
+        product_id="SOLUSDT-PERP", price=100.0, best_bid=99.99, best_ask=100.01,
+        source="binance_perp", quote_time="2026-11-27T07:00:00+00:00",
+    )
 
     rows = _rows(tmp_path, "ticks")
     assert len(rows) == 1
     assert rows[0]["product_id"] == "SOLUSDT-PERP"
+    assert rows[0]["source"] == "binance_perp"
+    assert rows[0]["quote_time"] == "2026-11-27T07:00:00+00:00"
     assert float(rows[0]["price"]) == pytest.approx(100.0)
     assert float(rows[0]["spread_bps"]) == pytest.approx(2.0, abs=0.05)
 

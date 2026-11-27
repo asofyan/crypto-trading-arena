@@ -31,16 +31,34 @@ import asyncio
 import math
 import os
 import sys
+from contextlib import AsyncExitStack, suppress
+from functools import partial
+from pathlib import Path
+
+import httpx
 
 from dotenv import load_dotenv
 
 from calfkit import Agent, Client, OpenAIModelClient, Worker
+from calfkit._vendor.pydantic_ai.messages import ModelRequest, SystemPromptPart, TextPart, UserPromptPart
+from calfkit._vendor.pydantic_ai.models import ModelRequestParameters
+from arena.ledger import Ledger
+from arena.live_session import ARMED, STATE_META_KEY
+from arena.risk import DEFAULT_HALT_PATH
+from arena.single_call import (
+    DECISION_INSTRUCTIONS,
+    DECISION_TOPIC,
+    SingleCallTick,
+    SnapshotDecision,
+)
+from arena.alerts import GmailMailer
 from arena.model_pool import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     RoundRobinModel,
     normalize_model_ids,
 )
+from arena.openrouter_monitor import OpenRouterMonitor
 from arena.tools import calculator, close_position, execute_trade, get_portfolio
 
 from arena.strategies import STRATEGIES
@@ -81,6 +99,11 @@ def _non_negative_seconds(text: str) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Deploy a named Agent for the daytrading arena.",
+    )
+    parser.add_argument(
+        "--portfolio-db",
+        type=Path,
+        help="Read the tool server ledger locally and generate one decision per market tick.",
     )
     parser.add_argument(
         "--name",
@@ -233,6 +256,42 @@ def apply_agent_config(args: argparse.Namespace, config: ArenaConfig) -> bool:
     return True
 
 
+LING_FLASH = "inclusionai/ling-3.0-flash"
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_PAID_FALLBACKS = ("openai/gpt-oss-20b", LING_FLASH)
+
+
+def ling_flash_decision_options() -> dict:
+    branches = []
+    for action in ("hold", "close_position", "buy", "sell"):
+        fields = {"action": {"type": "string", "enum": [action]}}
+        if action != "hold":
+            fields["product_id"] = {"type": "string"}
+        if action in ("buy", "sell"):
+            fields["quantity"] = {"type": "number"}
+        branches.append({
+            "type": "object",
+            "properties": fields,
+            "required": list(fields),
+            "additionalProperties": False,
+        })
+    return {
+        "provider": {
+            "only": ["Ant Digital"],
+            "allow_fallbacks": False,
+            "require_parameters": True,
+        },
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "trade_decision_by_action",
+                "strict": True,
+                "schema": {"type": "object", "anyOf": branches},
+            },
+        },
+    }
+
+
 def build_model_client(
     model_ids: list[str],
     *,
@@ -242,6 +301,7 @@ def build_model_client(
     extra_headers: dict[str, str] | None = None,
     model_cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
     rate_limit_cooldown_seconds: float = DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
+    single_attempt: bool = False,
 ) -> OpenAIModelClient | RoundRobinModel:
     """Build the agent's ``model_client``: one client, or a pool behind one.
 
@@ -249,6 +309,8 @@ def build_model_client(
     the plain client — it has nothing to rotate, so the SDK's own retries remain its
     only retry layer.
     """
+    model_ids = normalize_model_ids(model_ids)
+    openrouter = (base_url or "").rstrip("/") == OPENROUTER_URL
     clients = [
         OpenAIModelClient(
             model_name=model_id,
@@ -256,12 +318,16 @@ def build_model_client(
             api_key=api_key,
             reasoning_effort=reasoning_effort,
             extra_headers=extra_headers or None,
+            **({"extra_body": ling_flash_decision_options()}
+               if single_attempt and openrouter and model_id == LING_FLASH else {}),
         )
-        for model_id in normalize_model_ids(model_ids)
+        for model_id in model_ids
     ]
     if len(clients) == 1:
         if model_cooldown_seconds != DEFAULT_COOLDOWN_SECONDS:
             print("note: --model-cooldown-seconds only applies to a model pool; ignoring")
+        if single_attempt:
+            clients[0].client.max_retries = 0
         return clients[0]
     # The pool is the retry layer now: the SDK would retry twice more, sleeping on
     # Retry-After for up to a minute inside the tick we are trying to save, and spend
@@ -273,12 +339,57 @@ def build_model_client(
         clients,
         cooldown_seconds=model_cooldown_seconds,
         rate_limit_cooldown_seconds=rate_limit_cooldown_seconds,
+        single_attempt=single_attempt,
+        paid_fallback=(
+            next((model for model in OPENROUTER_PAID_FALLBACKS if model in model_ids), None)
+            if single_attempt else None
+        ),
     )
+
+
+def monitors_openrouter(name: str, base_url: str | None, model_ids: list[str]) -> bool:
+    paid = [model for model in model_ids if not model.endswith(":free")]
+    return (
+        name == "scalper-perp"
+        and (base_url or "").rstrip("/") == OPENROUTER_URL
+        and len(paid) == 1
+        and paid[0] in OPENROUTER_PAID_FALLBACKS
+        and len(model_ids) > 1
+    )
+
+
+async def cancel_monitor(task: asyncio.Task) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+async def send_monitor_email(subject: str, body: str) -> None:
+    await GmailMailer.from_env().send(subject, body)
+
+
+def single_call_handler(tick: SingleCallTick):
+    async def before_node(ctx):
+        if ctx.delivery_kind != "call":
+            return "Ignored tool continuation in one-call mode."
+        message = ctx.state.uncommitted_message
+        if not isinstance(message, ModelRequest):
+            return "Skipped tick without a market prompt."
+        market = "\n".join(
+            part.content for part in message.parts
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+        )
+        if not market.strip():
+            return "Skipped tick without a market prompt."
+        return await tick.run(market)
+
+    return before_node
 
 
 async def main() -> None:
     args = parse_args()
 
+    config = None
     # Handle config-based deployment
     if args.from_config:
         config = load_config(args.config_path)
@@ -331,42 +442,130 @@ async def main() -> None:
     print(f"\nConnecting to Kafka broker at {args.bootstrap_servers}...")
     client = Client.connect(args.bootstrap_servers)
 
-    tools = AGENT_TOOLS
-    agent = Agent(
-        args.name,
-        system_prompt=system_prompt,
-        subscribe_topics=input_topic_for(args.payload),
-        model_client=build_model_client(
-            args.model_ids,
-            base_url=args.base_url,
-            api_key=api_key,
-            reasoning_effort=args.reasoning_effort,
-            extra_headers=args.extra_headers,
+    build_client = partial(
+        build_model_client,
+        base_url=args.base_url,
+        api_key=api_key,
+        reasoning_effort=args.reasoning_effort,
+        extra_headers=args.extra_headers,
+        single_attempt=args.portfolio_db is not None,
+    )
+    async with AsyncExitStack() as stack:
+        ledger = None
+        can_request = None
+        if args.portfolio_db is not None:
+            ledger = stack.enter_context(Ledger(args.portfolio_db, read_only=True))
+            live_trading = config is not None and config.trading.mode == "live"
+            if live_trading or ledger.get_meta(STATE_META_KEY) is not None:
+                def trading_is_armed() -> bool:
+                    return (
+                        not DEFAULT_HALT_PATH.exists()
+                        and ledger.get_meta(STATE_META_KEY) == ARMED
+                    )
+
+                can_request = trading_is_armed
+
+        monitor = None
+        model_ids = args.model_ids
+        if monitors_openrouter(args.name, args.base_url, model_ids):
+            http = await stack.enter_async_context(httpx.AsyncClient(
+                base_url=args.base_url.rstrip("/") + "/",
+                headers={**(args.extra_headers or {}), "Authorization": f"Bearer {api_key}"},
+                timeout=15,
+            ))
+
+            def replace(old_id: str, new_id: str) -> None:
+                replacement = build_client([new_id])
+                replacement.client.max_retries = 0
+                model_client.replace_model(old_id, replacement)
+
+            monitor = OpenRouterMonitor(
+                client=http,
+                state_path=Path("data/openrouter-scalper-perp.json"),
+                model_ids=model_ids,
+                replace=replace,
+                retire=lambda model_id: model_client.retire_model(model_id),
+                send=send_monitor_email,
+                reasoning_effort=args.reasoning_effort,
+                can_probe=can_request,
+                tools=[
+                    {"type": "function", "function": {
+                        "name": schema.name,
+                        "description": schema.description,
+                        "parameters": schema.parameters_json_schema,
+                    }}
+                    for schema in (tool.tool_schema for tool in AGENT_TOOLS)
+                ],
+            )
+            model_ids = monitor.effective_models()
+
+        model_client = build_client(
+            model_ids,
             model_cooldown_seconds=args.model_cooldown_seconds,
             rate_limit_cooldown_seconds=args.model_rate_limit_cooldown_seconds,
-        ),
-        tools=tools,
-    )
-    worker = Worker(client, nodes=[agent], group_id=args.name)
+        )
+        if monitor is not None:
+            for model_id in monitor.retired_models():
+                model_client.retire_model(model_id)
+            stack.push_async_callback(cancel_monitor, asyncio.create_task(monitor.run()))
+            print("OpenRouter free-model retirement monitor enabled.")
 
-    tool_names = ", ".join(t.tool_schema.name for t in tools)
-    pool = len(args.model_ids) > 1
-    print(f"  - Agent:    {args.name}")
-    print(f"  - Strategy: {args.strategy}")
-    print(f"  - Model:    {', '.join(args.model_ids)}{' (round robin)' if pool else ''}")
-    if pool:
-        print(f"  - Cooldown: {args.model_cooldown_seconds:g}s")
-    print(f"  - Input:    {input_topic_for(args.payload)} ({args.payload} payload)")
-    print(f"  - Tools:    {tool_names}")
-    if args.base_url:
-        print(f"  - Base URL: {args.base_url}")
-    if args.reasoning_effort:
-        print(f"  - Reasoning effort: {args.reasoning_effort}")
-    if args.extra_headers:
-        print(f"  - Extra headers: {', '.join(args.extra_headers)}")
+        tools = AGENT_TOOLS
+        agent_options = {}
+        if ledger is not None:
+            async def request_decision(market: str) -> str:
+                response = await model_client.request(
+                    [ModelRequest(parts=[
+                        SystemPromptPart(content=f"{system_prompt}\n{DECISION_INSTRUCTIONS}"),
+                        UserPromptPart(content=market),
+                    ])],
+                    getattr(model_client, "settings", None),
+                    ModelRequestParameters(),
+                )
+                return "".join(part.content for part in response.parts if isinstance(part, TextPart))
 
-    print("\nAgent ready. Waiting for requests...")
-    await worker.run()
+            async def publish_decision(decision, trade_count: int) -> None:
+                intent = SnapshotDecision(
+                    agent_id=args.name, trade_count=trade_count, decision=decision
+                )
+                await client.broker.publish(intent, DECISION_TOPIC)
+
+            tick = SingleCallTick(args.name, ledger, request_decision, publish_decision, can_request)
+            tools = []
+            agent_options["before_node"] = single_call_handler(tick)
+            print(
+                "One decision per tick with same-tick paid fallback. "
+                f"Local portfolio ledger: {args.portfolio_db}"
+            )
+
+        agent = Agent(
+            args.name,
+            system_prompt=system_prompt,
+            subscribe_topics=input_topic_for(args.payload),
+            model_client=model_client,
+            tools=tools,
+            **agent_options,
+        )
+        worker = Worker(client, nodes=[agent], group_id=args.name)
+
+        tool_names = ", ".join(t.tool_schema.name for t in tools)
+        pool = len(model_ids) > 1
+        print(f"  - Agent:    {args.name}")
+        print(f"  - Strategy: {args.strategy}")
+        print(f"  - Model:    {', '.join(model_ids)}{' (round robin)' if pool else ''}")
+        if pool:
+            print(f"  - Cooldown: {args.model_cooldown_seconds:g}s")
+        print(f"  - Input:    {input_topic_for(args.payload)} ({args.payload} payload)")
+        print(f"  - Tools:    {tool_names}")
+        if args.base_url:
+            print(f"  - Base URL: {args.base_url}")
+        if args.reasoning_effort:
+            print(f"  - Reasoning effort: {args.reasoning_effort}")
+        if args.extra_headers:
+            print(f"  - Extra headers: {', '.join(args.extra_headers)}")
+
+        print("\nAgent ready. Waiting for requests...")
+        await worker.run()
 
 
 if __name__ == "__main__":

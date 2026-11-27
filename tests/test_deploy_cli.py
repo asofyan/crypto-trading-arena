@@ -773,3 +773,137 @@ def test_live_futures_builder_routes_long_and_short_via_demo(monkeypatch, tmp_pa
         finally:
             session.stop()
             client.close()
+
+
+def test_retirement_monitor_only_manages_the_scalper_openrouter_pool():
+    from deploy.agent import monitors_openrouter
+
+    models = ["some/model:free", "openai/gpt-oss-20b"]
+    assert monitors_openrouter("scalper-perp", "https://openrouter.ai/api/v1/", models)
+    assert not monitors_openrouter("other", "https://openrouter.ai/api/v1", models)
+    assert not monitors_openrouter("scalper-perp", "https://openrouter.ai.example/api/v1", models)
+    assert not monitors_openrouter("scalper-perp", "https://openrouter.ai/api/v1", models[:1])
+    assert not monitors_openrouter(
+        "scalper-perp", "https://openrouter.ai/api/v1", [*models, "other/paid"]
+    )
+
+
+async def test_agent_hot_swaps_a_catalog_delisting_without_restarting(monkeypatch, tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    import httpx
+
+    from deploy import agent as module
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    state = tmp_path / "data" / "openrouter-scalper-perp.json"
+    state.write_text(json.dumps({"old/model:free": {"missing_checks": 1}}))
+    monkeypatch.setattr(sys, "argv", [
+        "agent", "--name", "scalper-perp", "--strategy", "scalper-perp",
+        "--bootstrap-servers", "kafka:9092", "--api-key", "sk-test",
+        "--base-url", "https://openrouter.ai/api/v1",
+        "--model-id", "old/model:free", "--model-id", "openai/gpt-oss-20b",
+    ])
+    notified = asyncio.Event()
+    alerts = []
+
+    async def send(subject, body):
+        alerts.append((subject, body))
+        notified.set()
+
+    def router(request):
+        assert request.headers["Authorization"] == "Bearer sk-test"
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{
+                "id": "new/model:free", "context_length": 32_000,
+                "supported_parameters": ["tools"], "pricing": {"prompt": "0", "completion": "0"},
+            }]})
+        payload = json.loads(request.content)
+        assert payload["model"] == "new/model:free"
+        instruction = payload["messages"][-1]["content"]
+        name = "calculator" if "calculator" in instruction else "get_portfolio"
+        arguments = {"expression": "123 * 7"} if name == "calculator" else {}
+        return httpx.Response(200, json={"choices": [{
+            "finish_reason": "tool_calls", "message": {"tool_calls": [{
+                "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)},
+            }]},
+        }]})
+
+    def make_http(**kwargs):
+        return httpx.AsyncClient(transport=httpx.MockTransport(router), **kwargs)
+
+    class Worker:
+        def __init__(self, client, *, nodes, group_id):
+            self.pool = nodes[0].model_client
+
+        async def run(self):
+            assert [model.model_name for model in self.pool.models] == [
+                "old/model:free", "openai/gpt-oss-20b",
+            ]
+            await asyncio.wait_for(notified.wait(), timeout=3)
+            assert [model.model_name for model in self.pool.models] == [
+                "new/model:free", "openai/gpt-oss-20b",
+            ]
+
+    monkeypatch.setattr(module, "httpx", SimpleNamespace(AsyncClient=make_http))
+    monkeypatch.setattr(module, "send_monitor_email", send)
+    monkeypatch.setattr(module, "Client", SimpleNamespace(connect=lambda _: object()))
+    monkeypatch.setattr(module, "Agent", lambda name, **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(module, "Worker", Worker)
+
+    await module.main()
+
+    assert "new/model:free" in alerts[0][1]
+    assert json.loads(state.read_text())["old/model:free"]["replacement"] == "new/model:free"
+
+
+def test_demo_ling_flash_uses_pinned_structured_fallback():
+    from deploy.agent import build_model_client, monitors_openrouter
+
+    base_url = "https://openrouter.ai/api/v1"
+    ling = "inclusionai/ling-3.0-flash"
+    models = ["some/model:free", ling]
+    pool = build_model_client(models, base_url=base_url, api_key="test", single_attempt=True)
+
+    assert pool._paid_fallback == ling
+    assert monitors_openrouter("scalper-perp", base_url, models)
+    free, paid = pool.models
+    assert "extra_body" not in free.settings
+    body = paid.settings["extra_body"]
+    assert body["provider"] == {
+        "only": ["Ant Digital"], "allow_fallbacks": False, "require_parameters": True,
+    }
+    assert "reasoning" not in body
+    schema = body["response_format"]["json_schema"]
+    assert schema["strict"] is True
+    assert [branch["required"] for branch in schema["schema"]["anyOf"]] == [
+        ["action"], ["action", "product_id"], ["action", "product_id", "quantity"],
+        ["action", "product_id", "quantity"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_demo_restart_waits_until_reload_needed_and_operator_allows(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    flag = tmp_path / "LIVE_HALT"
+    flag.touch()
+    session = SimpleNamespace(
+        ledger_reload_required=False,
+        state=SimpleNamespace(halt_file_reason=lambda: "operator" if flag.exists() else None),
+    )
+    restart = asyncio.create_task(deploy_cli.wait_for_demo_ledger_reload(session, interval=0))
+    try:
+        await asyncio.sleep(0)
+        assert not restart.done()
+        session.ledger_reload_required = True
+        await asyncio.sleep(0)
+        assert not restart.done()
+        flag.unlink()
+        await asyncio.wait_for(restart, timeout=1)
+    finally:
+        restart.cancel()
+        await asyncio.gather(restart, return_exceptions=True)

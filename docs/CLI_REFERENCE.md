@@ -203,7 +203,7 @@ different venue.
 | `--bootstrap-servers` | No | `localhost:9092` | Kafka broker address |
 | `--config` | No | `config.json` | Path to config file for symbols |
 | `--symbols` | No | From `trading.binance_perp_symbols` | Venue symbols to subscribe (overrides config) |
-| `--min-interval` | No | `15` | Minimum seconds between publishes |
+| `--min-interval` | No | `60` | Minimum seconds between publishes |
 | `--log-level` | No | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 Products are published as `<SYMBOL>-PERP` (`SOLUSDT-PERP`), so a perp never collides with the

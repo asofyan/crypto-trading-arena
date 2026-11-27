@@ -13,6 +13,7 @@ Use a Binance Futures Demo wallet with test USDT. Configure **One-way Mode**, **
        "live": {
          "market": "perp",
          "dry_run": true,
+         "balance_refresh_seconds": 60,
          "accounts": {
            "demo": {
              "api_key": "${BINANCE_FUTURES_DEMO_KEY}",
@@ -41,15 +42,23 @@ Use a Binance Futures Demo wallet with test USDT. Configure **One-way Mode**, **
      --db data/live-futures-demo.db --headless
    ```
 
-4. Check the startup reconciliation and confirm the tool server reports `Binance Futures DEMO`. The tool server must report `ARMED` to accept trading intents. If a halt flag exists, review its reason and use `manage_bot.py resume --db data/live-futures-demo.db` only with the Demo engine stopped and its halt flag isolated.
+4. Check the startup reconciliation and confirm the tool server reports `Binance Futures DEMO`. The tool server must report `ARMED` to accept trading intents. With the example configuration, it rechecks the wallet every 60 seconds. After a failed reconciliation it waits 5 seconds between attempts and automatically re-arms a reconciliation halt after a clean check. If a halt flag exists, review its reason and use `manage_bot.py resume --db data/live-futures-demo.db` only with the Demo engine stopped and its halt flag isolated.
 
    ```bash
    uv run python manage_bot.py status --config data/config.futures-demo.json \
      --db data/live-futures-demo.db
 
    uv run python -m deploy.agent --from-config scalper-perp \
-     --config-path data/config.futures-demo.json --bootstrap-servers "$FUTURES_DEMO_BROKER"
+     --config-path data/config.futures-demo.json --bootstrap-servers "$FUTURES_DEMO_BROKER" \
+     --portfolio-db data/live-futures-demo.db
    ```
+
+   Use the same SQLite file as the tool server's `--db`. With `--portfolio-db`, the
+   agent reads the portfolio locally and generates at most one decision per market
+   tick. If a free model returns a retryable error, the agent immediately tries
+   `openai/gpt-oss-20b` once when it is in the configured pool.
+   When enabling this mode on an existing deployment, restart the tool server first
+   so it can receive decisions.
 
 5. Confirm that `dry_run: true` produces only `DRY_RUN` order intents. To test Demo fills, stop the agent and tool server, verify `testnet: true` in the mapped account, set `dry_run: false`, then restart the tool server before the agent. Compare order IDs, fills, fees, remaining position, and wallet balance with Binance Demo. Test both a long and a short through entry and exit, and restart with the same ledger to verify reconciliation.
 

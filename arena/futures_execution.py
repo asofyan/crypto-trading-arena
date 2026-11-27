@@ -93,7 +93,7 @@ class LiveBinanceFuturesExecutor:
         rules = self._rules.get(product)
         if rules is None or not is_perp_product(product):
             return TradeResult(False, f"{product} is not enabled for live perpetual trading.")
-        if self._restart_required or self._store.ledger_degraded:
+        if self.restart_required:
             return TradeResult(False, "Restart from the persistent futures ledger before trading.")
         if self._ledger.dangling_orders():
             return TradeResult(False, "An earlier order remains unresolved. Reconcile before trading.")
@@ -304,12 +304,16 @@ class LiveBinanceFuturesExecutor:
                 return rules.quantize(nearest)
         return rules.quantize(requested)
 
+    @property
+    def restart_required(self) -> bool:
+        return self._restart_required or self._store.ledger_degraded
+
     def settle_dangling(self) -> list[tuple[str, str]]:
         """Verify order IDs after failure without resubmitting possibly executed intents."""
         with self._store.write_lock:
             resolved = []
             for order in self._ledger.dangling_orders():
-                if self._restart_required or self._store.ledger_degraded:
+                if self.restart_required:
                     resolved.append((order.client_order_id, "restart-required"))
                     continue
                 if order.account != self._account or order.agent_id != self._agent \

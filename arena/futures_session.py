@@ -28,6 +28,7 @@ _WALLET_TOLERANCE = 0.001
 _DAY_MS = 86_400_000
 _FUNDING_WINDOW_MS = 7 * _DAY_MS
 _INCOME_LIMIT = 1000
+_RECONCILIATION_RETRY_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -80,22 +81,31 @@ class FuturesLiveSession:
         self._refresh_seconds = refresh_seconds
         self.state = state or LiveState(ledger)
         self.last_report: ReconcileReport | None = None
+        self._startup_pending = False
+        self._reconciliation_halt_reason: str | None = None
         self._refresher: threading.Thread | None = None
         self._stop = threading.Event()
         self._start_refresher = start_refresher
         self._now_ms = now_ms
 
+    @property
+    def ledger_reload_required(self) -> bool:
+        return self._executor is not None and self._executor.restart_required
+
     def start(self) -> ReconcileReport:
         with self._store.write_lock:
             self.state.set(RECONCILING, "startup")
             report = self._check(bootstrap=True)
+            self._startup_pending = not report.armed
+            self._reconciliation_halt_reason = None
             halt_reason = self.state.halt_file_reason()
             if halt_reason is not None:
                 self.state.set(HALTED, f"operator halt remains in effect ({halt_reason})")
-            elif report.armed:
-                self.state.set(ARMED)
-            else:
-                self.state.set(HALTED, report.first_blocker())
+            elif self.state.state == RECONCILING:
+                if report.armed:
+                    self.state.set(ARMED)
+                else:
+                    self._halt_for_reconciliation(report)
 
         if self._start_refresher and self._refresher is None:
             self._refresher = threading.Thread(
@@ -110,7 +120,15 @@ class FuturesLiveSession:
             self._refresher.join(timeout=self._refresh_seconds + 5)
 
     def _refresh_loop(self) -> None:
-        while not self._stop.wait(self._refresh_seconds):
+        while True:
+            report = self.last_report
+            delay = (
+                _RECONCILIATION_RETRY_SECONDS
+                if report is not None and (not report.armed or self.state.state == HALTED)
+                else self._refresh_seconds
+            )
+            if self._stop.wait(delay):
+                return
             try:
                 self.recheck()
             except Exception:
@@ -119,12 +137,30 @@ class FuturesLiveSession:
                 log.exception("futures live session could not persist reconciliation state")
 
     def recheck(self) -> ReconcileReport:
-        """Disarm on wallet drift without silently arming a previously halted session."""
+        """Recover a halted Demo session once the wallet is verified again."""
         with self._store.write_lock:
-            report = self._check(bootstrap=False)
-            if not report.armed:
-                self.state.set(HALTED, report.first_blocker())
+            report = self._check(bootstrap=self._startup_pending)
+            # Order settlement during the check can issue its own halt.
+            halted_by_reconciliation = (
+                self.state.state == HALTED
+                and self.state.reason == self._reconciliation_halt_reason
+            )
+            if report.armed:
+                self._startup_pending = False
+                can_resume = halted_by_reconciliation or (
+                    self._environment == "demo" and self.state.state == HALTED
+                )
+                if can_resume and self.state.halt_file_reason() is None:
+                    self.state.set(ARMED)
+                    self._reconciliation_halt_reason = None
+            elif self.state.state != HALTED or halted_by_reconciliation:
+                self._halt_for_reconciliation(report)
             return report
+
+    def _halt_for_reconciliation(self, report: ReconcileReport) -> None:
+        reason = report.first_blocker()
+        self._reconciliation_halt_reason = reason
+        self.state.set(HALTED, reason)
 
     def _check(self, *, bootstrap: bool) -> ReconcileReport:
         try:
@@ -184,6 +220,8 @@ class FuturesLiveSession:
                 raise ValueError(f"{symbol}: venue must use 1× leverage and cross margin")
 
     def _reconcile(self, *, bootstrap: bool) -> ReconcileReport:
+        if self.ledger_reload_required:
+            raise ValueError("futures tool server must reload the ledger before trading")
         started_ms = self._now_ms()
         wallet = self._wallet()
         binding = self._binding(wallet)

@@ -28,6 +28,7 @@ from arena.hold_watchdog import stale_positions as _stale_positions
 from arena.instruments import SymbolRules, is_perp_product
 from arena.ledger import Ledger
 from arena.models import AgentAccount, TradeLogEntry, TradeRecorder, TradeResult
+from arena.single_call import SnapshotDecision
 from arena.price_book import PriceBook
 from arena.trade_policy import ChurnGuard, ChurnLimits, ExitFloor, is_strict_reduce
 
@@ -219,6 +220,26 @@ class AccountStore:
                 abs(position),
                 "sell" if position > 0 else "buy",
                 latency,
+            )
+
+    def execute_snapshot_decision(self, intent: SnapshotDecision) -> TradeResult:
+        """Keep the snapshot check and booking together, including watchdog races."""
+        agent_id = intent.agent_id
+        decision = intent.decision
+        with self._write_lock:
+            account = self.get_or_create(agent_id)
+            if account.trade_count != intent.trade_count:
+                return TradeResult(False, "Portfolio changed after this tick was read.")
+            if decision.action == "hold":
+                return TradeResult(True, "Hold.")
+            assert decision.product_id is not None
+            if decision.action == "close_position":
+                return self.close_position(agent_id, decision.product_id)
+            assert decision.quantity is not None
+            self.record_portfolio_read(agent_id, trade_count=intent.trade_count)
+            return self.execute_trade(
+                agent_id, decision.product_id, decision.quantity, decision.action,
+                allow_flip=False,
             )
 
     def stale_positions(

@@ -265,8 +265,9 @@ Ordered by how much it hurts:
    them gets `markets: ["perp"]` it cannot add exposure at all.
 7. **`manage_bot.py status`/`stop` cannot see nohup-started processes** — either always start
    through `manage_bot.py`, or fall back to discovering the processes by command line.
-8. **Uncommitted work in the tree that belongs to someone else** (see §8) — a read-only
-   portfolio monitor refactor. Review and commit it separately.
+8. **The read-only monitor (`deploy/portfolio_monitor.py`) is not in any health check.** It
+   reads the ledger and never publishes, so a broken monitor is silent; it was only proved by
+   `--once` in a test. Consider a smoke run in CI (`--once` against a fixture ledger).
 
 ---
 
@@ -281,14 +282,12 @@ Paper only. `LIVE_HALT` set; no real orders.
 - Verification of the post-reset restart was cut short (by request). First thing next
   session: confirm `agent_router.input.lean` LAG is 0–1 with a tick every ~50 s, and that
   `close_position` appears in `bot.log` when the agent exits a position.
-- Suite: **812 passed, 10 skipped, 3 xfailed** in the current tree (811 belong to the fix
-  below, 1 to the uncommitted monitor refactor); `ruff check arena/ deploy/ tests/` clean.
-- The stale-size fix and ADR-0011 landed as `dd62237 fix: never let an agent size an exit
-  from a stale read`.
-- **Uncommitted, not from that work:** `arena/dashboard.py`, `arena/ledger.py`,
-  `deploy/portfolio_monitor.py`, `monitor.sh`, `tests/test_portfolio_monitor.py` — a
-  read-only portfolio monitor that reads one SQLite snapshot (`Ledger.read_portfolio`)
-  instead of the live store. The suite passes with it; commit separately once its author is
-  done.
-- `.harness/` holds the plan/report for the fix; `.harness.prev-guard-experiment/` is an
-  older run and can be deleted.
+- Suite: **812 passed, 10 skipped, 3 xfailed**; `ruff check arena/ deploy/ tests/` clean.
+- Landed on `main` (pushed to `fork`):
+  - `dd62237 fix: never let an agent size an exit from a stale read` (+ ADR-0011)
+  - `566ee4d docs: consolidate the working guide into AGENTS.md`
+  - `a9cb99c refactor: read the monitor's wallets from the ledger, not a CSV replay`
+- The working tree is clean. `.harness/` (gitignored) holds the plan/report for the fix;
+  `.harness.prev-guard-experiment/` was deleted.
+- The monitor now reads `data/arena.db` via `Ledger.read_portfolio`; CSV replay is behind
+  `--no-ledger`. `Ledger`'s lock is an `RLock` for that reason — do not "simplify" it back.

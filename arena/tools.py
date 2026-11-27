@@ -36,13 +36,35 @@ def _execute_trade(
         "tool._execute_trade called: agent=%s action=%s product=%s qty=%s latency=%s",
         agent_id, action, product_id, quantity, latency,
     )
-    result = store.execute_trade(agent_id, product_id, quantity, action, latency=latency)
+    result = store.execute_trade(
+        agent_id, product_id, quantity, action, latency=latency, allow_flip=False
+    )
     log.debug(
         "tool._execute_trade result: agent=%s success=%s message=%s",
         agent_id, result.success, result.message,
     )
     view.rerender()
     return result.message
+
+
+def _close_position(agent_id: str, product_id: str, latency: float | None = None) -> str:
+    log.debug(
+        "tool._close_position called: agent=%s product=%s latency=%s",
+        agent_id, product_id, latency,
+    )
+    result = store.close_position(agent_id, product_id, latency=latency)
+    log.debug(
+        "tool._close_position result: agent=%s success=%s message=%s",
+        agent_id, result.success, result.message,
+    )
+    view.rerender()
+    return result.message
+
+
+def _invoked_latency(ctx: ToolContext) -> float | None:
+    """Seconds from the connector's invoke stamp to now, or ``None`` for a manual call."""
+    invoked_at = ctx.deps.get("invoked_at")
+    return None if invoked_at is None else time.time() - invoked_at
 
 
 def _format_hold_time(entry_ts: float | None) -> str:
@@ -63,7 +85,10 @@ def _format_hold_time(entry_ts: float | None) -> str:
 
 def _get_portfolio(agent_id: str) -> str:
     log.debug("tool._get_portfolio called: agent=%s", agent_id)
-    account = store.get_or_create(agent_id)
+    # A copy under the write lock, because the hold watchdog closes positions on a worker
+    # thread in this process and iterating the live dict would raise on a product it just
+    # flattened.
+    account = store.snapshot(agent_id)
     pb = store.price_book
 
     lines = [f"Cash: ${account.cash:,.2f}"]
@@ -111,6 +136,10 @@ def _get_portfolio(agent_id: str) -> str:
         "tool._get_portfolio result: agent=%s cash=%.2f positions=%s portfolio_value=%.2f",
         agent_id, account.cash, dict(account.positions), portfolio_val,
     )
+    # Stamp the read only after the render succeeded, and stamp the count the copy was
+    # taken at: a fill that lands in between leaves the stamp behind the book, so the next
+    # order asks for one more read instead of trusting a book this turn never saw.
+    store.record_portfolio_read(agent_id, trade_count=account.trade_count)
     return "\n".join(lines)
 
 
@@ -130,8 +159,14 @@ def execute_trade(ctx: ToolContext, product_id: str, quantity: float, action: st
     On a PERPETUAL FUTURES product (e.g. SOLUSDT-PERP) the position is a signed net
     amount, so one tool covers both directions:
     - flat: 'buy' opens a long, 'sell' opens a short.
-    - long: 'buy' adds, 'sell' reduces; selling more than you hold flips you short.
-    - short: 'sell' adds, 'buy' reduces/covers; buying more than you are short flips you long.
+    - long: 'buy' adds, 'sell' reduces.
+    - short: 'sell' adds, 'buy' reduces/covers.
+    It never opens the opposite side. An overshoot is either refused with the live size,
+    or — when the venue cannot represent the opening leg at all (under its minimum
+    notional) — booked as the close it mostly was, and the confirmation says which. To
+    reverse, close first with close_position, then open the other side in a second order.
+    A position you are holding was sized on an earlier turn, and a fill since may have
+    changed it, so an exit carries no size at all.
     Leverage is fixed at 1:1: gross notional (sum of |position| x mark) may never exceed
     account equity, so an order that would lever the book up is rejected with the size
     you may use. Closing or reducing a position is never blocked.
@@ -157,12 +192,38 @@ def execute_trade(ctx: ToolContext, product_id: str, quantity: float, action: st
     # calfkit 0.12 exposes ToolContext.deps as the producer-supplied Mapping directly.
     # The connector stamps deps={"invoked_at": <time>} on the agent invocation so we can
     # measure invoke→fill latency; a manual/test invocation omits it (latency stays None).
-    latency: float | None = None
-    invoked_at = ctx.deps.get("invoked_at")
-    if invoked_at is not None:
-        latency = time.time() - invoked_at
-    result = _execute_trade(ctx.agent_name, product_id, quantity, action, latency=latency)
+    result = _execute_trade(
+        ctx.agent_name, product_id, quantity, action, latency=_invoked_latency(ctx)
+    )
     log.debug("execute_trade EXIT: agent=%s tool_call_id=%s", ctx.agent_name, ctx.tool_call_id)
+    return result
+
+
+@agent_tool
+def close_position(ctx: ToolContext, product_id: str) -> str:
+    """Close whatever position is open in one product — the exit that cannot be stale.
+
+    No quantity: the size is read from the book at the moment the fill is booked, so an
+    exit can never be sized from a number that went stale. Asking to close something you
+    are flat in is refused rather than opening the opposite side.
+
+    On a perp it closes a long by selling and a short by buying — whichever the position
+    is. Round-trip fees and the exit band apply exactly as they do to any other fill, and
+    the hold watchdog closes stale positions the same way.
+
+    Args:
+        product_id: The product to flatten (e.g., SOLUSDT-PERP)
+
+    Returns:
+        The fill confirmation (price, fee, resulting flat position, cash, equity), or the
+        reason it could not be closed
+    """
+    log.debug(
+        "close_position ENTER: agent=%s product=%s tool_call_id=%s",
+        ctx.agent_name, product_id, ctx.tool_call_id,
+    )
+    result = _close_position(ctx.agent_name, product_id, latency=_invoked_latency(ctx))
+    log.debug("close_position EXIT: agent=%s tool_call_id=%s", ctx.agent_name, ctx.tool_call_id)
     return result
 
 

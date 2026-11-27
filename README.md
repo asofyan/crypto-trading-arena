@@ -165,7 +165,8 @@ Optional: You can use the `--min-interval <seconds>` flag which controls how oft
 **Perpetual futures (paper only).** `exchanges.binance_perp` streams Binance USDⓈ-M contracts and
 publishes them as `<SYMBOL>-PERP` products (`SOLUSDT-PERP`), so they never collide with the spot
 product of the same name. Perp products are a *signed net position*: `sell` from flat opens a short,
-`buy` against a short covers it, and a fill larger than the position flips it. Leverage is fixed at
+`buy` against a short covers it. An agent order never crosses zero: a fill larger than the position
+is refused and the position is flattened with `close_position` instead ([ADR-0011](docs/adr/0011-the-agent-names-an-exit-the-server-sizes-it.md)). Leverage is fixed at
 **1:1** — gross notional (Σ |position| × mark) may not exceed equity — and the simulated taker fee is
 `trading.fees.perp_taker_bps` (default 5 bps, Binance USDⓈ-M VIP 0). No real futures orders are placed.
 Refresh the contract rules with `uv run python -m arena.instruments --perp`.
@@ -313,7 +314,8 @@ strict `xfail`s; see [docs/REVIEW_FINDINGS.md](docs/REVIEW_FINDINGS.md).
 
 | Tool | Description |
 |------|-------------|
-| `execute_trade` | Buy or sell a crypto product at the current market price. A configurable taker fee is charged on every fill (see `trading.fees.taker_bps` below) |
+| `execute_trade` | Buy or sell a crypto product at the current market price. A configurable taker fee is charged on every fill (see `trading.fees.taker_bps` below). Never crosses zero: a sell larger than the long held is refused, not turned into a short — see [ADR-0011](docs/adr/0011-the-agent-names-an-exit-the-server-sizes-it.md) |
+| `close_position` | Flatten whatever is open in one product. Takes no quantity: the size is read from the book when the fill is booked, so an exit can never be sized from a stale reading |
 | `get_portfolio` | View cash, open positions, cost basis (fee-inclusive), P&L, and average time held |
 | `calculator` | Evaluate math expressions for position sizing, P&L calculations, etc. |
 

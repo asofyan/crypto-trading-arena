@@ -130,9 +130,13 @@ def seeded_singleton():
     )
     tools.store._accounts.clear()
     tools.store._trade_log.clear()
+    # The read stamps outlive an account (they are keyed by agent id), so a leftover stamp
+    # would silently disable the stale-read gate for every later test in this file.
+    tools.store._portfolio_read_seq.clear()
     yield tools.store
     tools.store._accounts.clear()
     tools.store._trade_log.clear()
+    tools.store._portfolio_read_seq.clear()
 
 
 def test_get_portfolio_empty(seeded_singleton):
@@ -195,3 +199,128 @@ def test_execute_trade_latency_none_when_dep_absent(seeded_singleton, monkeypatc
     tools.execute_trade._tool.function(ctx, "SOL-USD", 0.5, "buy")
 
     assert seeded_singleton.trade_log[-1].latency is None
+
+
+# ── the agent may never size an exit ────────────────────────────
+#
+# 2026-11-27 09:27: a model that had read SNDK 0.62 before a fill dropped it to 0.32
+# asked to sell 0.62 — a request that would have opened a 0.61 short if the churn guard
+# had not refused it first. The number was stale by one fill, and a quantity is the one
+# thing that cannot survive being stale on an exit. Exits now name the product only.
+
+PERP = "SOLUSDT-PERP"
+
+
+def _mark_perp(price: float = 50.0) -> None:
+    tools.price_book.update(
+        {
+            "product_id": PERP,
+            "price": str(price),
+            "best_bid": str(price),
+            "best_ask": str(price),
+        }
+    )
+
+
+def _position(store, agent_id: str = "agent") -> float:
+    return store.get_or_create(agent_id).positions.get(PERP, 0.0)
+
+
+def test_close_position_tool_flattens_the_live_size(seeded_singleton, monkeypatch):
+    """The model names the product; the size is read when the fill is booked."""
+    monkeypatch.setattr(tools.view, "rerender", lambda: None)
+    _mark_perp()
+    ctx = _exec_ctx({})
+    tools.execute_trade._tool.function(ctx, PERP, 1.0, "buy")
+
+    message = tools.close_position._tool.function(ctx, PERP)
+
+    assert _position(seeded_singleton) == pytest.approx(0.0)
+    assert "closed" in message.lower()
+    assert seeded_singleton.trade_log[-1].quantity == pytest.approx(1.0)
+
+
+def test_close_position_tool_refuses_when_flat(seeded_singleton, monkeypatch):
+    """Nothing to close is a refusal, not an order that opens the other side."""
+    monkeypatch.setattr(tools.view, "rerender", lambda: None)
+    _mark_perp()
+    before = len(seeded_singleton.trade_log)
+
+    message = tools.close_position._tool.function(_exec_ctx({}), PERP)
+
+    assert "Nothing to close" in message
+    assert len(seeded_singleton.trade_log) == before
+
+
+def test_execute_trade_refuses_an_agent_order_that_would_flip(seeded_singleton, monkeypatch):
+    """Crossing zero is a new position, and the agent must ask for it deliberately."""
+    monkeypatch.setattr(tools.view, "rerender", lambda: None)
+    _mark_perp()
+    ctx = _exec_ctx({})
+    tools.execute_trade._tool.function(ctx, PERP, 1.0, "buy")
+    tools.get_portfolio._tool.function(ctx)  # the size must come from a book it has seen
+
+    message = tools.execute_trade._tool.function(ctx, PERP, 2.0, "sell")
+
+    assert _position(seeded_singleton) == pytest.approx(1.0)
+    assert "close_position" in message
+    assert "short" in message.lower()
+
+
+def test_a_stale_size_cannot_open_a_short(seeded_singleton, monkeypatch):
+    """Replay of the incident: a size read before the close must not open a short after it.
+
+    This is the case a position-shaped gate cannot see — the book is *flat*, so "sell the
+    0.6 I read" and "open a 0.6 short" are the same order. Only the read count separates
+    them, which is why the assertion is that the fill does not happen at all.
+    """
+    monkeypatch.setattr(tools.view, "rerender", lambda: None)
+    _mark_perp()
+    ctx = _exec_ctx({})
+    tools.execute_trade._tool.function(ctx, PERP, 0.6, "buy")
+    tools.get_portfolio._tool.function(ctx)  # the read the model is carrying
+    tools.close_position._tool.function(ctx, PERP)  # a fill it has not seen
+    assert _position(seeded_singleton) == pytest.approx(0.0)
+
+    refusal = tools.execute_trade._tool.function(ctx, PERP, 0.6, "sell")
+
+    assert _position(seeded_singleton) == pytest.approx(0.0)
+    assert "REJECTED" in refusal
+    assert "get_portfolio" in refusal
+
+    # A deliberate short is still possible — after reading the book it is actually holding.
+    tools.get_portfolio._tool.function(ctx)
+    tools.execute_trade._tool.function(ctx, PERP, 0.6, "sell")
+    assert _position(seeded_singleton) == pytest.approx(-0.6)
+
+
+def test_a_malformed_size_gets_the_executors_message(seeded_singleton, monkeypatch):
+    """A NaN or a negative size is not a stale read; answering it with one loops the model."""
+    monkeypatch.setattr(tools.view, "rerender", lambda: None)
+    _mark_perp()
+    ctx = _exec_ctx({})
+    tools.execute_trade._tool.function(ctx, PERP, 0.6, "buy")
+
+    for bad in (float("nan"), float("inf"), -1.0, 0.0):
+        message = tools.execute_trade._tool.function(ctx, PERP, bad, "sell")
+        assert "REJECTED (not filled): 1 fill" not in message
+        assert "Quantity" in message or "positive" in message.lower(), (bad, message)
+
+
+def test_close_position_offers_the_model_no_quantity_to_get_wrong():
+    """The whole fix rests on this: an exit the model cannot size."""
+    schema = tools.close_position.tool_schema
+    assert set(schema.parameters_json_schema["properties"]) == {"product_id"}
+    assert schema.parameters_json_schema["required"] == ["product_id"]
+
+
+def test_both_deployables_register_the_same_tools():
+    """The agent is told about a tool the worker must serve; a mismatch is an unknown-tool
+    error the model cannot recover from, and the restart order makes it easy to hit."""
+    from deploy.agent import AGENT_TOOLS
+    from deploy.tools_and_dashboard import WORKER_TOOLS
+
+    agent_names = {tool.tool_schema.name for tool in AGENT_TOOLS}
+    worker_names = {tool.tool_schema.name for tool in WORKER_TOOLS}
+    assert agent_names == worker_names
+    assert "close_position" in agent_names

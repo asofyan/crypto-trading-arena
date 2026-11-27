@@ -33,10 +33,18 @@ def test_strategy_prompts_are_distinct():
 
 
 def test_default_prompt_opens_with_a_portfolio_check():
-    """Agents are stateless between ticks; the portfolio tool is their only memory."""
+    """The portfolio tool is the only *current* record; history is context, not memory.
+
+    The prompt used to claim the agent has no memory at all. calfkit's state is an
+    append-only message history, so that was false — and believing it is what let a stale
+    position survive the fill that changed it (ADR-0011).
+    """
     prompt = STRATEGIES["default"]
     assert "get_portfolio" in prompt
-    assert "fresh context" in prompt or "do not remember" in prompt
+    assert "claim about the past" in prompt
+    assert "may have landed since" in prompt
+    assert "you do not remember" not in prompt
+    assert "fresh context" not in prompt
 
 
 def test_default_prompt_gates_trades_on_the_disclosed_fee():
@@ -200,10 +208,14 @@ def test_scalper_perp_prompt_bounds_turnover():
 
 
 def test_scalper_perp_prompt_keeps_the_mechanics_that_are_not_strategy():
-    """Net-position semantics and the 1:1 cap are facts about the executor, not rules."""
+    """Net-position semantics and the 1:1 cap are facts about the executor, not rules.
+
+    The flip sentence moved: ``execute_trade`` stopped crossing zero on 2026-11-27, so a
+    prompt still promising a one-order flip would manufacture refused tool calls.
+    """
     prompt = STRATEGIES["scalper-perp"]
-    assert "flips you short" in prompt
-    assert "flips you long" in prompt
+    assert "never crosses zero" in prompt.lower()
+    assert "close_position" in prompt
     assert "1:1" in prompt
     assert "equity" in prompt.lower()
     assert "get_portfolio" in prompt
@@ -222,3 +234,54 @@ def test_scalper_perp_prompt_leaves_sizing_and_exit_to_conviction():
     assert "conviction" in lowered
     assert "prove you wrong" in lowered
     assert "cash is a position" in lowered
+
+
+def test_scalper_perp_exits_by_naming_the_product_not_a_size():
+    """An exit carries no quantity, so no stale number can become an opening order."""
+    prompt = STRATEGIES["scalper-perp"]
+    lowered = prompt.lower()
+
+    assert "close_position" in prompt
+    assert "never size a close yourself" in lowered
+    # The band still decides *when* an exit is allowed; only the sizing moved to the server.
+    assert "+100 bps" in prompt and "-50 bps" in prompt
+
+
+def test_scalper_perp_prompt_does_not_claim_the_model_has_no_memory():
+    """calfkit's state is an append-only message history, so the old claim was false — and
+    believing it is what let a 0.62 read survive the fill that made it 0.32."""
+    lowered = STRATEGIES["scalper-perp"].lower()
+
+    assert "you do not remember earlier turns" not in lowered
+    assert "may have landed since" in lowered
+    assert "close_position" in lowered  # the remedy, not just the warning
+
+
+def test_no_prompt_claims_the_agent_has_no_memory():
+    """calfkit keeps an append-only message history, so the claim was false everywhere it
+    appeared. A prompt that says it is amnesiac removes any reason to distrust an old read."""
+    for name, prompt in STRATEGIES.items():
+        lowered = prompt.lower()
+        assert "you do not remember earlier turns" not in lowered, name
+        assert "fresh context" not in lowered, name
+
+
+def test_scalper_perp_warns_that_a_reversal_waits_for_the_band():
+    """The flip refusal says 'close, then open'; inside the exit band the close is refused
+    too, so the prompt must not sell a reversal as a way out (finding F2 from review)."""
+    lowered = STRATEGIES["scalper-perp"].lower()
+    assert "reversing is therefore two orders" in lowered
+    assert "inside the exit band the close is refused" in lowered
+    assert "until you have called get_portfolio" in lowered
+
+
+def test_no_prompt_promises_more_turnover_than_the_churn_budget_allows():
+    """6 fills/hour by default; 4 round trips is 8 fills, so the old guidance was
+    unreachable by construction (finding F8 from review)."""
+    from arena.trade_policy import ChurnLimits
+
+    prompt = STRATEGIES["scalper-perp"]
+    budget = ChurnLimits().max_fills_per_hour
+    assert budget is not None
+    assert "2-3 round trips per hour" in prompt
+    assert f"{budget} fills" not in prompt  # the number lives in the guard, not the prompt

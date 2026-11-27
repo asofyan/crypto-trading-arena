@@ -479,3 +479,169 @@ def test_a_spot_only_account_needs_no_marks_to_buy():
 
     assert result.success, result.message
     assert store.get_or_create("a").positions[SPOT] == pytest.approx(1.0)
+
+
+# ── an agent order may not cross zero ───────────────────────────
+#
+# The model learned its size from a portfolio it read earlier. Once a fill lands, that
+# number is a claim about the past: selling it turns an exit into an opening order on the
+# other side (2026-11-27 09:27 — see tests/test_tools.py::test_a_stale_size_cannot_open_a_short).
+# The store keeps flipping for callers that read the book themselves (close_position, the
+# hold watchdog, replay); only the agent tool path is refused.
+
+
+def test_an_agent_order_may_not_cross_zero():
+    store, _ = make_env()
+    assert store.execute_trade("a", PERP, 0.5, "buy", allow_flip=False).success
+    store.record_portfolio_read("a", trade_count=store.get_or_create("a").trade_count)
+
+    refusal = store.execute_trade("a", PERP, 0.8, "sell", allow_flip=False)
+
+    assert not refusal.success
+    assert "crosses zero" in refusal.message.lower()
+    assert "close_position" in refusal.message
+    assert store.get_or_create("a").positions[PERP] == pytest.approx(0.5)
+    # The refusal names the live size, so the model can correct itself in the same turn.
+    assert "0.5" in refusal.message
+
+
+def test_a_trusted_caller_may_still_flip():
+    """The ban is agent policy, not a property of the book: the store contract is unchanged."""
+    store, _ = make_env()
+    assert store.execute_trade("a", PERP, 0.5, "buy").success
+
+    assert store.execute_trade("a", PERP, 0.8, "sell").success
+
+    assert store.get_or_create("a").positions[PERP] == pytest.approx(-0.3)
+
+
+def test_close_position_still_closes_under_the_agent_gate():
+    """An exit at the live size never crosses zero, so the gate must not touch it."""
+    store, _ = make_env()
+    store.execute_trade("a", PERP, 0.5, "buy", allow_flip=False)
+
+    result = store.close_position("a", PERP)
+
+    assert result.success, result.message
+    assert store.get_or_create("a").positions.get(PERP, 0.0) == pytest.approx(0.0)
+
+
+# ── a perp order needs a book the agent has seen ─────────────────
+#
+# The flip gate above compares the order against the position that is still there. It
+# cannot see the harder case: the position went to zero in between, so "sell the size I
+# read" and "open that size short" are the same order. Only the read count separates them
+# (AccountStore._stale_read_rejection), and it is why a stale exit cannot open a position.
+
+
+def test_a_perp_order_needs_a_book_seen_since_the_last_fill():
+    store, _ = make_env()
+    assert store.execute_trade("a", PERP, 0.5, "buy", allow_flip=False).success
+
+    stale = store.execute_trade("a", PERP, 0.2, "buy", allow_flip=False)
+
+    assert not stale.success
+    assert "get_portfolio" in stale.message
+    assert store.get_or_create("a").positions[PERP] == pytest.approx(0.5)
+
+    store.record_portfolio_read("a", trade_count=store.get_or_create("a").trade_count)
+    assert store.execute_trade("a", PERP, 0.2, "buy", allow_flip=False).success
+
+
+def test_a_stale_size_cannot_open_a_short_on_a_flat_book():
+    """The hole a position-shaped gate cannot see: flat is not a smaller long."""
+    store, _ = make_env()
+    assert store.execute_trade("a", PERP, 0.5, "buy", allow_flip=False).success
+    assert store.close_position("a", PERP).success
+    assert store.get_or_create("a").positions.get(PERP, 0.0) == pytest.approx(0.0)
+
+    stale = store.execute_trade("a", PERP, 0.5, "sell", allow_flip=False)
+
+    assert not stale.success
+    assert "stale" in stale.message.lower()
+    assert store.get_or_create("a").positions.get(PERP, 0.0) == pytest.approx(0.0)
+
+
+def test_an_exit_is_exempt_from_the_read_count():
+    """A model-sized reduce can only ever end smaller, so it never waits for a re-read."""
+    store, _ = make_env()
+    assert store.execute_trade("a", PERP, 0.5, "buy", allow_flip=False).success
+
+    result = store.execute_trade("a", PERP, 0.2, "sell", allow_flip=False)
+
+    assert result.success, result.message
+    assert store.get_or_create("a").positions[PERP] == pytest.approx(0.3)
+
+
+def test_spot_is_not_gated_by_the_read_count():
+    """A stale size on spot cannot open anything: a sell past the holding is refused, and a
+    buy is cash-funded. The probe is an *adding* buy, which is what the perp gate refuses."""
+    store, _ = make_env()
+
+    assert store.execute_trade("a", SPOT, 0.5, "buy", allow_flip=False).success
+    # Same shape as the perp refusal above (an add, no re-read) — allowed here on purpose.
+    assert store.execute_trade("a", SPOT, 0.2, "buy", allow_flip=False).success
+    assert store.get_or_create("a").positions[SPOT] == pytest.approx(0.7)
+
+
+def test_the_flip_gate_judges_the_clamped_size():
+    """A dust flip is booked as a close, so the gate must not refuse it (F1 from review)."""
+    store, book = make_env()
+    store.set_instrument_rules(
+        {
+            PERP: SymbolRules(
+                symbol="SOLUSDT",
+                base_asset="SOL",
+                quote_asset="USDT",
+                step_size=Decimal("0.01"),
+                min_qty=Decimal("0.01"),
+                min_notional=Decimal("20"),
+                tick_size=Decimal("0.01"),
+            )
+        }
+    )
+    assert store.execute_trade("a", PERP, 1.0, "buy", allow_flip=False).success
+    store.record_portfolio_read("a", trade_count=store.get_or_create("a").trade_count)
+
+    # 1.05 booked against a long of 1.0 leaves a 0.05 opening leg ($2.50) — under the $20
+    # minimum, so the executor books it as the close it mostly was.
+    result = store.execute_trade("a", PERP, 1.05, "sell", allow_flip=False)
+
+    assert result.success, result.message
+    assert store.get_or_create("a").positions.get(PERP, 0.0) == pytest.approx(0.0)
+
+
+def test_the_flip_refusal_is_asked_before_churn():
+    """A spent fill budget must not answer a question the flip gate can answer better."""
+    from arena.trade_policy import ChurnLimits
+
+    store, _ = make_env()
+    store.set_churn_limits(ChurnLimits(max_fills_per_hour=0))
+    store.apply_fill(
+        "a", "buy", PERP, 0.5, 50.0, perp_fee(25.0), fee_bps=PERP_TAKER
+    )
+    store.record_portfolio_read("a", trade_count=store.get_or_create("a").trade_count)  # isolate the flip gate from the read-count gate
+
+    refusal = store.execute_trade("a", PERP, 0.8, "sell", allow_flip=False)
+
+    assert not refusal.success
+    assert "crosses zero" in refusal.message.lower()
+    assert "fills already" not in refusal.message  # not the churn message
+
+
+def test_close_position_can_be_refused_by_the_exit_floor():
+    """Documents the dead end the prompt must not promise its way out of: inside the band,
+    neither a reduce nor a close is allowed, so a reversal is impossible until the band
+    resolves."""
+    from arena.trade_policy import ExitFloor
+
+    store, book = make_env()
+    assert store.execute_trade("a", PERP, 0.5, "buy").success
+    store.set_exit_floor(ExitFloor(min_profit_bps=100, stop_bps=50, max_hold_seconds=3600))
+    mark(book, PERP, 50.2)  # +40 bps: inside the band
+
+    refusal = store.close_position("a", PERP)
+
+    assert not refusal.success
+    assert "exit floor" in refusal.message.lower()
+    assert store.get_or_create("a").positions[PERP] == pytest.approx(0.5)

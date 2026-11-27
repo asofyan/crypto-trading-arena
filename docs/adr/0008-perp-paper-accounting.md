@@ -1,6 +1,8 @@
 # Paper perpetual futures: signed net positions, 1:1 leverage, real taker fees
 
-**Status:** accepted
+**Status:** accepted — the flipping half of decision 2 is superseded for the agent path by
+[ADR-0011](0011-the-agent-names-an-exit-the-server-sizes-it.md) (an agent order never crosses
+zero; exits are sized by the server). The signed-net-position model itself is unchanged.
 
 ## Context & decision
 

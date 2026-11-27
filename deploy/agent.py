@@ -41,12 +41,17 @@ from arena.model_pool import (
     RoundRobinModel,
     normalize_model_ids,
 )
-from arena.tools import calculator, execute_trade, get_portfolio
+from arena.tools import calculator, close_position, execute_trade, get_portfolio
+
 from arena.strategies import STRATEGIES
 from config import ArenaConfig, load_config
 from exchanges import AGENT_INPUT_TOPIC, AGENT_INPUT_TOPIC_LEAN
 
 load_dotenv()
+
+# The tool set the agent is told about. `deploy/tools_and_dashboard.py` serves the same
+# list; a mismatch is an unknown-tool error the model cannot recover from.
+AGENT_TOOLS = [execute_trade, close_position, get_portfolio, calculator]
 
 
 def _parse_header_pair(pair: str) -> tuple[str, str]:
@@ -326,7 +331,7 @@ async def main() -> None:
     print(f"\nConnecting to Kafka broker at {args.bootstrap_servers}...")
     client = Client.connect(args.bootstrap_servers)
 
-    tools = [execute_trade, get_portfolio, calculator]
+    tools = AGENT_TOOLS
     agent = Agent(
         args.name,
         system_prompt=system_prompt,

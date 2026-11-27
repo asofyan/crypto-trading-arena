@@ -28,12 +28,14 @@ from arena.ledger import DEFAULT_DB_PATH, Ledger, LedgerInUseError, LedgerSchema
 from arena.models import INITIAL_CASH, AgentAccount
 from arena.tools import (
     calculator,
+    close_position,
     execute_trade,
     get_portfolio,
     price_book,
     store,
     view,
 )
+
 from arena.risk import DEFAULT_HALT_PATH, LiveLimits, RiskGates
 from arena.trade_policy import ChurnLimits, ExitFloor
 from config import TradingConfig, load_config_strict
@@ -42,6 +44,10 @@ from exchanges.binance_spot import (
     BINANCE_SPOT_TESTNET_REST,
     BinanceSpotClient,
 )
+
+# Every agent tool must be registered on the worker that serves it, or the agent's call
+# comes back as an unknown tool. Named here so a test can assert the two deployables agree.
+WORKER_TOOLS = [execute_trade, close_position, get_portfolio, calculator]
 
 # Tools & Price Feed — Deploys trading tool workers and subscribes
 # to the Kafka price topic published by the connector.
@@ -470,7 +476,7 @@ async def main():
     print(f"\nConnecting to Kafka broker at {args.bootstrap_servers}...")
     client = Client.connect(args.bootstrap_servers)
 
-    tools = [execute_trade, get_portfolio, calculator]
+    tools = WORKER_TOOLS
     worker = Worker(client, nodes=tools)
     if ledger is not None:
         clear_degraded_marker_when_serving(worker, store)

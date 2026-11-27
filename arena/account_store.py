@@ -93,6 +93,10 @@ class AccountStore:
         # absent here keep the pre-existing behaviour and may trade anything: this is a
         # guard for strategies that cannot mean both markets, not a permission system.
         self._agent_markets: dict[str, tuple[str, ...]] = {}
+        # agent_id → the account's ``trade_count`` when it last read its portfolio. A
+        # perp order that adds exposure is refused while the two disagree: the model's
+        # size came from that read, and a fill since then makes it a claim about the past.
+        self._portfolio_read_seq: dict[str, int] = {}
         # Set when a ledger write fails: the fill still counted in memory, so the
         # disk is now behind. Surfaced by PortfolioView's header badge and by the
         # durable meta row that `manage_bot.py status` reads from another process.
@@ -333,6 +337,7 @@ class AccountStore:
         latency: float | None = None,
         *,
         replay: bool = False,
+        allow_flip: bool = True,
     ) -> TradeResult:
         """Route one trade intent through the active executor.
 
@@ -342,9 +347,18 @@ class AccountStore:
         A replay skips the churn guard and the exit floor for the same reason — it is
         history, not a new decision, and refusing it would silently drop a fill from the
         ledger.
+
+        ``allow_flip=False`` refuses an order that would open the opposite side. The agent
+        tool path passes it, because a model's size is a number it read on an earlier turn:
+        one fill in between turns that number into an opening order nobody asked for
+        (:meth:`close_position` exists to make exits immune to it). Callers that read the
+        book themselves — the hold watchdog, replay, a seat reconciling live state — keep
+        the default.
         """
         if not replay:
-            blocked = self._preadmission_rejection(agent_id, product_id, quantity, action)
+            blocked = self._preadmission_rejection(
+                agent_id, product_id, quantity, action, allow_flip=allow_flip
+            )
             if blocked is not None:
                 gate, rejection = blocked
                 log.info(
@@ -363,21 +377,44 @@ class AccountStore:
         )
 
     def _preadmission_rejection(
-        self, agent_id: str, product_id: str, quantity: float, action: str
+        self,
+        agent_id: str,
+        product_id: str,
+        quantity: float,
+        action: str,
+        *,
+        allow_flip: bool = True,
     ) -> tuple[str, TradeResult] | None:
         """Ask every order-path gate about this fill; ``None`` means it may go out.
 
-        Both gates are asked under one lock acquisition, before the executor runs and
+        Every gate is asked under one lock acquisition, before the executor runs and
         not for it: a gate must never hold every other agent behind a venue round-trip,
         so two intents racing the same window can both pass. The fill after them is the
         one a stateful gate stops; the exit floor has no state and is decided by the
         account, which only one writer can touch at a time anyway.
 
-        Churn is asked first because its refusals are the ones an agent addresses by
-        trading less, and it never refuses a reduce — so in practice each gate owns a
-        disjoint set of fills and only a flip is judged by both.
+        The flip gate is asked first when the caller cannot read the book: its refusal
+        teaches the shape of the order (close, then open), while a churn refusal on the
+        same order only says "trading too much" and leaves a stale size in the model's
+        hands. Before it, a perp order that adds exposure is asked whether the agent has
+        seen the book since the last fill — a stale size can open a position just as
+        easily on a book it thinks is long as on one it thinks is flat, and only the read
+        count can tell the two apart. Churn comes next because its refusals are the ones
+        an agent addresses by trading less, and it never refuses a reduce — so in practice
+        each gate owns a disjoint set of fills and only a flip is judged by both.
         """
         with self._write_lock:
+            # One flag asks one question — may this caller be trusted to size an order from
+            # its own read? — and switches on both book-trust gates: the read count (has it
+            # seen the book since the last fill?) and the zero crossing (is this an exit or
+            # a new position?). Callers that read the book themselves keep both off.
+            if not allow_flip:
+                rejection = self._stale_read_rejection(agent_id, product_id, quantity, action)
+                if rejection is not None:
+                    return "stale read", rejection
+                rejection = self._flip_rejection(agent_id, product_id, quantity, action)
+                if rejection is not None:
+                    return "flip", rejection
             if self._churn_guard is not None:
                 rejection = self._churn_rejection(agent_id, product_id, quantity, action)
                 if rejection is not None:
@@ -387,6 +424,139 @@ class AccountStore:
                 if rejection is not None:
                     return "exit floor", rejection
         return None
+
+    def record_portfolio_read(self, agent_id: str, *, trade_count: int) -> None:
+        """Mark that the agent has just seen the book, so a perp order may be sized from it.
+
+        Called by the ``get_portfolio`` tool. The marker is the fill count, not a
+        timestamp: what invalidates a size is a fill, not the clock. An agent that has
+        never read starts at 0, which is correct until its first fill.
+
+        ``trade_count`` is the count the caller actually rendered, and it is required: a
+        default that read the live count would let a stamp run *ahead* of the data it
+        claims to describe, which is the one way to defeat the gate. A fill landing between
+        the snapshot and the render leaves the stamp behind the book, so the next order asks
+        for one more read — conservative in the safe direction.
+        """
+        with self._write_lock:
+            self._portfolio_read_seq[agent_id] = trade_count
+
+    def snapshot(self, agent_id: str) -> AgentAccount:
+        """A consistent copy of the book, safe to render while other threads book fills.
+
+        The hold watchdog closes positions on a worker thread in the same process, so a
+        render that iterates the live dict can raise ``KeyError`` on a product a fill just
+        closed. Copying under the write lock is what makes a read a read.
+        """
+        with self._write_lock:
+            account = self.get_or_create(agent_id)
+            return AgentAccount(
+                cash=account.cash,
+                positions=dict(account.positions),
+                cost_basis=dict(account.cost_basis),
+                avg_entry_ts=dict(account.avg_entry_ts),
+                trade_count=account.trade_count,
+                total_fees_paid=account.total_fees_paid,
+                realized_pnl=account.realized_pnl,
+            )
+
+    def _stale_read_rejection(
+        self, agent_id: str, product_id: str, quantity: float, action: str
+    ) -> TradeResult | None:
+        """Refuse a perp order that adds exposure against a book the agent has not seen since
+        the last fill.
+
+        :meth:`_flip_rejection` catches a stale size that runs past a position that is still
+        there. It cannot catch one that lands on a flat book: "sell the 0.62 I read" and
+        "open a 0.62 short" are the same order. Only the read count separates them — the
+        model's number came from read N, the book is at fill N+1 — and a stale size can open
+        a position just as easily on a book it thinks is long as on one it thinks is flat.
+        Exits are exempt because ``close_position`` sizes them under the booking lock.
+        """
+        action = action.lower().strip()
+        if action not in ("buy", "sell"):
+            return None
+        # A malformed size is the executor's message to give ("Quantity must be positive"),
+        # and answering it with "re-read the book" sends the model to re-issue the same
+        # garbage. Only a well-formed size can be diagnosed as stale.
+        if not math.isfinite(quantity) or quantity <= 0:
+            return None
+        product_id = product_id.upper().strip()
+        # Spot cannot open a position by surprise: selling more than is held is refused by
+        # the executor, and buying is cash-funded. The read count is a perp sized-size guard.
+        if not is_perp_product(product_id):
+            return None
+        account = self._accounts.get(agent_id)
+        if account is None:
+            return None
+        position = account.positions.get(product_id, 0.0)
+        bookable = self._bookable_quantity(product_id, position, quantity, action)
+        if is_strict_reduce(position, bookable, action):
+            # An exit sized by the model can only ever end at or below what is held, so it
+            # never opens a position. A trim big enough to be clamped books as a full close
+            # (``abs(position)``), which is the clamp's own safe reading of an overshoot.
+            return None
+
+        seen = self._portfolio_read_seq.get(agent_id, 0)
+        missed = account.trade_count - seen
+        if missed <= 0:
+            return None
+        return TradeResult(
+            False,
+            f"REJECTED (not filled): {missed} fill(s) landed since your last get_portfolio, "
+            f"so any size you are carrying may be stale. Call get_portfolio, then decide "
+            f"again — you hold {position:g} {product_id}. Exits do not wait for this: "
+            f"close_position('{product_id}') sizes itself from the book.",
+        )
+
+    def _flip_rejection(
+        self, agent_id: str, product_id: str, quantity: float, action: str
+    ) -> TradeResult | None:
+        """Refuse an order that would open the opposite side, for callers that cannot read the book.
+
+        The agent tool path is such a caller: its size is a number the model read on an
+        earlier turn, and one fill in between turns that number into an opening order on
+        the other side. On 2026-11-27 a long of 0.01 was asked to be "closed" with a sell
+        of 0.62 — a 0.61 short no turn had decided on, refused that day only by the churn
+        guard. Naming the product for an exit (:meth:`close_position`) and issuing an
+        opening order on a fresh read is the only shape that cannot go stale.
+
+        The quantity judged is the one the executor will book, not the intent, so a flip
+        small enough for ``clamp_flip_to_a_close`` to reduce to an exit passes here — it
+        is an exit by the time the book sees it.
+        """
+        action = action.lower().strip()
+        if action not in ("buy", "sell"):
+            return None
+        product_id = product_id.upper().strip()
+        # Spot has no opposite side to open, and a sell past the holding is already an
+        # error the executor states better ("cannot sell what you do not hold").
+        if not is_perp_product(product_id):
+            return None
+
+        account = self._accounts.get(agent_id)
+        position = account.positions.get(product_id, 0.0) if account is not None else 0.0
+        if not math.isfinite(position) or abs(position) <= _QTY_EPSILON:
+            return None  # flat: every order opens, and opening is what the tool is for
+
+        bookable = self._bookable_quantity(product_id, position, quantity, action)
+        if not math.isfinite(bookable) or bookable <= 0:
+            return None  # let the executor own a malformed size
+        delta = bookable if action == "buy" else -bookable
+        crossing = abs(delta) - abs(position)
+        if (position > 0) == (delta > 0) or crossing <= _QTY_EPSILON:
+            return None  # same side (adding), or an exit that never reaches zero
+
+        side_now = "long" if position > 0 else "short"
+        side_opened = "short" if position > 0 else "long"
+        return TradeResult(
+            False,
+            f"REJECTED (not filled): you hold {abs(position):g} {side_now} in {product_id}, "
+            f"and this order would take you through zero to {side_opened}. execute_trade "
+            f"never crosses zero. To leave the position, close_position('{product_id}') — it "
+            f"sizes the exit from the book when the fill is booked. Taking the other side is "
+            f"a separate decision, made on a fresh portfolio read.",
+        )
 
     def _churn_rejection(
         self, agent_id: str, product_id: str, quantity: float, action: str

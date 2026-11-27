@@ -56,3 +56,61 @@ Use a Binance Futures Demo wallet with test USDT. Configure **One-way Mode**, **
 The connector polls the venue's order-book ticker. Keep the poll interval below `max_price_age_seconds` (default 5 seconds). The venue fills a market order at available prices. `max_price_slippage_bps` reserves margin headroom. [Binance market order API](https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Order)
 
 The tool server initializes and reconciles live futures automatically. Use `status` with the Demo ledger path to read its persisted arming state. If you start the tool server directly, the process row in `status` can say it is stopped while the ledger still reports its persisted arming state. Keep the same ledger across restarts so orders with uncertain outcomes can be resolved by client order ID. Use a separate config, account, broker, and ledger for a production deployment.
+
+## Local recipe that worked (2026-11-27)
+
+`testnet.binancefuture.com` now 301-redirects to `demo.binance.com`, so "testnet" here means
+**Binance Futures Demo Trading**: create the HMAC key under *Demo Trading → Account → API
+Management* (`https://demo.binance.com/en/my/settings/api-management`), not under the main
+account. A key from the production account will not authenticate against
+`demo-fapi.binance.com`.
+
+The demo wallet needs all four venue settings before the tool server will arm, and
+`arena/futures_session.py::_check_settings` reads them from the venue, not from the UI:
+
+```bash
+# one-way, single-asset, no BNB fee burn, 1× cross per symbol
+curl -s -H "X-MBX-APIKEY: $BINANCE_FUTURES_DEMO_KEY" \
+  "https://demo-fapi.binance.com/fapi/v1/symbolConfig?symbol=ZECUSDT&timestamp=..." # signed
+```
+
+`POST /fapi/v1/leverage?symbol=ZECUSDT&leverage=1` when the demo wallet defaults to 20×.
+
+Two isolation seams matter more than the doc's "isolated checkout":
+
+- **Halt flag is cwd-relative** (`arena/risk.py::DEFAULT_HALT_PATH` = `data/LIVE_HALT`). A
+  second stack started from the repo root inherits the paper stack's halt and never arms. Run
+  the demo stack from its own cwd (`.run/demo-cwd/data/LIVE_HALT` stays absent) and symlink
+  `.env` in, because `load_config` reads dotenv from the *cwd*:
+
+  ```bash
+  mkdir -p .run/demo-cwd/data && ln -sfn "$PWD/.env" .run/demo-cwd/.env
+  cd .run/demo-cwd
+  PYTHONPATH=/repo uv run --project /repo python -m deploy.tools_and_dashboard \
+    --config /repo/data/config.futures-demo.json --bootstrap-servers localhost:9094 \
+    --db /repo/data/live-futures-demo.db --data-dir /repo/data --headless
+  ```
+
+  `manage_bot.py status` must run from the same cwd, or it reports the paper stack's flag.
+- **A second broker**, so topic names (`agent_router.input.lean`, `<agent>.private.return`)
+  never meet the paper stack's consumers:
+
+  ```bash
+  docker run -d --name local-broker-demo --network docker_default \
+    -p 9094:9092 -p 29096:29092 -e CLUSTER_ID=<fresh> -e KAFKA_NODE_ID=2 -e KAFKA_BROKER_ID=2 \
+    -e KAFKA_PROCESS_ROLES=broker,controller -e KAFKA_CONTROLLER_QUORUM_VOTERS=2@localhost:9093 \
+    -e KAFKA_LISTENERS=HOST://:9092,DOCKER://:29092,CONTROLLER://:9093 \
+    -e KAFKA_ADVERTISED_LISTENERS=HOST://localhost:9094,DOCKER://host.docker.internal:29096 \
+    -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,HOST:PLAINTEXT,DOCKER:PLAINTEXT \
+    -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER -e KAFKA_INTER_BROKER_LISTENER_NAME=HOST \
+    -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 confluentinc/cp-kafka:8.0.0
+  ```
+
+Two things the logs say that are easy to misread:
+
+- The tool-server banner still prints `every agent starts at $100` on a fresh ledger. The
+  futures ledger is seeded with `venue wallet − reserve_usdt` instead; check `accounts.cash`
+  in the demo DB (§3) rather than the banner.
+- `manage_bot.py status` reports `Bot: not running` for a `nohup`-started tool server (§7.7
+  of AGENTS.md) and reads the halt flag from its *own* cwd. The ledger's `live_state=ARMED`
+  is the truth the engine obeys.

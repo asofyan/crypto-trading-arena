@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-from arena.models import Candle, TIMEFRAMES
+from arena.models import Candle, TIMEFRAMES, Timeframe
 
 log = logging.getLogger(__name__)
 
@@ -112,10 +112,16 @@ class CandleBook:
         candles.sort(key=lambda c: c.time)
         self._candles[(product_id, granularity)] = candles
 
-    def format_prompt(self, product_ids: list[str]) -> str:
-        """Build a structured, multi-timeframe price history for the agent prompt."""
+    def format_prompt(
+        self, product_ids: list[str], timeframes: list[Timeframe] | None = None
+    ) -> str:
+        """Build a structured, multi-timeframe price history for the agent prompt.
+
+        ``timeframes`` narrows the tables to the tiers the caller's strategy actually
+        reads: the daily and 4h tiers are ~89% of the rows and belong to swing-trend.
+        """
         buf = io.StringIO()
-        for tf in TIMEFRAMES:
+        for tf in timeframes or TIMEFRAMES:
             buf.write(f"### {tf.label}\n")
             buf.write("product,time,open,high,low,close,volume\n")
             for pid in product_ids:
@@ -130,3 +136,42 @@ class CandleBook:
 
     def has_data(self) -> bool:
         return any(bool(v) for v in self._candles.values())
+
+    def trend_summary(self, product_ids: list[str]) -> str:
+        """Higher-timeframe regime in a handful of numbers per product.
+
+        A minutes-horizon scalper needs to know whether it is fighting a multi-day
+        move, but it does not need 328 candle rows to learn it: EMA distance, where
+        price sits in the monthly range, and the last daily change carry that context
+        in ~200 tokens instead of ~15k. Returns "" when no higher timeframe is cached.
+        """
+        lines = []
+        for pid in product_ids:
+            four_h = self._candles.get((pid, 14400), [])
+            daily = self._candles.get((pid, 86400), [])
+            parts = []
+            if len(four_h) >= 21:
+                closes = [c.close for c in four_h]
+                ema = closes[0]
+                for close in closes[1:]:
+                    ema += (close - ema) * (2 / 21)
+                parts.append(f"4h close vs EMA20 {(closes[-1] / ema - 1) * 1e4:+.0f} bps")
+                back = min(12, len(closes) - 1)
+                parts.append(f"4h {back}-bar change {(closes[-1] / closes[-1 - back] - 1) * 1e4:+.0f} bps")
+            if len(daily) >= 2:
+                parts.append(f"last daily change {(daily[-1].close / daily[-2].close - 1) * 1e4:+.0f} bps")
+                high = max(c.high for c in daily)
+                low = min(c.low for c in daily)
+                position = (daily[-1].close - low) / (high - low) * 100 if high > low else 50.0
+                parts.append(f"{len(daily)}d range position {position:.0f}%")
+            if parts:
+                lines.append(f"{pid}: " + ", ".join(parts))
+        if not lines:
+            return ""
+        return (
+            "### Trend context (higher timeframes, regime only)\n"
+            "These are context, not signals: they tell you which way the tide runs, "
+            "your entries and exits are decided on the intraday tables.\n"
+            + "\n".join(lines)
+            + "\n"
+        )

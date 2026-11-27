@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import time
 
 import pytest
 
 from arena.ledger import DEFAULT_DB_PATH, Ledger
 from arena.models import INITIAL_CASH, AgentAccount
+from arena.trade_policy import ExitFloor
 from deploy import tools_and_dashboard as deploy_cli
 
 
@@ -77,7 +79,7 @@ def test_parse_args_accepts_opt_out_flags(monkeypatch, tmp_path):
 # passed the wrong name silently ran a strategy the config never assigned.
 
 
-def _agent_config_file(tmp_path, *, strategy="scalper"):
+def _agent_config_file(tmp_path, *, strategy="scalper", model="hungerg-free"):
     path = tmp_path / "config.json"
     path.write_text(
         json.dumps(
@@ -89,7 +91,7 @@ def _agent_config_file(tmp_path, *, strategy="scalper"):
                     {
                         "name": "hungerg",
                         "provider": "p",
-                        "model": "hungerg-free",
+                        "model": model,
                         "strategy": strategy,
                     }
                 ],
@@ -125,7 +127,7 @@ def test_from_config_supplies_the_strategy_so_it_cannot_drift(monkeypatch, tmp_p
     assert module.apply_agent_config(args, load_config(path)) is True
     assert args.strategy == "scalper"
     assert args.name == "hungerg"
-    assert args.model_id == "hungerg-free"
+    assert args.model_ids == ["hungerg-free"]
     assert args.base_url == "https://llm.example/v1"
 
 
@@ -138,6 +140,203 @@ def test_explicit_strategy_overrides_config_with_a_notice(monkeypatch, tmp_path,
     assert module.apply_agent_config(args, load_config(path)) is True
     assert args.strategy == "default"
     assert "overrides config strategy" in capsys.readouterr().out
+
+
+def test_from_config_carries_a_model_pool(monkeypatch, tmp_path):
+    from config import load_config
+
+    path = _agent_config_file(tmp_path, model=["hungerg-free", "hungerg-mini"])
+    module, args = _parse_from_config(monkeypatch, path)
+
+    assert module.apply_agent_config(args, load_config(path)) is True
+    assert args.model_ids == ["hungerg-free", "hungerg-mini"]
+
+
+def test_payload_flag_selects_the_lean_topic(monkeypatch):
+    import deploy.agent as agent_module
+    from exchanges import AGENT_INPUT_TOPIC, AGENT_INPUT_TOPIC_LEAN
+
+    monkeypatch.setattr(
+        sys, "argv", ["agent", "--bootstrap-servers", "b:9092", "--model-id", "m", "--payload", "lean"]
+    )
+
+    args = agent_module.parse_args()
+
+    assert args.payload == "lean"
+    assert agent_module.input_topic_for(args.payload) == AGENT_INPUT_TOPIC_LEAN
+    assert agent_module.input_topic_for("full") == AGENT_INPUT_TOPIC
+
+
+def test_an_explicit_payload_overrides_config_with_a_notice(monkeypatch, tmp_path, capsys):
+    """The flag is documented as an override; it must not be overwritten by the config."""
+    from config import load_config
+
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "llm_providers": {"p": {"api_key": "sk-test", "base_url": "https://llm.example/v1"}},
+                "agents": [{"name": "hungerg", "provider": "p", "model": "m", "payload": "lean"}],
+            }
+        )
+    )
+    module, args = _parse_from_config(monkeypatch, path, "--payload", "full")
+
+    assert module.apply_agent_config(args, load_config(path)) is True
+    assert args.payload == "full"
+    assert "payload" in capsys.readouterr().out
+
+
+def test_from_config_carries_the_payload_profile(monkeypatch, tmp_path):
+    from config import load_config
+
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "llm_providers": {"p": {"api_key": "sk-test", "base_url": "https://llm.example/v1"}},
+                "agents": [
+                    {"name": "hungerg", "provider": "p", "model": "m", "payload": "lean"}
+                ],
+            }
+        )
+    )
+    module, args = _parse_from_config(monkeypatch, path)
+
+    assert module.apply_agent_config(args, load_config(path)) is True
+    assert args.payload == "lean"
+
+
+def test_model_id_flag_is_repeatable(monkeypatch):
+    """A pool is one agent with several models, so the flag repeats rather than mutates."""
+    import deploy.agent as agent_module
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent",
+            "--bootstrap-servers", "b:9092",
+            "--model-id", "gpt-a",
+            "--model-id", "gpt-b",
+        ],
+    )
+
+    args = agent_module.parse_args()
+
+    assert args.model_ids == ["gpt-a", "gpt-b"]
+
+
+def test_a_lone_model_keeps_a_plain_client():
+    """One model must not pay for pool machinery it cannot use."""
+    from calfkit import OpenAIModelClient
+
+    import deploy.agent as agent_module
+
+    client = agent_module.build_model_client(
+        ["gpt-a"], base_url="https://llm.example/v1", api_key="sk-test"
+    )
+
+    assert isinstance(client, OpenAIModelClient)
+    assert client.model_name == "gpt-a"
+
+
+def test_build_model_client_refuses_a_pool_that_cannot_rotate():
+    import deploy.agent as agent_module
+
+    with pytest.raises(ValueError, match="repeats"):
+        agent_module.build_model_client(["gpt-a", "gpt-a"], api_key="sk-test")
+
+
+def test_pooled_clients_hand_retrying_to_the_pool():
+    """The OpenAI SDK retries twice and sleeps on Retry-After inside the tick."""
+    import deploy.agent as agent_module
+
+    pool = agent_module.build_model_client(["gpt-a", "gpt-b"], api_key="sk-test")
+
+    assert [model.client.max_retries for model in pool.models] == [0, 0]
+
+
+def test_a_negative_cooldown_is_rejected(monkeypatch):
+    import deploy.agent as agent_module
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent",
+            "--bootstrap-servers", "b:9092",
+            "--model-id", "gpt-a",
+            "--model-cooldown-seconds", "-1",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        agent_module.parse_args()
+
+
+def test_an_unusable_cooldown_value_is_rejected(monkeypatch):
+    import deploy.agent as agent_module
+
+    for value in ("-1", "nan", "inf"):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "agent",
+                "--bootstrap-servers", "b:9092",
+                "--model-id", "gpt-a",
+                "--model-cooldown-seconds", value,
+            ],
+        )
+        with pytest.raises(SystemExit):
+            agent_module.parse_args()
+
+
+def test_a_single_model_says_the_cooldown_does_nothing(capsys):
+    import deploy.agent as agent_module
+
+    agent_module.build_model_client(["gpt-a"], api_key="sk-test", model_cooldown_seconds=90)
+
+    assert "only applies to a model pool" in capsys.readouterr().out
+
+
+def test_a_whitespace_padded_model_is_not_an_override(monkeypatch, tmp_path, capsys):
+    from config import load_config
+
+    path = _agent_config_file(tmp_path)
+    module, args = _parse_from_config(monkeypatch, path, "--model-id", " hungerg-free ")
+
+    assert module.apply_agent_config(args, load_config(path)) is True
+    assert args.model_ids == ["hungerg-free"]
+    assert "overrides config model" not in capsys.readouterr().out
+
+
+def test_an_explicit_model_pool_overrides_config_with_a_notice(monkeypatch, tmp_path, capsys):
+    from config import load_config
+
+    path = _agent_config_file(tmp_path)
+    module, args = _parse_from_config(monkeypatch, path, "--model-id", "other-model")
+
+    assert module.apply_agent_config(args, load_config(path)) is True
+    assert args.model_ids == ["other-model"]
+    assert "overrides config model" in capsys.readouterr().out
+
+
+def test_several_models_become_a_round_robin_pool():
+    import deploy.agent as agent_module
+    from arena.model_pool import RoundRobinModel
+
+    client = agent_module.build_model_client(
+        ["gpt-a", "gpt-b"],
+        base_url="https://llm.example/v1",
+        api_key="sk-test",
+        model_cooldown_seconds=5,
+    )
+
+    assert isinstance(client, RoundRobinModel)
+    assert [model.model_name for model in client.models] == ["gpt-a", "gpt-b"]
+    assert client.cooldown_seconds == 5
 
 
 def test_from_config_reports_an_unknown_agent(monkeypatch, tmp_path):
@@ -346,3 +545,86 @@ def test_resolve_instrument_rules_missing_cache_tells_the_operator_how_to_fix_it
 
     assert rules == {}
     assert "arena.instruments --refresh" in summary
+
+
+# ── The hold watchdog: the half of the escape hatch that submits ─
+#
+# The exit floor permits a close past the hold limit and stops there. In the measured
+# run nothing else pulled, so four round trips sat 800-3100 s past a 3600 s limit and
+# the scorecard — correctly — called it a guard that did not fire. These tests pin the
+# deploy wiring: armed from the same config number as the floor, published in the startup
+# banner, and refused when the operator turned the limit off.
+
+
+def test_hold_watchdog_is_armed_from_the_configured_hold_limit(make_store, capsys):
+    watchdog = deploy_cli.arm_hold_watchdog(
+        make_store(),
+        ExitFloor(min_profit_bps=50.0, stop_bps=25.0, max_hold_seconds=3600.0),
+    )
+
+    assert watchdog is not None
+    banner = capsys.readouterr().out
+    assert "Hold watchdog:" in banner
+    assert "3600" in banner
+
+
+def test_hold_watchdog_stays_off_without_an_exit_floor(make_store, capsys):
+    """No floor means no band and no limit: a watchdog here would invent a rule."""
+    assert deploy_cli.arm_hold_watchdog(make_store(), None) is None
+    assert "Hold watchdog:" not in capsys.readouterr().out
+
+
+def test_hold_watchdog_stays_off_when_the_timeout_is_removed(make_store, capsys):
+    """``max_hold_seconds: null`` is the operator saying "hold it" — not "close it"."""
+    assert deploy_cli.arm_hold_watchdog(make_store(), ExitFloor(max_hold_seconds=None)) is None
+    assert "Hold watchdog:" not in capsys.readouterr().out
+
+
+async def test_the_armed_watchdog_closes_a_position_past_the_limit(make_store):
+    """The wiring, end to end: the banner's watchdog is the one that books the close."""
+    store = make_store(taker_bps=10)
+    assert store.execute_trade("a", "SOL-USD", 0.5, "buy").success
+    store.get_or_create("a").avg_entry_ts["SOL-USD"] = time.time() - 4000.0
+    watchdog = deploy_cli.arm_hold_watchdog(
+        store, ExitFloor(min_profit_bps=50.0, stop_bps=25.0, max_hold_seconds=3600.0)
+    )
+
+    [result] = await watchdog.tick()
+
+    assert result.success, result.message
+    assert store.get_or_create("a").positions.get("SOL-USD", 0.0) == pytest.approx(0.0)
+
+
+def test_the_rate_limit_cooldown_is_configurable(monkeypatch):
+    """A 429 is a quota window, not a blip: the operator must be able to widen it."""
+    import deploy.agent as agent_module
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent",
+            "--bootstrap-servers", "b:9092",
+            "--model-id", "free-model",
+            "--model-id", "paid-model",
+            "--model-rate-limit-cooldown-seconds", "1800",
+        ],
+    )
+
+    args = agent_module.parse_args()
+    pool = agent_module.build_model_client(
+        args.model_ids,
+        api_key="sk-test",
+        rate_limit_cooldown_seconds=args.model_rate_limit_cooldown_seconds,
+    )
+
+    assert pool.rate_limit_cooldown_seconds == 1800
+
+
+def test_help_renders(monkeypatch):
+    """argparse interpolates help text with %, so a literal % must be escaped."""
+    import deploy.agent as agent_module
+
+    monkeypatch.setattr(sys, "argv", ["agent", "--help"])
+    with pytest.raises(SystemExit):
+        agent_module.parse_args()

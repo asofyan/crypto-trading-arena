@@ -131,3 +131,41 @@ async def test_close_writes_final_snapshot_on_cancel(tmp_path, make_store):
     await rec.close()
 
     assert len(_rows(tmp_path, "snapshots")) == 1
+
+
+# ── Market ticks (the price path a band audit needs) ─────────────
+
+
+def test_records_a_market_tick_with_the_spread_it_crossed(tmp_path):
+    rec = DataRecorder(data_dir=str(tmp_path))
+
+    rec.record_tick(product_id="SOLUSDT-PERP", price=100.0, best_bid=99.99, best_ask=100.01)
+
+    rows = _rows(tmp_path, "ticks")
+    assert len(rows) == 1
+    assert rows[0]["product_id"] == "SOLUSDT-PERP"
+    assert float(rows[0]["price"]) == pytest.approx(100.0)
+    assert float(rows[0]["spread_bps"]) == pytest.approx(2.0, abs=0.05)
+
+
+def test_tick_recording_survives_a_quote_with_no_price(tmp_path):
+    """A malformed ticker must not kill the subscriber loop that feeds it."""
+    rec = DataRecorder(data_dir=str(tmp_path))
+
+    rec.record_tick(product_id="SOLUSDT-PERP", price="", best_bid="", best_ask="")
+
+    assert _rows(tmp_path, "ticks") == []
+
+
+def test_a_zero_price_quote_is_dropped(tmp_path):
+    rec = DataRecorder(data_dir=str(tmp_path))
+
+    rec.record_tick(product_id="SOLUSDT-PERP", price=0.0, best_bid=0.0, best_ask=0.0)
+
+    assert _rows(tmp_path, "ticks") == []
+
+
+def test_creates_the_ticks_file_with_a_header(tmp_path):
+    DataRecorder(data_dir=str(tmp_path))
+
+    assert glob.glob(str(tmp_path / "ticks_*.csv"))

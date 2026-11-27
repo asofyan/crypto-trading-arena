@@ -18,7 +18,7 @@ import asyncio
 import logging
 import sys
 
-from exchanges import AGENT_INPUT_TOPIC, quiet_shared_inbox_reply_log
+from exchanges import AGENT_INPUT_TOPIC, AGENT_INPUT_TOPIC_LEAN, quiet_shared_inbox_reply_log
 from exchanges.binance import PERP_VENUE, parse_args as binance_parse_args
 from exchanges.binance import run as binance_run
 
@@ -28,8 +28,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return binance_parse_args(argv, venue=PERP_VENUE)
 
 
-async def run(args: argparse.Namespace, agent_topic: str = AGENT_INPUT_TOPIC) -> None:
-    await binance_run(args, agent_topic=agent_topic, venue=PERP_VENUE)
+async def run(
+    args: argparse.Namespace,
+    agent_topic: str = AGENT_INPUT_TOPIC,
+    lean_topic: str | None = AGENT_INPUT_TOPIC_LEAN,
+) -> None:
+    await binance_run(args, agent_topic=agent_topic, venue=PERP_VENUE, lean_topic=lean_topic)
 
 
 def main() -> None:

@@ -129,3 +129,70 @@ def test_has_data_and_empty_prompt():
     assert "BTC-USD," not in out  # but no data rows
     book.update_from_api("BTC-USD", 60, [[1, 1, 1, 1, 1, 1]])
     assert book.has_data() is True
+
+
+# ── Lean payload: intraday tables + compact trend summary ─────────
+
+
+def _candle(row):
+    """Parse the synthetic [ts, open, high, low, close] rows this module uses."""
+    from datetime import datetime, timezone
+
+    from arena.models import Candle
+
+    return Candle(
+        time=datetime.fromtimestamp(row[0], tz=timezone.utc),
+        open=float(row[1]),
+        high=float(row[2]),
+        low=float(row[3]),
+        close=float(row[4]),
+        volume=1.0,
+    )
+
+
+def _book_with(rows_by_timeframe, pid="SOLUSDT-PERP"):
+    from arena.models import TIMEFRAMES
+    from arena.price_book import CandleBook
+
+    book = CandleBook(parse_row=lambda row: _candle(row))
+    for tf in TIMEFRAMES:
+        rows = rows_by_timeframe.get(tf.granularity)
+        if rows:
+            book.update_from_api(pid, tf.granularity, rows)
+    return book
+
+
+def _rising_rows(count, start=100.0, step=0.5):
+    return [
+        [i * 900, start + i * step, start + i * step + 0.2, start + i * step - 0.2, start + (i + 1) * step]
+        for i in range(count)
+    ]
+
+
+def test_format_prompt_can_be_limited_to_a_subset_of_timeframes():
+    from arena.models import INTRADAY_TIMEFRAMES
+
+    book = _book_with({86400: _rising_rows(5), 900: _rising_rows(6), 60: _rising_rows(20)})
+
+    lean = book.format_prompt(["SOLUSDT-PERP"], timeframes=INTRADAY_TIMEFRAMES)
+
+    assert "15-min" in lean or "### 15-min candles" in lean
+    assert "1-daily" not in lean, "the daily tier is not intraday"
+    assert "4-hour" not in lean
+
+
+def test_trend_summary_reports_regime_in_a_few_numbers():
+    book = _book_with({86400: _rising_rows(30), 14400: _rising_rows(40)})
+
+    summary = book.trend_summary(["SOLUSDT-PERP"])
+
+    assert "SOLUSDT-PERP" in summary
+    assert "EMA20" in summary
+    assert "range position" in summary
+    assert len(summary) < 600, "the whole point is that this replaces thousands of candle rows"
+
+
+def test_trend_summary_is_empty_without_higher_timeframe_data():
+    book = _book_with({900: _rising_rows(6)})
+
+    assert book.trend_summary(["SOLUSDT-PERP"]) == ""

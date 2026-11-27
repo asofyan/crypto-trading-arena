@@ -27,9 +27,11 @@ from arena.models import Candle, TIMEFRAMES, Timeframe
 from arena.price_book import CandleBook
 from exchanges import (
     AGENT_INPUT_TOPIC,
+    AGENT_INPUT_TOPIC_LEAN,
     AGENT_OUTPUT_TOPIC,
     PRICE_TOPIC,
     TickerMessage,
+    build_market_message,
     quiet_shared_inbox_reply_log,
 )
 
@@ -124,6 +126,7 @@ class CoinbaseKafkaConnector:
         fee_model: FeeModel,
         min_publish_interval: float = 0.0,
         candle_book: CandleBook | None = None,
+        lean_topic: str | None = None,
     ) -> None:
         if not products:
             raise ValueError("At least one product must be specified")
@@ -132,6 +135,9 @@ class CoinbaseKafkaConnector:
         # broadcast topic (all agents subscribe under distinct consumer groups), NOT a
         # per-agent private topic — see docs/calfkit-0.12-migration.md, constraint #2.
         self._agent_gw = client.agent(topic=agent_topic)
+        # Second fan-out gateway for the lean profile. Off unless a topic is supplied,
+        # so a deployment with no scalper pays nothing for it.
+        self._lean_gw = client.agent(topic=lean_topic) if lean_topic else None
         self._products = products
         self._min_interval = min_publish_interval
         self._running = True
@@ -197,27 +203,8 @@ class CoinbaseKafkaConnector:
         }
         batch_json = json.dumps([t.model_dump(exclude=_exclude) for t in batch])
 
-        prompt_parts = [
-            "Here is the latest ticker information. You should view your "
-            "portfolio first before making any decisions to trade.\n"
-            "price = last traded price, best_bid = price you sell at, "
-            "best_ask = price you buy at.\n"
-            f"{self._fee_disclosure}\n\n"
-            f"{batch_json}",
-        ]
+        await self._publish_profiles(batch_json)
 
-        if self._candle_book is not None and self._candle_book.has_data():
-            prompt_parts.append(
-                "\n## Price History (OHLCV candlesticks)\n"
-                "Below are candlesticks at several granularities — coarser for "
-                "broader trend context, finer for recent price action.\n\n"
-                f"{self._candle_book.format_prompt(self._products)}"
-            )
-
-        await self._agent_gw.send(
-            "\n".join(prompt_parts),
-            deps={"invoked_at": time.time()},
-        )
 
         summary = ", ".join(f"{t.product_id} @ ${t.price}" for t in batch)
         logger.info(
@@ -225,6 +212,28 @@ class CoinbaseKafkaConnector:
             len(batch),
             summary,
         )
+
+    async def _publish_profiles(self, batch_json: str) -> None:
+        """Fan the batch out to each subscribed profile (full book, and lean if asked)."""
+        deps = {"invoked_at": time.time()}
+        full = build_market_message(
+            fee_disclosure=self._fee_disclosure,
+            tickers_json=batch_json,
+            candle_book=self._candle_book,
+            product_ids=self._products,
+        )
+        await self._agent_gw.send(full, deps=deps)
+        if self._lean_gw is not None:
+            await self._lean_gw.send(
+                build_market_message(
+                    fee_disclosure=self._fee_disclosure,
+                    tickers_json=batch_json,
+                    candle_book=self._candle_book,
+                    product_ids=self._products,
+                    profile="lean",
+                ),
+                deps=deps,
+            )
 
     async def _periodic_agent_invoke(self) -> None:
         """Publish the latest snapshot on a fixed interval."""
@@ -342,7 +351,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def run(args: argparse.Namespace, agent_topic: str = AGENT_INPUT_TOPIC) -> None:
+async def run(
+    args: argparse.Namespace,
+    agent_topic: str = AGENT_INPUT_TOPIC,
+    lean_topic: str | None = AGENT_INPUT_TOPIC_LEAN,
+) -> None:
     # Load the fee rate (and products, when not given via CLI) from config, which
     # is the single source of truth shared with the tools node. load_config_strict
     # fails loud if the file exists but is invalid, rather than guessing the fee.
@@ -361,6 +374,7 @@ async def run(args: argparse.Namespace, agent_topic: str = AGENT_INPUT_TOPIC) ->
         products=products,
         fee_model=fee_model,
         min_publish_interval=args.min_interval,
+        lean_topic=lean_topic,
     )
 
     loop = asyncio.get_running_loop()

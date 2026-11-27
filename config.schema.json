@@ -14,9 +14,19 @@
           "type": "string"
         },
         "model": {
-          "description": "Model ID to use (e.g. 'gpt-5-nano', 'anthropic/claude-sonnet-4').",
-          "title": "Model",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          ],
+          "description": "Model ID to use (e.g. 'gpt-5-nano', 'anthropic/claude-sonnet-4'), or a list of IDs the agent round-robins across. Rate limits are charged per model, so a pool keeps trading while a throttled model rests.",
+          "title": "Model"
         },
         "max_workers": {
           "default": 1,
@@ -43,9 +53,19 @@
           "description": "Reasoning effort level for supported models.",
           "title": "Reasoning Effort"
         },
+        "payload": {
+          "default": "full",
+          "description": "Which market-message profile this agent consumes. 'full' carries every candle tier (daily/4h/15m/5m/1m); 'lean' carries the intraday tiers plus a compact higher-timeframe trend line \u2014 the same decisions for a minutes-horizon strategy at ~10% of the prompt tokens.",
+          "enum": [
+            "full",
+            "lean"
+          ],
+          "title": "Payload",
+          "type": "string"
+        },
         "strategy": {
           "default": "default",
-          "description": "Trading strategy (selects system prompt); must exist in arena/strategies.py.",
+          "description": "Trading strategy (selects system prompt).",
           "title": "Strategy",
           "type": "string",
           "enum": [
@@ -58,10 +78,6 @@
           ]
         },
         "markets": {
-          "default": [
-            "spot",
-            "perp"
-          ],
           "description": "Markets this agent's strategy is written for. Products outside this list are refused by the executor, so a spot prompt cannot accidentally open a short and a perp prompt cannot buy inventory.",
           "items": {
             "enum": [
@@ -71,7 +87,11 @@
             "type": "string"
           },
           "title": "Markets",
-          "type": "array"
+          "type": "array",
+          "default": [
+            "spot",
+            "perp"
+          ]
         }
       },
       "required": [
@@ -82,8 +102,112 @@
       "title": "AgentConfig",
       "type": "object"
     },
+    "ChurnConfig": {
+      "description": "Turnover guard: how much trading cost one agent may burn per hour.\n\nExists because of a measured incident \u2014 a scalper-perp agent booked 140 fills in\ntwo hours for $2.06 of fees (2% of a $100 wallet) against $0.10 of gross P&L. Every\ncorrect-and-profitable per-trade decision still lost money at that rate, so the\nguard limits the *rate* in paper as well as live. ``null`` disables one limit;\nreducing a position is always allowed regardless (see ``arena.trade_policy``).",
+      "properties": {
+        "max_fills_per_hour": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 6,
+          "description": "Fills per rolling hour, counting every fill including exits (each one pays the taker fee). Trades that add exposure are refused once the hour is full. null disables.",
+          "title": "Max Fills Per Hour"
+        },
+        "cooldown_seconds": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 60.0,
+          "description": "Quiet period after a fill in a product before the same product may be re-opened. Closing or trimming is never delayed. null disables.",
+          "title": "Cooldown Seconds"
+        },
+        "max_fee_burn_pct_per_hour": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0.25,
+          "description": "Fee budget per rolling hour as a percentage of equity. Once the hour's fees would exceed it, trades that add exposure are refused. 0.25 = 25 bps of equity per hour; null disables.",
+          "title": "Max Fee Burn Pct Per Hour"
+        }
+      },
+      "title": "ChurnConfig",
+      "type": "object"
+    },
+    "ExitFloorConfig": {
+      "description": "No-scratch-exit gate: refuse a close between the stop and the target.\n\nMeasured on the real ledger: 29 of 111 exit legs closed at 0-10 bps of profit\nagainst a 10 bps round trip, median move 0.00 bps \u2014 two taker fees paid to end up\nwhere the position started. Nothing in a per-order or per-hour gate can see that,\nbecause each fill is legal and cheap on its own; only the distance from the entry\nprice can. The stop and the target are the two honest ways out of a position, and\na close that is neither is a scratch. ``null`` on either bound disables the band\n(nothing to sit between); ``max_hold_seconds: null`` removes the timeout, so the\nband keeps applying to a stale position instead of releasing it.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Wire the exit floor into the order path. false leaves exits exactly as they were before the guard.",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "min_profit_bps": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 100.0,
+          "description": "Profit, in basis points from the entry price, at which a close is allowed. Below it the position has not earned its round trip. null disables the band.",
+          "title": "Min Profit Bps"
+        },
+        "stop_bps": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 50.0,
+          "description": "Loss, in basis points from the entry price, at which a close is allowed. Cutting a loss is never refused. null disables the band.",
+          "title": "Stop Bps"
+        },
+        "max_hold_seconds": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 3600.0,
+          "description": "Holding time after which the exit floor lets go, so a stale position is never trapped by a move that never happens. null removes the timeout.",
+          "title": "Max Hold Seconds"
+        }
+      },
+      "title": "ExitFloorConfig",
+      "type": "object"
+    },
     "FeeConfig": {
-      "description": "Trading fee configuration. All simulated fills cross the spread, so only\nthe taker rate is applied. Expressed in basis points (1 bps = 0.01%).\n\nDefault 60 bps matches Coinbase Advanced Trade's base-tier taker rate. Set to\n10 for Binance global (VIP 0), 40 for Kraken Pro, or 0 to disable.\n\n``perp_taker_bps`` is separate because a perpetual contract is a different\ninstrument: Binance USD\u24c8-M futures charge 5 bps at VIP 0 (spot charges 10), and\nthe venue bills the contract notional on the open as well as the close.",
+      "description": "Trading fee configuration. All simulated fills cross the spread, so only\nthe taker rate is applied. Expressed in basis points (1 bps = 0.01%).\n\nDefault 60 bps matches Coinbase Advanced Trade's base-tier taker rate. Set to\n10 for Binance global (VIP 0), 40 for Kraken Pro, or 0 to disable.",
       "properties": {
         "taker_bps": {
           "default": 60,
@@ -179,7 +303,7 @@
           ],
           "default": null,
           "description": "Operator note. Ignored by the engine.",
-          "title": " Comment"
+          "title": "Comment"
         },
         "accounts": {
           "additionalProperties": {
@@ -206,21 +330,21 @@
         "reserve_usdt": {
           "default": 0.0,
           "description": "Quote balance never allocated to agents (buffer for fees).",
-          "minimum": 0.0,
+          "minimum": 0,
           "title": "Reserve Usdt",
           "type": "number"
         },
         "balance_refresh_seconds": {
           "default": 30.0,
           "description": "How often the real balance is re-read for equity sync.",
-          "exclusiveMinimum": 0.0,
+          "exclusiveMinimum": 0,
           "title": "Balance Refresh Seconds",
           "type": "number"
         },
         "sync_tolerance_usdt": {
           "default": 1.0,
           "description": "Surplus smaller than this is treated as dust, not a deposit.",
-          "minimum": 0.0,
+          "minimum": 0,
           "title": "Sync Tolerance Usdt",
           "type": "number"
         },
@@ -246,8 +370,8 @@
         "max_order_pct_of_equity": {
           "default": 25.0,
           "description": "Per-order ceiling as a share of equity.",
-          "exclusiveMinimum": 0.0,
-          "maximum": 100.0,
+          "exclusiveMinimum": 0,
+          "maximum": 100,
           "title": "Max Order Pct Of Equity",
           "type": "number"
         },
@@ -280,8 +404,8 @@
         "max_daily_loss_pct": {
           "default": 10.0,
           "description": "Halt when session P&L falls this far below equity.",
-          "exclusiveMinimum": 0.0,
-          "maximum": 100.0,
+          "exclusiveMinimum": 0,
+          "maximum": 100,
           "title": "Max Daily Loss Pct",
           "type": "number"
         },
@@ -295,7 +419,7 @@
         "max_price_age_seconds": {
           "default": 5.0,
           "description": "Refuse to trade on a quote older than this.",
-          "exclusiveMinimum": 0.0,
+          "exclusiveMinimum": 0,
           "title": "Max Price Age Seconds",
           "type": "number"
         },
@@ -375,6 +499,12 @@
           "title": "Binance Perp Symbols",
           "type": "array"
         },
+        "perp_instrument_cache": {
+          "default": "data/instruments-binance-perp.json",
+          "description": "Cached fapi exchangeInfo rules for the perp products. Refresh with `uv run python -m arena.instruments --perp`.",
+          "title": "Perp Instrument Cache",
+          "type": "string"
+        },
         "coinbase_products": {
           "description": "Coinbase product IDs to subscribe to.",
           "items": {
@@ -389,12 +519,6 @@
           "title": "Instrument Cache",
           "type": "string"
         },
-        "perp_instrument_cache": {
-          "default": "data/instruments-binance-perp.json",
-          "description": "Cached fapi exchangeInfo rules for the perp products. Refresh with `uv run python -m arena.instruments --perp`.",
-          "title": "Perp Instrument Cache",
-          "type": "string"
-        },
         "paper": {
           "$ref": "#/$defs/PaperConfig",
           "description": "Paper-mode fill rules."
@@ -406,6 +530,14 @@
         "fees": {
           "$ref": "#/$defs/FeeConfig",
           "description": "Trading fees applied to every simulated fill."
+        },
+        "churn": {
+          "$ref": "#/$defs/ChurnConfig",
+          "description": "Turnover guard applied to every fill path (paper and live): hourly fill ceiling, per-product re-entry cooldown, and an hourly fee budget scaled to equity. Reducing exposure always bypasses it."
+        },
+        "exit_floor": {
+          "$ref": "#/$defs/ExitFloorConfig",
+          "description": "No-scratch-exit gate: a close is refused while the position sits between its stop and its target (or past the hold limit), so an agent cannot pay the round trip to end up where it started."
         }
       },
       "title": "TradingConfig",

@@ -34,6 +34,18 @@ class TradeRow(BaseModel):
     latency: float | None
 
 
+class TickRow(BaseModel):
+    """One market quote. The price path a band audit needs to answer
+    "did the target arrive before the stop, and inside the hold limit?"."""
+
+    timestamp: str
+    product_id: str
+    price: float
+    best_bid: float
+    best_ask: float
+    spread_bps: float
+
+
 class SnapshotRow(BaseModel):
     timestamp: str
     agent_id: str
@@ -64,9 +76,11 @@ class DataRecorder:
 
         trades_path = self._data_dir / f"trades_{session_ts}.csv"
         snapshots_path = self._data_dir / f"snapshots_{session_ts}.csv"
+        ticks_path = self._data_dir / f"ticks_{session_ts}.csv"
 
         self._trades_file = open(trades_path, "w", newline="", buffering=1)
         self._snapshots_file = open(snapshots_path, "w", newline="", buffering=1)
+        self._ticks_file = open(ticks_path, "w", newline="", buffering=1)
 
         self._trades_writer = csv.DictWriter(
             self._trades_file, fieldnames=list(TradeRow.model_fields.keys())
@@ -74,11 +88,16 @@ class DataRecorder:
         self._snapshots_writer = csv.DictWriter(
             self._snapshots_file, fieldnames=list(SnapshotRow.model_fields.keys())
         )
+        self._ticks_writer = csv.DictWriter(
+            self._ticks_file, fieldnames=list(TickRow.model_fields.keys())
+        )
 
         self._trades_writer.writeheader()
         self._trades_file.flush()
         self._snapshots_writer.writeheader()
         self._snapshots_file.flush()
+        self._ticks_writer.writeheader()
+        self._ticks_file.flush()
 
         self._snapshot_task: asyncio.Task[None] | None = None
 
@@ -112,6 +131,30 @@ class DataRecorder:
         )
         self._trades_writer.writerow(row.model_dump())
         self._trades_file.flush()
+
+    # ── Tick recording ───────────────────────────────────────────
+
+    def record_tick(
+        self, *, product_id: str, price: float | str, best_bid: float | str, best_ask: float | str
+    ) -> None:
+        """Record one quote, skipping rows whose prices cannot be read."""
+        try:
+            price_f, bid_f, ask_f = float(price), float(best_bid), float(best_ask)
+        except (TypeError, ValueError):
+            return
+        if not all(v > 0 for v in (price_f, bid_f, ask_f)):
+            return
+        mid = (bid_f + ask_f) / 2
+        row = TickRow(
+            timestamp=datetime.now().isoformat(),
+            product_id=product_id,
+            price=price_f,
+            best_bid=bid_f,
+            best_ask=ask_f,
+            spread_bps=(ask_f - bid_f) / mid * 1e4 if mid else 0.0,
+        )
+        self._ticks_writer.writerow(row.model_dump())
+        self._ticks_file.flush()
 
     # ── Snapshot recording ───────────────────────────────────────
 
@@ -197,4 +240,5 @@ class DataRecorder:
                 pass
         self._trades_file.close()
         self._snapshots_file.close()
+        self._ticks_file.close()
         logger.info("DataRecorder closed")

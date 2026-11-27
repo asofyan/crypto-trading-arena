@@ -23,7 +23,8 @@
       "strategy": "default",
       "markets": [
         "spot"
-      ]
+      ],
+      "payload": "full"
     },
     {
       "name": "claude",
@@ -33,7 +34,8 @@
       "strategy": "default",
       "markets": [
         "spot"
-      ]
+      ],
+      "payload": "full"
     },
     {
       "name": "scalper-perp",
@@ -43,7 +45,8 @@
       "strategy": "scalper-perp",
       "markets": [
         "perp"
-      ]
+      ],
+      "payload": "lean"
     }
   ],
   "trading": {
@@ -97,6 +100,19 @@
       "_comment": "Taker fee in basis points (1 bps = 0.01%). 60 = Coinbase Advanced Trade base tier. Set to 10 for Binance global VIP 0, or 0 to disable. perp_taker_bps applies to *-PERP products only (5 = Binance USD\u24c8-M VIP 0); run `uv run python -m exchanges.binance_perp` to stream those contracts.",
       "taker_bps": 60,
       "perp_taker_bps": 5
+    },
+    "churn": {
+      "_comment": "Turnover guard, wired into every fill path (paper and live). max_fills_per_hour counts every fill, exits included, because each one pays the taker fee. cooldown_seconds blocks re-opening the same product right after a fill. max_fee_burn_pct_per_hour is the hourly fee budget as a share of equity (0.25 = 25 bps/hour), scaled so a deposit raises it. Reducing a position is never blocked. null disables any one limit; these three come from an incident where 140 fills in two hours cost $2.06 of fees on $100 of equity to earn $0.10 gross.",
+      "max_fills_per_hour": 6,
+      "cooldown_seconds": 60,
+      "max_fee_burn_pct_per_hour": 0.25
+    },
+    "exit_floor": {
+      "_comment": "No-scratch-exit gate. A close is allowed at or beyond min_profit_bps of profit, at or beyond -stop_bps of loss (cutting a loss is never refused), or after max_hold_seconds so a stale position cannot be trapped. Anything in between pays the round trip to end up where the position started. Calibrate the band to the cost: EV is p*TP-(1-p)*SL-C, and a driftless random walk has p=SL/(TP+SL), so the band only pays if the strategy's hit rate beats that \u2014 a 50/25 band needs ~15 points of edge at a 10 bps round trip, 100/50 needs ~7. null on either bound disables the band; max_hold_seconds: null removes the timeout. enabled: false leaves exits unguarded.",
+      "enabled": true,
+      "min_profit_bps": 100.0,
+      "stop_bps": 50.0,
+      "max_hold_seconds": 3600.0
     }
   }
 }

@@ -60,6 +60,42 @@ For the full config schema with all fields, types, and defaults, see [`config.sc
 
 > **Note:** The Anthropic API is not OpenAI-compatible. To use Claude models, configure them via the `openrouter` provider or another OpenAI-compatible proxy.
 
+**Model pools (rate limits):** `model` takes either one ID or a list of IDs. A list
+turns the agent's model client into a round-robin pool (`arena/model_pool.py`): each
+inference goes to the next model in rotation, and a model that fails transiently
+(`429`, `403`/`404` for a model id this key cannot use, `408`/`409`, any 5xx, a
+connection failure) rests for the cooldown while the others keep trading. Rate limits
+are charged per model, so two models roughly double one agent's headroom:
+
+```json
+{ "name": "hy4-pool", "provider": "opencode-go",
+  "model": ["hy4-flash-free", "deepseek-v4.1-flash"] }
+```
+
+Every model in a pool answers the same strategy prompt with the same tools, so the
+agent cannot tell which one replied. A request-shaped rejection (a `400` from a
+malformed request) is *not* retried on another model — that is a bug to fix, not a
+quota to dodge. Pooled clients also run with the OpenAI SDK's own retries off, so the
+pool pays for failover instead of sleeping on `Retry-After`.
+
+On the command line, repeat `--model-id` to build a pool; an explicit `--model-id`
+overrides the config's `model` and prints a note (same rule as `--strategy`).
+See [ADR-0009](adr/0009-round-robin-model-pool.md).
+
+**Market-message profiles:** the connector publishes the market message twice — once
+complete on `agent_router.input`, once lean on `agent_router.input.lean`. `lean` keeps
+the three intraday candle tiers (15m/5m/1m, tiling the last three hours) plus a one-line
+per-product trend summary (4h EMA20 distance, 4h change, last daily change, monthly-range
+position). Measured: 20,633 → 2,399 tokens per tick, an 88% cut. Set it per agent:
+
+```json
+{ "name": "scalper-perp", "payload": "lean", "strategy": "scalper-perp" }
+```
+
+`full` remains the default, so swing-trend agents are unaffected. A minutes-horizon
+strategy reads the intraday tiers; the daily/4h tiers are 89% of the candle rows and
+exist for swing horizons.
+
 **API Key Formats:**
 - Environment variable: `"${OPENAI_API_KEY}"` - Reads from env var at runtime
 - Embedded key: `"sk-..."` - Key embedded directly in config (less secure)
@@ -87,7 +123,9 @@ Deploy an agent with an embedded model client and trading strategy. Can use expl
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--name` | Yes* | — | Agent name (consumer group + identity) |
-| `--model-id` | Yes* | — | Model ID (e.g. `gpt-5-nano`, `deepseek-chat`) |
+| `--model-id` | Yes* | — | Model ID (e.g. `gpt-5-nano`, `deepseek-chat`). Repeatable: each flag adds a model to the pool the agent round-robins across |
+| `--model-cooldown-seconds` | No | `30` | How long a server error (5xx/transport) sits a model out; a `429` rests it for `--model-rate-limit-cooldown-seconds` |
+| `--payload` | No | `full` | Market-message profile: `full` (every candle tier) or `lean` (intraday tables + trend line, ~88% fewer tokens). Defaults to the config's `payload` |
 | `--strategy` | Yes | — | Trading strategy: `default`, `momentum`, `brainrot`, or `scalper` |
 | `--bootstrap-servers` | Yes | — | Kafka broker address |
 | `--base-url` | No | OpenAI | Base URL for OpenAI-compatible providers |
@@ -118,6 +156,13 @@ uv run python -m deploy.agent \
     --base-url https://openrouter.ai/api/v1 \
     --api-key $OPENROUTER_API_KEY \
     --strategy default --bootstrap-servers localhost:9092
+
+# One agent, several models (rate-limit headroom)
+uv run python -m deploy.agent \
+    --name momentum-pool --model-id hy4-flash-free --model-id deepseek-v4.1-flash \
+    --base-url https://opencode.ai/inference/go/openai/v1 \
+    --api-key $OPENCODE_GO_API_KEY \
+    --strategy momentum --bootstrap-servers localhost:9092
 ```
 
 ---

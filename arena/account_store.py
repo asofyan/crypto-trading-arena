@@ -16,16 +16,20 @@ replay, portfolio monitor — agrees without extra wiring.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from datetime import datetime, timezone
 
-from arena.execution import Executor, FillRequest, PaperExecutor
+from arena.execution import Executor, FillRequest, PaperExecutor, clamp_flip_to_a_close
 from arena.fees import FeeModel
+from arena.hold_watchdog import StalePosition
+from arena.hold_watchdog import stale_positions as _stale_positions
 from arena.instruments import SymbolRules, is_perp_product
 from arena.ledger import Ledger
 from arena.models import AgentAccount, TradeLogEntry, TradeRecorder, TradeResult
 from arena.price_book import PriceBook
+from arena.trade_policy import ChurnGuard, ChurnLimits, ExitFloor, is_strict_reduce
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +68,14 @@ class AccountStore:
         self._price_book = price_book
         self._data_recorder: TradeRecorder | None = None
         self._fee_model = fee_model or FeeModel()
+        # Turnover guard for the order path. ``None`` (the default) keeps the pre-guard
+        # behaviour so a deployment that never opts in — and every existing test — is
+        # unchanged; deploy wires it from ``trading.churn``.
+        self._churn_guard: ChurnGuard | None = None
+        # Exit floor for the order path: refuses a close that lands between the position's
+        # stop and its target (see arena.trade_policy.ExitFloor). ``None`` (the default)
+        # keeps the pre-guard behaviour; deploy wires it from ``trading.exit_floor``.
+        self._exit_floor: ExitFloor | None = None
         self._ledger = ledger
         # One fill at a time: tool calls arrive from worker threads, and the
         # read-modify-write below plus ledger.save_fill must see a settled state.
@@ -129,7 +141,9 @@ class AccountStore:
             self.mark_ledger_healthy()
         log.info(
             "account_store.attach_ledger: hydrated %d account(s) and %d recent fill(s) from %s",
-            len(self._accounts), len(self._trade_log), ledger.path,
+            len(self._accounts),
+            len(self._trade_log),
+            ledger.path,
         )
 
     def mark_ledger_healthy(self) -> None:
@@ -148,6 +162,74 @@ class AccountStore:
     def set_fee_model(self, fee_model: FeeModel) -> None:
         """Replace the active fee model. Used by deploy entrypoints after CLI/config resolution."""
         self._fee_model = fee_model
+
+    def set_churn_limits(self, limits: ChurnLimits | None) -> None:
+        """Install the turnover guard, or ``None`` to disable it (the default).
+
+        Installs a fresh ``ChurnGuard``, so call it at startup: re-calling it resets the
+        rolling hour, and a guard with no memory would let the first fill of every
+        restart through a budget the previous process had already spent.
+        """
+        self._churn_guard = None if limits is None else ChurnGuard(limits)
+
+    def set_exit_floor(self, floor: ExitFloor | None) -> None:
+        """Install the no-scratch-exit gate, or ``None`` to disable it (the default).
+
+        Stateless, unlike ``set_churn_limits``: the floor holds no history, so it can be
+        swapped at any point without forgetting anything a restart would have kept.
+        """
+        self._exit_floor = floor
+
+    def close_position(
+        self, agent_id: str, product_id: str, *, latency: float | None = None
+    ) -> TradeResult:
+        """Flatten whatever is open right now, sized under the same lock that books it.
+
+        The watchdog knows *which* position is stale; it must not decide the *size*.
+        A read that is one fill out of date turns a close into an opening order on the
+        other side — a long of 8.0 read at 8.0 and closed by the agent while the
+        watchdog was between calls becomes a short of 8.0, with a fresh hold clock and
+        the exit floor unable to touch it. Re-reading here, inside the lock the fill is
+        booked under, is what makes "close" mean close.
+
+        Nothing to close is a refusal, not a success: the caller asked for a fill and
+        none went out. It is also the only safe answer — an order that opens a position
+        because the book was already flat is the bug this method exists to prevent.
+
+        In live mode the venue call happens while this lock is held, which is the price
+        of sizing and booking under one writer; the hold watchdog calls this from a
+        worker thread so the event loop is not the one waiting on the order.
+        """
+        product_id = product_id.upper().strip()
+        with self._write_lock:
+            account = self._accounts.get(agent_id)
+            position = account.positions.get(product_id, 0.0) if account is not None else 0.0
+            if not math.isfinite(position) or abs(position) <= _QTY_EPSILON:
+                return TradeResult(
+                    False,
+                    f"Nothing to close: {agent_id} is flat on {product_id}.",
+                )
+            return self.execute_trade(
+                agent_id,
+                product_id,
+                abs(position),
+                "sell" if position > 0 else "buy",
+                latency,
+            )
+
+    def stale_positions(
+        self, hold_limit_s: float | None, *, now: float | None = None
+    ) -> list[StalePosition]:
+        """The positions past ``hold_limit_s``, as the closes that would end them.
+
+        The quantity on each result is **diagnostic**: the close is sized again by
+        :meth:`close_position` under the booking lock, because this read releases it.
+        """
+        timestamp = datetime.now().timestamp() if now is None else now
+        with self._write_lock:
+            return _stale_positions(
+                self._accounts, hold_limit_s=hold_limit_s, now=timestamp
+            )
 
     @property
     def instrument_rules(self) -> dict[str, SymbolRules]:
@@ -209,7 +291,9 @@ class AccountStore:
             after = account.portfolio_value(self._price_book)
         log.info(
             "account_store: equity adjustment agent=%s amount=%+.2f cash=%.2f",
-            agent_id, amount, account.cash,
+            agent_id,
+            amount,
+            account.cash,
         )
         return before, after
 
@@ -255,10 +339,224 @@ class AccountStore:
         ``replay`` books a fill that already happened elsewhere (the CSV the arena wrote)
         and therefore skips the leverage gate: the recorded fill is the truth, and
         re-deriving margin from a partially reconstructed price book would reject it.
+        A replay skips the churn guard and the exit floor for the same reason — it is
+        history, not a new decision, and refusing it would silently drop a fill from the
+        ledger.
         """
+        if not replay:
+            blocked = self._preadmission_rejection(agent_id, product_id, quantity, action)
+            if blocked is not None:
+                gate, rejection = blocked
+                log.info(
+                    "account_store.execute_trade REJECT (%s): agent=%s action=%s "
+                    "product=%s qty=%s — %s",
+                    gate,
+                    agent_id,
+                    action,
+                    product_id,
+                    quantity,
+                    rejection.message,
+                )
+                return rejection
         return self._executor.execute(
             FillRequest(agent_id, product_id, quantity, action, latency, replay=replay)
         )
+
+    def _preadmission_rejection(
+        self, agent_id: str, product_id: str, quantity: float, action: str
+    ) -> tuple[str, TradeResult] | None:
+        """Ask every order-path gate about this fill; ``None`` means it may go out.
+
+        Both gates are asked under one lock acquisition, before the executor runs and
+        not for it: a gate must never hold every other agent behind a venue round-trip,
+        so two intents racing the same window can both pass. The fill after them is the
+        one a stateful gate stops; the exit floor has no state and is decided by the
+        account, which only one writer can touch at a time anyway.
+
+        Churn is asked first because its refusals are the ones an agent addresses by
+        trading less, and it never refuses a reduce — so in practice each gate owns a
+        disjoint set of fills and only a flip is judged by both.
+        """
+        with self._write_lock:
+            if self._churn_guard is not None:
+                rejection = self._churn_rejection(agent_id, product_id, quantity, action)
+                if rejection is not None:
+                    return "churn", rejection
+            if self._exit_floor is not None:
+                rejection = self._exit_floor_rejection(agent_id, product_id, quantity, action)
+                if rejection is not None:
+                    return "exit floor", rejection
+        return None
+
+    def _churn_rejection(
+        self, agent_id: str, product_id: str, quantity: float, action: str
+    ) -> TradeResult | None:
+        """The guard's verdict as a refusal, or ``None`` when the fill may go out.
+
+        The store owns this translation because only it knows the position the fill
+        would change and the fee the fee model would charge: the guard is told both, so
+        it can keep judging *rate* instead of re-deriving account state.
+
+        An action other than buy/sell is not judged here — the executor already owns
+        that message, and a churn complaint about a typo would only confuse the agent.
+        """
+        guard = self._churn_guard
+        if guard is None:
+            return None
+        action = action.lower().strip()
+        if action not in ("buy", "sell"):
+            return None
+        product_id = product_id.upper().strip()
+        perp = is_perp_product(product_id)
+
+        account = self._accounts.get(agent_id)
+        pos_now = account.positions.get(product_id, 0.0) if account is not None else 0.0
+
+        # ``is_strict_reduce`` is the definition of an exit for a signed net position:
+        # closing, trimming and shrinking a short all qualify, while a flip past zero
+        # does not — however much smaller it leaves the book, it is a decision to be
+        # short (or long), so it pays for the cooldown and the fill budget like the
+        # new position it is. Spot has no short, so a sell is always an exit there and a
+        # buy can never be one.
+        if perp:
+            # The executor may clamp an overshooting close down to the close it mostly
+            # is, and the gate has to judge the same order the book will see: reading
+            # the raw 8.9 against a long of 8.8 calls a close a flip and refuses it.
+            reduces = is_strict_reduce(
+                pos_now,
+                self._bookable_quantity(product_id, pos_now, quantity, action),
+                action,
+            )
+        else:
+            reduces = action == "sell"
+
+        # No mark means no fee estimate, and the guard falls back to the fill count and
+        # the cooldown: refusing to quote a fee is not a reason to skip the rate limits.
+        fee_estimate = 0.0
+        entry = self._price_book.get(product_id)
+        quote = None
+        if entry is not None:
+            quote = entry.get("best_ask" if action == "buy" else "best_bid")
+            if quote is None:
+                quote = entry.get("price")
+        if (
+            quote is not None
+            and math.isfinite(quantity)
+            and quantity > 0
+            and math.isfinite(float(quote))
+            and float(quote) > 0
+        ):
+            fee_estimate = self._fee_model.fee(float(quote) * quantity, perp=perp)
+
+        equity = account.portfolio_value(self._price_book) if account is not None else 0.0
+        verdict = guard.check(
+            agent_id=agent_id,
+            product_id=product_id,
+            fee_estimate=fee_estimate,
+            equity=equity,
+            reduces_exposure=reduces,
+        )
+        return None if verdict.allowed else TradeResult(False, verdict.reason)
+
+    def _exit_floor_rejection(
+        self, agent_id: str, product_id: str, quantity: float, action: str
+    ) -> TradeResult | None:
+        """The exit floor's verdict as a refusal, or ``None`` when the fill may go out.
+
+        The store answers the two questions only it can: how far the position has moved
+        from its entry, and how long it has held. It measures the move at the price the
+        fill would actually get (the bid for a sell, the ask for a buy) so the number the
+        floor judges is the number the close would realise, not a mid-price fantasy.
+
+        **A fill is judged when it closes an old lot, not when it shrinks the position.**
+        ``pos_old != 0 and (pos_old > 0) != (delta > 0)`` is the whole rule, and it is
+        deliberately wider than ``reduces_exposure``: selling *more* than a long closes
+        the old lot and opens a short, so a flip at +5 bps is a scratch exit dressed up
+        as a new position. Opening, adding, and anything that leaves every old lot
+        untouched are never judged.
+
+        Fails open on every input it cannot trust — a zero/missing cost basis, a flat
+        position, a missing entry time (a legacy row the ledger has no timestamp for; a
+        hydrated position keeps the one it was saved with), a missing or non-finite
+        quote. Refusing a close because a record is
+        incomplete is how a guard turns a guard into a trap.
+        """
+        floor = self._exit_floor
+        if floor is None:
+            return None
+        action = action.lower().strip()
+        if action not in ("buy", "sell"):
+            return None  # the executor owns the message for a typo
+        product_id = product_id.upper().strip()
+
+        account = self._accounts.get(agent_id)
+        if account is None:
+            return None
+        pos_old = account.positions.get(product_id, 0.0)
+        if abs(pos_old) <= _QTY_EPSILON:
+            return None
+        delta = quantity if action == "buy" else -quantity
+        if (pos_old > 0) == (delta > 0):
+            return None  # opening or adding on the same side: no old lot is closed
+
+        basis = account.cost_basis.get(product_id, 0.0)
+        if not math.isfinite(basis) or basis == 0.0:
+            return None
+        entry = basis / pos_old  # both signed, so the entry price is positive
+        if not math.isfinite(entry) or entry <= 0:
+            return None
+
+        entry_ts = account.avg_entry_ts.get(product_id)
+        if entry_ts is None or not math.isfinite(entry_ts):
+            return None
+
+        quote = self._exit_quote(product_id, action)
+        if quote is None:
+            return None
+        bps_move = (
+            (quote - entry) / entry * 10_000.0
+            if pos_old > 0
+            else (entry - quote) / entry * 10_000.0
+        )
+        held_seconds = datetime.now().timestamp() - entry_ts
+
+        verdict = floor.check(bps_move=bps_move, held_seconds=held_seconds)
+        return None if verdict.allowed else TradeResult(False, verdict.reason)
+
+    def _bookable_quantity(
+        self, product_id: str, position: float, quantity: float, action: str
+    ) -> float:
+        """The size the executor will book, so a gate can judge that and not the intent.
+
+        Today the one rewrite is a perp flip whose opening leg is under the venue's
+        minimum notional: the executor books it as a close (``clamp_flip_to_a_close``).
+        A gate that skipped this would see a flip where the book sees an exit.
+        """
+        rules = self._instrument_rules.get(product_id)
+        if rules is None:
+            return quantity
+        price = self._exit_quote(product_id, action)
+        if price is None:
+            return quantity
+        return clamp_flip_to_a_close(
+            quantity, position=position, action=action, price=price, rules=rules
+        )
+
+    def _exit_quote(self, product_id: str, action: str) -> float | None:
+        """The touch this fill would cross, or ``None`` when the book cannot say."""
+        entry = self._price_book.get(product_id)
+        if entry is None:
+            return None
+        quote = entry.get("best_bid" if action == "sell" else "best_ask")
+        if quote is None:
+            quote = entry.get("price")
+        try:
+            quote = float(quote)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(quote) or quote <= 0:
+            return None
+        return quote
 
     def apply_fill(
         self,
@@ -292,8 +590,18 @@ class AccountStore:
         """
         with self._write_lock:
             return self._apply_fill_locked(
-                agent_id, action, product_id, quantity, price, fee, latency, fee_bps,
-                client_order_id, fee_asset, venue_order_id, enforce_margin,
+                agent_id,
+                action,
+                product_id,
+                quantity,
+                price,
+                fee,
+                latency,
+                fee_bps,
+                client_order_id,
+                fee_asset,
+                venue_order_id,
+                enforce_margin,
             )
 
     def _apply_fill_locked(
@@ -323,13 +631,15 @@ class AccountStore:
                 "account_store.apply_fill: %s is already booked; ignoring replay",
                 client_order_id,
             )
-            return TradeResult(
-                False, f"Order {client_order_id} was already booked; nothing to do."
-            )
+            return TradeResult(False, f"Order {client_order_id} was already booked; nothing to do.")
         log.debug(
-            "account_store.apply_fill ENTER: agent=%s action=%s product=%s qty=%s "
-            "price=%s fee=%s",
-            agent_id, action, product_id, quantity, price, fee,
+            "account_store.apply_fill ENTER: agent=%s action=%s product=%s qty=%s price=%s fee=%s",
+            agent_id,
+            action,
+            product_id,
+            quantity,
+            price,
+            fee,
         )
 
         if action not in ("buy", "sell"):
@@ -346,8 +656,18 @@ class AccountStore:
             # (no selling what you do not hold, fees capitalised into basis) would
             # read a short as a negative holding and reject every close.
             return self._apply_perp_fill_locked(
-                agent_id, action, product_id, quantity, price, fee, latency, fee_rate,
-                client_order_id, fee_asset, venue_order_id, enforce_margin,
+                agent_id,
+                action,
+                product_id,
+                quantity,
+                price,
+                fee,
+                latency,
+                fee_rate,
+                client_order_id,
+                fee_asset,
+                venue_order_id,
+                enforce_margin,
             )
 
         if action == "buy":
@@ -357,7 +677,10 @@ class AccountStore:
                 log.debug(
                     "account_store.apply_fill REJECT: insufficient cash "
                     "need=%.2f (incl fee=%.2f) have=%.2f agent=%s",
-                    cash_out, fee, account.cash, agent_id,
+                    cash_out,
+                    fee,
+                    account.cash,
+                    agent_id,
                 )
                 return TradeResult(
                     False,
@@ -365,18 +688,14 @@ class AccountStore:
                     f"(${notional:,.2f} + ${fee:,.2f} fee) "
                     f"but only have ${account.cash:,.2f}.",
                 )
-            if enforce_margin and any(
-                is_perp_product(pid) for pid in account.positions
-            ):
+            if enforce_margin and any(is_perp_product(pid) for pid in account.positions):
                 # A perp short credits its notional to cash, so "can I afford it" no
                 # longer implies "is it 1:1": this buy could be funded by borrow-shaped
                 # proceeds and push gross notional past equity. A pure spot book needs no
                 # check (cash >= notional already implies gross <= equity), so this
                 # leaves spot-only deployments — and their quotes — untouched.
                 positions_after = dict(account.positions)
-                positions_after[product_id] = (
-                    account.positions.get(product_id, 0.0) + quantity
-                )
+                positions_after[product_id] = account.positions.get(product_id, 0.0) + quantity
                 rejection = self._leverage_rejection(
                     account,
                     positions_after,
@@ -389,24 +708,40 @@ class AccountStore:
             account.cash -= cash_out
             existing_qty = account.positions.get(product_id, 0)
             now_ts = datetime.now().timestamp()
-            existing_ts = account.avg_entry_ts.get(product_id, now_ts)
-            account.avg_entry_ts[product_id] = (existing_qty * existing_ts + quantity * now_ts) / (
-                existing_qty + quantity
-            )
+            # An add keeps the clock the position already had: the hold limit measures
+            # how long the exposure has existed, and a dust add that renewed it would
+            # make the limit optional. A fresh position starts here.
+            account.avg_entry_ts.setdefault(product_id, now_ts)
             account.positions[product_id] = existing_qty + quantity
             # Capitalize the fee into cost basis: cost basis = notional + fee = cash_out
             account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) + cash_out
             account.total_fees_paid += fee
             account.trade_count += 1
             self._record_trade(
-                agent_id, action, product_id, quantity, price, fee, latency,
-                client_order_id, fee_asset, venue_order_id,
+                agent_id,
+                action,
+                product_id,
+                quantity,
+                price,
+                fee,
+                latency,
+                client_order_id,
+                fee_asset,
+                venue_order_id,
+                replay=not enforce_margin,
             )
             log.debug(
                 "account_store.apply_fill BUY OK: agent=%s %s %s @ $%.2f "
                 "notional=$%.2f fee=$%.2f cash_after=$%.2f positions=%s trade_count=%d",
-                agent_id, quantity, product_id, price,
-                notional, fee, account.cash, dict(account.positions), account.trade_count,
+                agent_id,
+                quantity,
+                product_id,
+                price,
+                notional,
+                fee,
+                account.cash,
+                dict(account.positions),
+                account.trade_count,
             )
             return TradeResult(
                 True,
@@ -424,7 +759,10 @@ class AccountStore:
             log.debug(
                 "account_store.apply_fill REJECT: insufficient holdings "
                 "want=%s held=%s product=%s agent=%s",
-                quantity, held, product_id, agent_id,
+                quantity,
+                held,
+                product_id,
+                agent_id,
             )
             return TradeResult(
                 False,
@@ -452,14 +790,30 @@ class AccountStore:
             account.positions[product_id] = new_qty
         account.trade_count += 1
         self._record_trade(
-            agent_id, action, product_id, quantity, price, fee, latency,
-            client_order_id, fee_asset, venue_order_id,
+            agent_id,
+            action,
+            product_id,
+            quantity,
+            price,
+            fee,
+            latency,
+            client_order_id,
+            fee_asset,
+            venue_order_id,
+            replay=not enforce_margin,
         )
         log.debug(
             "account_store.apply_fill SELL OK: agent=%s %s %s @ $%.2f "
             "notional=$%.2f fee=$%.2f cash_after=$%.2f positions=%s trade_count=%d",
-            agent_id, quantity, product_id, price,
-            notional, fee, account.cash, dict(account.positions), account.trade_count,
+            agent_id,
+            quantity,
+            product_id,
+            price,
+            notional,
+            fee,
+            account.cash,
+            dict(account.positions),
+            account.trade_count,
         )
         return TradeResult(
             True,
@@ -545,9 +899,7 @@ class AccountStore:
         closed_qty = min(abs(delta), abs(pos_old)) if closing else 0.0
         closed_signed = (-closed_qty if pos_old > 0 else closed_qty) if closing else 0.0
         closed_pnl = (
-            closed_qty * (price - entry_old) * (1.0 if pos_old > 0 else -1.0)
-            if closed_qty
-            else 0.0
+            closed_qty * (price - entry_old) * (1.0 if pos_old > 0 else -1.0) if closed_qty else 0.0
         )
 
         remainder = delta - closed_signed
@@ -570,19 +922,25 @@ class AccountStore:
                 # The old lot is fully gone (opened fresh or flipped): this is a new
                 # position, so its holding time starts now.
                 account.avg_entry_ts[product_id] = now_ts
-            elif pos_old and closed_qty:
-                # Partial reduce: the remaining units keep their original entry time.
-                account.avg_entry_ts.setdefault(product_id, now_ts)
             else:
-                # Opening or adding: weight by |qty| so the denominator can never be 0.
-                previous_ts = account.avg_entry_ts.get(product_id, now_ts)
-                account.avg_entry_ts[product_id] = (
-                    abs(pos_old) * previous_ts + abs(delta) * now_ts
-                ) / (abs(pos_old) + abs(delta))
+                # Partial reduce, opening, or adding: the clock is the age of the
+                # *exposure*, not the average age of its lots. Averaging let a 0.01 add
+                # renew the hold, so a position could sit inside the floor's band
+                # forever and never reach its escape hatch.
+                account.avg_entry_ts.setdefault(product_id, now_ts)
 
         self._record_trade(
-            agent_id, action, product_id, quantity, price, fee, latency,
-            client_order_id, fee_asset, venue_order_id,
+            agent_id,
+            action,
+            product_id,
+            quantity,
+            price,
+            fee,
+            latency,
+            client_order_id,
+            fee_asset,
+            venue_order_id,
+            replay=not enforce_margin,
         )
 
         gross_now = self._gross_notional(account.positions)
@@ -605,14 +963,22 @@ class AccountStore:
         cash_note = (
             f"paid ${notional + fee:,.2f} (${notional:,.2f} + ${fee:,.2f} fee{fee_rate})"
             if delta > 0
-            else f"received ${notional - fee:,.2f} "
-            f"(${notional:,.2f} − ${fee:,.2f} fee{fee_rate})"
+            else f"received ${notional - fee:,.2f} (${notional:,.2f} − ${fee:,.2f} fee{fee_rate})"
         )
         log.debug(
             "account_store.apply_fill PERP OK: agent=%s %s %s %s @ $%.6f "
             "pos %.6f -> %.6f cash=%.2f gross=%s equity=%.2f realized=%+.2f",
-            agent_id, action, quantity, product_id, price, pos_old, pos_new,
-            account.cash, gross_text, equity_now, closed_pnl - fee,
+            agent_id,
+            action,
+            quantity,
+            product_id,
+            price,
+            pos_old,
+            pos_new,
+            account.cash,
+            gross_text,
+            equity_now,
+            closed_pnl - fee,
         )
         return TradeResult(
             True,
@@ -682,7 +1048,8 @@ class AccountStore:
             if age > _MARK_STALENESS_SECONDS:
                 log.warning(
                     "account_store: refusing to size leverage on a %.0fs-old %s quote",
-                    age, product_id,
+                    age,
+                    product_id,
                 )
                 return None
         return float(entry["price"])
@@ -741,12 +1108,28 @@ class AccountStore:
         client_order_id: str | None = None,
         fee_asset: str | None = None,
         venue_order_id: str | None = None,
+        replay: bool = False,
     ) -> None:
+        # Every freshly booked fill arrives here — spot buy, spot sell, perp — and a
+        # rejected one never does. That is exactly the population the churn guard
+        # budgets: money actually paid for turnover, not intent.
+        #
+        # ``replay`` fills are excluded. They were paid by an earlier process and were
+        # already budgeted then; stamping them with the current clock would spend a fresh
+        # hour's budget on history and freeze an agent that has not traded yet.
+        if self._churn_guard is not None and not replay:
+            self._churn_guard.record(agent_id=agent_id, product_id=product_id, fee=fee)
         now = datetime.now()
         self._trade_log.append(
             TradeLogEntry(
                 now.strftime("%H:%M:%S"),
-                agent_id, action, product_id, quantity, price, fee, latency,
+                agent_id,
+                action,
+                product_id,
+                quantity,
+                price,
+                fee,
+                latency,
             )
         )
 
@@ -815,5 +1198,8 @@ class AccountStore:
                 log.exception(
                     "account_store: ledger write FAILED for agent=%s %s %s qty=%s — "
                     "this fill is in memory only; the ledger is now behind",
-                    agent_id, action, product_id, quantity,
+                    agent_id,
+                    action,
+                    product_id,
+                    quantity,
                 )

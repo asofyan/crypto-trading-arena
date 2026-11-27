@@ -483,3 +483,78 @@ def test_committed_schema_documents_live_mode():
         "max_price_age_seconds",
     ):
         assert key in live
+
+
+# ── Model pool (one agent, several models) ───────────────────────
+
+
+def test_agent_config_takes_a_model_pool():
+    agent = AgentConfig(name="a", provider="openai", model=["gpt-5-nano", "gpt-5-mini"])
+
+    assert agent.model_ids == ["gpt-5-nano", "gpt-5-mini"]
+
+
+def test_agent_config_wraps_a_lone_model_into_the_pool():
+    agent = AgentConfig(name="a", provider="openai", model="gpt-5-nano")
+
+    assert agent.model_ids == ["gpt-5-nano"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "",
+        [],
+        ["gpt-5-nano", ""],
+        ["gpt-5-nano", "gpt-5-nano"],
+    ],
+)
+def test_agent_config_rejects_an_unusable_model_pool(model):
+    with pytest.raises(ValidationError):
+        AgentConfig(name="a", provider="openai", model=model)
+
+
+def test_committed_schema_matches_the_generated_model_field():
+    """The committed schema is hand-maintained; pin the one field we edited by hand."""
+    generated = ArenaConfig.model_json_schema()["$defs"]["AgentConfig"]["properties"]["model"]
+    committed = json.loads(Path("config.schema.json").read_text())
+
+    assert committed["$defs"]["AgentConfig"]["properties"]["model"] == generated
+
+
+def test_committed_schema_offers_a_model_pool():
+    schema = json.loads(Path("config.schema.json").read_text())
+
+    model = schema["$defs"]["AgentConfig"]["properties"]["model"]
+    shapes = [option.get("type") for option in model.get("anyOf", [model])]
+
+    assert shapes == ["string", "array"]
+
+
+# ── Market-message profile per agent ─────────────────────────────
+
+
+def test_agent_config_payload_defaults_to_the_full_market_message():
+    agent = AgentConfig(name="a", provider="p", model="m")
+
+    assert agent.payload == "full"
+
+
+def test_agent_config_accepts_the_lean_payload():
+    agent = AgentConfig(name="a", provider="p", model="m", payload="lean")
+
+    assert agent.payload == "lean"
+
+
+def test_agent_config_rejects_an_unknown_payload():
+    with pytest.raises(ValidationError):
+        AgentConfig(name="a", provider="p", model="m", payload="tiny")
+
+
+def test_committed_schema_documents_the_payload_profiles():
+    schema = json.loads(Path("config.schema.json").read_text())
+
+    payload = schema["$defs"]["AgentConfig"]["properties"]["payload"]
+
+    assert payload["enum"] == ["full", "lean"]
+    assert payload["default"] == "full"

@@ -151,6 +151,51 @@ async def test_publish_latest_includes_fee_and_essential_ticker_fields():
     assert '"time"' not in prompt
 
 
+def _coinbase_candles(rows_by_granularity):
+    """A CandleBook with `n` synthetic rising candles per granularity."""
+    from arena.price_book import CandleBook
+
+    book = CandleBook()
+    for granularity, count in rows_by_granularity.items():
+        rows = [
+            [1_700_000_000 + i * granularity, 100 + i, 101 + i, 99 + i, 100 + i, 5]
+            for i in range(count)
+        ]
+        book.update_from_api("BTC-USD", granularity, rows)
+    return book
+
+
+async def test_publish_latest_sends_a_lean_message_to_the_lean_topic():
+    """Two profiles off one publish: swing-trend keeps the full book, the scalper does not."""
+    client = _FakeClient()
+    candles = _coinbase_candles({86400: 5, 14400: 25, 900: 6, 300: 14, 60: 20})
+    conn = CoinbaseKafkaConnector(
+        client, "full.topic", ["BTC-USD"], FeeModel(0), candle_book=candles, lean_topic="lean.topic"
+    )
+    conn._latest = {"BTC-USD": _ticker()}
+
+    await conn._publish_latest()
+
+    prompts = {inv["topic"]: inv["user_prompt"] for inv in client.invocations}
+    assert set(prompts) == {"full.topic", "lean.topic"}
+    full, lean = prompts["full.topic"], prompts["lean.topic"]
+    assert "1-daily" in full and "4-hour" in full
+    assert "1-daily" not in lean and "4-hour candles" not in lean
+    assert "intraday" in lean.lower()
+    assert "Trend context" in lean and "EMA20" in lean
+    assert len(lean) < len(full), "the lean payload must actually be smaller"
+
+
+async def test_publish_latest_stays_single_message_without_a_lean_topic():
+    client = _FakeClient()
+    conn = CoinbaseKafkaConnector(client, "full.topic", ["BTC-USD"], FeeModel(0))
+    conn._latest = {"BTC-USD": _ticker()}
+
+    await conn._publish_latest()
+
+    assert len(client.invocations) == 1
+
+
 async def test_publish_latest_noop_when_no_tickers():
     client = _FakeClient()
     conn = CoinbaseKafkaConnector(client, "t", ["BTC-USD"], FeeModel(0))
@@ -543,8 +588,8 @@ async def test_binance_perp_entrypoint_pins_the_futures_venue(monkeypatch):
 
     seen: dict = {}
 
-    async def fake_run(args, *, venue=None, agent_topic=None):
-        seen.update(args=args, venue=venue, agent_topic=agent_topic)
+    async def fake_run(args, *, venue=None, agent_topic=None, lean_topic=None):
+        seen.update(args=args, venue=venue, agent_topic=agent_topic, lean_topic=lean_topic)
 
     monkeypatch.setattr(bp, "binance_run", fake_run)
     args = SimpleNamespace()
@@ -553,6 +598,9 @@ async def test_binance_perp_entrypoint_pins_the_futures_venue(monkeypatch):
 
     assert seen["args"] is args
     assert seen["venue"] is bn.PERP_VENUE
+    # The perp connector is the one that feeds a lean scalper at all: losing this
+    # forward leaves every `payload: lean` agent starving with no error.
+    assert seen["lean_topic"] == bp.AGENT_INPUT_TOPIC_LEAN
     assert bp.parse_args([]).min_interval == 15.0
 
 
@@ -657,3 +705,46 @@ async def test_the_board_is_ignored_while_the_socket_is_delivering():
     await conn._on_board_quote(ticker)
     assert conn._latest["XRPUSDT-PERP"] is ticker
     assert published and published[0][0] is ticker
+
+
+def test_the_lean_topic_is_a_stable_wire_contract():
+    """Independently deployed connectors and agents meet on this string."""
+    from exchanges import AGENT_INPUT_TOPIC, AGENT_INPUT_TOPIC_LEAN
+
+    assert AGENT_INPUT_TOPIC == "agent_router.input"
+    assert AGENT_INPUT_TOPIC_LEAN == "agent_router.input.lean"
+
+
+async def test_binance_run_subscribes_both_profiles(monkeypatch):
+    """The seam that actually decides whether a lean agent ever gets a message."""
+    from types import SimpleNamespace
+
+    import exchanges.binance as bn
+    from config import ArenaConfig
+    from exchanges import AGENT_INPUT_TOPIC, AGENT_INPUT_TOPIC_LEAN
+
+    captured: dict = {}
+
+    class FakeConnector:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def start(self):
+            return None
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bn, "BinanceKafkaConnector", FakeConnector)
+    monkeypatch.setattr(bn, "Client", SimpleNamespace(connect=lambda *a, **k: object()))
+    monkeypatch.setattr("config.load_config_strict", lambda path: ArenaConfig())
+
+    args = SimpleNamespace(
+        config="config.json", bootstrap_servers="b:9092", symbols=["ZECUSDT"],
+        min_interval=60.0, board_interval=0.0,
+    )
+
+    await bn.run(args)
+
+    assert captured["agent_topic"] == AGENT_INPUT_TOPIC
+    assert captured["lean_topic"] == AGENT_INPUT_TOPIC_LEAN

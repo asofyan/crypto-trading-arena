@@ -19,12 +19,14 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Callable, Protocol
 from uuid import uuid4
 
 from arena.instruments import SymbolRules, is_perp_product
 from arena.models import TradeResult
 from arena.risk import PortfolioSnapshot, RiskGates
+from arena.trade_policy import is_strict_reduce
 from exchanges.binance_spot import (
     BinanceApiError,
     BinanceSpotClient,
@@ -45,6 +47,35 @@ log = logging.getLogger(__name__)
 
 # Below this, a position is float dust rather than a holding.
 _QUANTITY_DUST = 1e-9
+
+
+def clamp_flip_to_a_close(
+    quantity: float, *, position: float, action: str, price: float, rules: SymbolRules
+) -> float:
+    """Drop a flip's opening leg when the venue floor cannot represent it.
+
+    Selling 8.9 against a long of 8.8 does not open "short 0.1": it books a close and
+    opens a $0.92 short under a $20 minimum, which no later order can flatten. The
+    order is therefore rounded down to the close it mostly was. The flip is not lost —
+    the agent can open it deliberately on the next tick, and that order will be sized
+    like an opening rather than left over from one.
+
+    The quantity returned is the position as booked, which the caller then floors to the
+    venue step. Fills booked here are always on-step, so that floor is exact; a book
+    hydrated from a legacy ledger can hold a sub-step residue that no order can express,
+    and the caller names that case instead of silently looping on it.
+    """
+    if rules is None or not math.isfinite(quantity) or quantity <= 0:
+        return quantity
+    if abs(position) <= _QUANTITY_DUST:
+        return quantity
+    delta = quantity if action == "buy" else -quantity
+    if (position > 0) == (delta > 0) or abs(delta) <= abs(position) + _QUANTITY_DUST:
+        return quantity  # adding, or closing at most the whole lot: no new side opens
+    opening = abs(delta) - abs(position)
+    if rules.notional_ok(Decimal(repr(opening)), price):
+        return quantity
+    return abs(position)
 
 
 @dataclass(frozen=True)
@@ -134,6 +165,9 @@ class PaperExecutor:
         # a deployment trading Coinbase products, or one started without an instrument
         # cache, must keep working exactly as before.
         rules = self._store.instrument_rules.get(product_id)
+        position = self._store.get_or_create(request.agent_id).positions.get(
+            product_id, 0.0
+        )
         if rules is not None:
             quantized = rules.quantize(quantity)
             if quantized is None:
@@ -143,7 +177,35 @@ class PaperExecutor:
                     f"{rules.min_qty:g}; {quantity:g} is not orderable. "
                     f"Round down to a multiple of {rules.step_size:g}.",
                 )
-            if not rules.notional_ok(quantized, price):
+            order_qty = float(quantized)
+            # Only a perp can flip. On spot, "sell more than you hold" is an error the
+            # agent should see, not an overshoot to round down.
+            if perp:
+                clamped = clamp_flip_to_a_close(
+                    order_qty, position=position, action=action, price=price, rules=rules
+                )
+                if clamped != order_qty:
+                    log.info(
+                        "paper_executor.execute CLAMP flip->close: agent=%s product=%s "
+                        "qty=%s -> %s (opening leg below venue minimum)",
+                        request.agent_id,
+                        product_id,
+                        order_qty,
+                        clamped,
+                    )
+                    order_qty = clamped
+                    quantized = rules.quantize(order_qty)
+                    if quantized is None:
+                        return TradeResult(
+                            False,
+                            f"{product_id} holds {order_qty:g}, which is below the venue's "
+                            f"{rules.min_qty:g} step and cannot be closed by an order. "
+                            f"Clear the position by hand.",
+                        )
+
+            if not rules.notional_ok(quantized, price) and not is_strict_reduce(
+                position, order_qty, action
+            ):
                 return TradeResult(
                     False,
                     f"Order notional ${float(quantized) * price:,.2f} is below the venue "
@@ -284,6 +346,12 @@ class LiveBinanceExecutor:
                 f"{rules.min_qty:g}; {request.quantity:g} is not orderable.",
             )
         quantity = float(quantized)
+        # A perp never reaches this executor: config refuses live mode with perp symbols
+        # (config.py ``_check_live_mode``), and spot has no flip to clamp. The dust rules
+        # in ``clamp_flip_to_a_close`` therefore live in the paper path, where perps do.
+        # The minimum-notional exemption for exits stays paper-only on purpose: the venue
+        # refuses a sub-minimum order whatever the arena thinks, so inventing a bypass
+        # here would trade a visible refusal for a circuit around the exchange's answer.
         if not rules.notional_ok(quantized, price):
             return TradeResult(
                 False,

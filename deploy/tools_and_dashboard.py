@@ -15,6 +15,7 @@ from exchanges import (
 )
 from arena.account_store import AccountStore
 from arena.execution import LiveBinanceExecutor
+from arena.hold_watchdog import HoldWatchdog
 from arena.live_session import HALTED, LiveSession, LiveState
 from arena.fees import FeeModel
 from arena.instruments import (
@@ -34,6 +35,7 @@ from arena.tools import (
     view,
 )
 from arena.risk import DEFAULT_HALT_PATH, LiveLimits, RiskGates
+from arena.trade_policy import ChurnLimits, ExitFloor
 from config import TradingConfig, load_config_strict
 from exchanges.binance_spot import (
     BINANCE_SPOT_REST,
@@ -101,6 +103,35 @@ def parse_args():
         help="Run without the Rich Live dashboard, for detached/supervised runs",
     )
     return parser.parse_args()
+
+
+def _limit(value: float | int | None, unit: str) -> str:
+    """One churn limit for the startup banner; ``None`` means the operator turned it off."""
+    return "off" if value is None else f"{value:g} {unit}"
+
+
+def arm_hold_watchdog(
+    store: AccountStore, floor: ExitFloor | None
+) -> HoldWatchdog | None:
+    """Start the half of the escape hatch that submits, or explain why there is none.
+
+    The floor answers "may this close go out", and past the hold limit it answers yes and
+    stops there — a guard that never refuses a stale exit is not a guard that closes one.
+    In the measured run nothing closed them: four round trips held 800 s to 3100 s past
+    the 3600 s limit because the only actor that could submit the order was an LLM on a
+    market tick, and it had no reason to look again.
+
+    ``None`` for both the disabled floor and the removed timeout: an operator who turned
+    the limit off did not ask for a watchdog that invents one.
+    """
+    if floor is None or floor.max_hold_seconds is None:
+        return None
+    watchdog = HoldWatchdog(store, hold_limit_s=floor.max_hold_seconds)
+    print(
+        f"Hold watchdog: closes anything held past {floor.max_hold_seconds:g} s, "
+        f"checking every {watchdog.interval:g} s"
+    )
+    return watchdog
 
 
 def halt(reason: str, *, path: Path = DEFAULT_HALT_PATH) -> None:
@@ -321,6 +352,46 @@ async def main():
     perp_taker_bps = trading.fees.perp_taker_bps
     store.set_fee_model(FeeModel(taker_bps=taker_bps, perp_taker_bps=perp_taker_bps))
     print(f"Trading fee: {taker_bps} bps ({taker_bps / 100:.2f}% taker) applied to every fill")
+
+    # Turnover guard: the fee bleed is invisible per order and obvious per hour, so the
+    # limit lives on the rate. Wired from config for paper and live alike — the paper
+    # run is where the 140-fill, $2.06-fee incident happened.
+    churn = trading.churn
+    store.set_churn_limits(
+        ChurnLimits(
+            max_fills_per_hour=churn.max_fills_per_hour,
+            cooldown_seconds=churn.cooldown_seconds,
+            max_fee_burn_pct_per_hour=churn.max_fee_burn_pct_per_hour,
+        )
+    )
+    print(
+        f"Churn guard: {_limit(churn.max_fills_per_hour, 'fills/hour')}, "
+        f"{_limit(churn.cooldown_seconds, 's re-entry cooldown')}, "
+        f"{_limit(churn.max_fee_burn_pct_per_hour, '% of equity/hour in fees')} "
+        f"(reducing a position is never blocked)"
+    )
+
+    # Exit floor: the churn guard limits how *often* an agent trades, this one limits
+    # *where* it may close. Both matter for the same reason — a close that neither
+    # reached the target nor hit the stop paid two fees to end up where it started.
+    floor = trading.exit_floor
+    exit_floor = (
+        ExitFloor(
+            min_profit_bps=floor.min_profit_bps,
+            stop_bps=floor.stop_bps,
+            max_hold_seconds=floor.max_hold_seconds,
+        )
+        if floor.enabled
+        else None
+    )
+    store.set_exit_floor(exit_floor)
+    print(
+        f"Exit floor:  {_limit(floor.min_profit_bps, ' bps profit target')}, "
+        f"{_limit(floor.stop_bps, ' bps stop')}, "
+        f"{_limit(floor.max_hold_seconds, 's hold limit')} "
+        f"({'closes between the two are refused' if floor.enabled else 'off'})"
+    )
+    hold_watchdog = arm_hold_watchdog(store, exit_floor)
     if trading.binance_perp_symbols:
         print(
             f"Perp fee:    {perp_taker_bps} bps ({perp_taker_bps / 100:.2f}% taker) on "
@@ -409,12 +480,6 @@ async def main():
     for tool in tools:
         print(f"  - {tool.tool_schema.name} (topic: {tool.subscribe_topics[0]})")
 
-    # ── Price subscriber ─────────────────────────────────────────
-    @client.broker.subscriber(PRICE_TOPIC, group_id="tools-dashboard")
-    async def handle_price_update(ticker: TickerMessage) -> None:
-        price_book.update(ticker.model_dump())
-        view.rerender()
-
     # ── Data recorder (optional) ────────────────────────────────
     recorder = None
     if args.snapshot_interval > 0:
@@ -424,6 +489,21 @@ async def main():
         store.attach_recorder(recorder)
         print(f"\nCSV recording enabled → {args.data_dir}/ (snapshots every {args.snapshot_interval}s)")
 
+    # ── Price subscriber ─────────────────────────────────────────
+    @client.broker.subscriber(PRICE_TOPIC, group_id="tools-dashboard")
+    async def handle_price_update(ticker: TickerMessage) -> None:
+        price_book.update(ticker.model_dump())
+        if recorder is not None:
+            # The band audit needs the path the price actually walked, not the
+            # one-minute portfolio snapshots: record every quote, unaggregated.
+            recorder.record_tick(
+                product_id=ticker.product_id,
+                price=ticker.price,
+                best_bid=ticker.best_bid,
+                best_ask=ticker.best_ask,
+            )
+        view.rerender()
+
     if args.headless:
         # view.rerender() no-ops without an attached Live, so price callbacks stay cheap.
         print("\nHeadless mode: live dashboard disabled (logs only)")
@@ -431,6 +511,8 @@ async def main():
         print("\nStarting portfolio dashboard (prices via Kafka)...")
 
     try:
+        if hold_watchdog is not None:
+            hold_watchdog.start()
         if args.headless:
             if recorder is not None:
                 recorder.start_snapshot_loop(store, interval=args.snapshot_interval)
@@ -442,6 +524,10 @@ async def main():
                     recorder.start_snapshot_loop(store, interval=args.snapshot_interval)
                 await worker.run()
     finally:
+        # Stop the watchdog before the session and ledger close: a close it books needs
+        # a writer, and a task cancelled after teardown would trade into a closed book.
+        if hold_watchdog is not None:
+            await hold_watchdog.close()
         if session is not None:
             session.stop()
         if live_client is not None:

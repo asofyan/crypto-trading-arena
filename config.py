@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from dotenv import find_dotenv, load_dotenv
 
 from arena.fees import DEFAULT_PERP_TAKER_BPS, DEFAULT_TAKER_BPS, MAX_TAKER_BPS
+from arena.model_pool import normalize_model_ids
 from arena.strategies import STRATEGIES
 
 DEFAULT_CONFIG_PATH = Path("config.json")
@@ -65,10 +66,25 @@ class AgentConfig(BaseModel):
 
     name: str = Field(description="Unique agent name (used as consumer group + identity).")
     provider: str = Field(description="Key into llm_providers (e.g. 'openai', 'openrouter').")
-    model: str = Field(description="Model ID to use (e.g. 'gpt-5-nano', 'anthropic/claude-sonnet-4').")
+    model: str | list[str] = Field(
+        description=(
+            "Model ID to use (e.g. 'gpt-5-nano', 'anthropic/claude-sonnet-4'), or a list "
+            "of IDs the agent round-robins across. Rate limits are charged per model, so "
+            "a pool keeps trading while a throttled model rests."
+        )
+    )
     max_workers: int = Field(1, description="Concurrent inference workers.", ge=1)
     reasoning_effort: Literal["low", "medium", "high"] | None = Field(
         None, description="Reasoning effort level for supported models."
+    )
+    payload: Literal["full", "lean"] = Field(
+        "full",
+        description=(
+            "Which market-message profile this agent consumes. 'full' carries every "
+            "candle tier (daily/4h/15m/5m/1m); 'lean' carries the intraday tiers plus a "
+            "compact higher-timeframe trend line — the same decisions for a "
+            "minutes-horizon strategy at ~10% of the prompt tokens."
+        ),
     )
     strategy: str = Field("default", description="Trading strategy (selects system prompt).")
     markets: list[Literal["spot", "perp"]] = Field(
@@ -79,6 +95,22 @@ class AgentConfig(BaseModel):
             "short and a perp prompt cannot buy inventory."
         ),
     )
+
+    @field_validator("model")
+    @classmethod
+    def _usable_model_pool(cls, value: str | list[str]) -> str | list[str]:
+        """Reject a pool that cannot rotate anywhere — at load, not at 3am.
+
+        A blank or repeated ID would send two rotations to the same throttled model,
+        which is the failure this pool exists to avoid.
+        """
+        ids = normalize_model_ids(value)
+        return ids[0] if isinstance(value, str) else ids
+
+    @property
+    def model_ids(self) -> list[str]:
+        """The pool this agent rotates across — one entry for the single-model case."""
+        return normalize_model_ids(self.model)
 
     @field_validator("strategy")
     @classmethod
@@ -113,6 +145,90 @@ class FeeConfig(BaseModel):
         ),
         ge=0,
         le=MAX_TAKER_BPS,
+    )
+
+
+class ChurnConfig(BaseModel):
+    """Turnover guard: how much trading cost one agent may burn per hour.
+
+    Exists because of a measured incident — a scalper-perp agent booked 140 fills in
+    two hours for $2.06 of fees (2% of a $100 wallet) against $0.10 of gross P&L. Every
+    correct-and-profitable per-trade decision still lost money at that rate, so the
+    guard limits the *rate* in paper as well as live. ``null`` disables one limit;
+    reducing a position is always allowed regardless (see ``arena.trade_policy``).
+    """
+
+    max_fills_per_hour: int | None = Field(
+        6,
+        ge=1,
+        description=(
+            "Fills per rolling hour, counting every fill including exits (each one pays "
+            "the taker fee). Trades that add exposure are refused once the hour is full. "
+            "null disables."
+        ),
+    )
+    cooldown_seconds: float | None = Field(
+        60.0,
+        ge=0,
+        description=(
+            "Quiet period after a fill in a product before the same product may be "
+            "re-opened. Closing or trimming is never delayed. null disables."
+        ),
+    )
+    max_fee_burn_pct_per_hour: float | None = Field(
+        0.25,
+        ge=0,
+        description=(
+            "Fee budget per rolling hour as a percentage of equity. Once the hour's "
+            "fees would exceed it, trades that add exposure are refused. 0.25 = 25 bps "
+            "of equity per hour; null disables."
+        ),
+    )
+
+
+class ExitFloorConfig(BaseModel):
+    """No-scratch-exit gate: refuse a close between the stop and the target.
+
+    Measured on the real ledger: 29 of 111 exit legs closed at 0-10 bps of profit
+    against a 10 bps round trip, median move 0.00 bps — two taker fees paid to end up
+    where the position started. Nothing in a per-order or per-hour gate can see that,
+    because each fill is legal and cheap on its own; only the distance from the entry
+    price can. The stop and the target are the two honest ways out of a position, and
+    a close that is neither is a scratch. ``null`` on either bound disables the band
+    (nothing to sit between); ``max_hold_seconds: null`` removes the timeout, so the
+    band keeps applying to a stale position instead of releasing it.
+    """
+
+    enabled: bool = Field(
+        True,
+        description=(
+            "Wire the exit floor into the order path. false leaves exits exactly as they "
+            "were before the guard."
+        ),
+    )
+    min_profit_bps: float | None = Field(
+        100.0,
+        ge=0,
+        description=(
+            "Profit, in basis points from the entry price, at which a close is allowed. "
+            "Below it the position has not earned its round trip. null disables the band."
+        ),
+    )
+    stop_bps: float | None = Field(
+        50.0,
+        ge=0,
+        description=(
+            "Loss, in basis points from the entry price, at which a close is allowed. "
+            "Cutting a loss is never refused. null disables the band."
+        ),
+    )
+    max_hold_seconds: float | None = Field(
+        3600.0,
+        ge=0,
+        description=(
+            "Holding time after which the exit floor lets go, so a stale position is "
+            "never trapped by a move that never happens. null removes the timeout."
+        ),
     )
 
 
@@ -285,6 +401,22 @@ class TradingConfig(BaseModel):
     fees: FeeConfig = Field(
         default_factory=FeeConfig,
         description="Trading fees applied to every simulated fill.",
+    )
+    churn: ChurnConfig = Field(
+        default_factory=ChurnConfig,
+        description=(
+            "Turnover guard applied to every fill path (paper and live): hourly fill "
+            "ceiling, per-product re-entry cooldown, and an hourly fee budget scaled to "
+            "equity. Reducing exposure always bypasses it."
+        ),
+    )
+    exit_floor: ExitFloorConfig = Field(
+        default_factory=ExitFloorConfig,
+        description=(
+            "No-scratch-exit gate: a close is refused while the position sits between "
+            "its stop and its target (or past the hold limit), so an agent cannot pay "
+            "the round trip to end up where it started."
+        ),
     )
 
 

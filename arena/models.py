@@ -33,7 +33,10 @@ class AgentAccount:
     cash: float = INITIAL_CASH
     positions: dict[str, float] = field(default_factory=dict)
     cost_basis: dict[str, float] = field(default_factory=dict)
-    # Weighted-average entry timestamp (Unix epoch) per position
+    # When the current side of each position was opened (Unix epoch). An add keeps
+    # the older value: holding time is the age of the exposure, not the average age
+    # of its lots, so a dust add cannot renew the hold limit.
+
     avg_entry_ts: dict[str, float] = field(default_factory=dict)
     trade_count: int = 0
     # Cumulative taker fees paid across all fills (buys + sells).
@@ -162,6 +165,11 @@ TIMEFRAMES = [
     Timeframe(300, 90, 20, "5-min candles (90min ago -> 20min ago)"),
     Timeframe(60, 20, 0, "1-min candles (last 20 minutes)"),
 ]
+
+# The intraday tiers alone: the three windows that tile the last three hours at
+# rising resolution. A minutes-horizon strategy decides on these; the daily and 4h
+# tiers are 89% of the candle payload and belong to swing-trend's decision tier.
+INTRADAY_TIMEFRAMES = [tf for tf in TIMEFRAMES if tf.granularity in (900, 300, 60)]
 
 
 # TYPE_CHECKING-only import to avoid circular dependency at runtime.

@@ -58,7 +58,8 @@ loop: market event → decision → trade → updated state.
 
 Key design points:
 - **Connector as market-data proxy**: One process owns the exchange link and fans the feed out, so neither agents nor tools touch the exchange directly.
-- **Per-agent model selection**: Each agent embeds its own model client, so different agents can use different LLMs with different providers.
+- **Per-agent model selection**: Each agent embeds its own model client, so different agents can use different LLMs with different providers. An agent can also hold a *pool* of models and round-robin inference across them, so a rate-limited model rests while the others carry the agent's trading.
+- **Per-agent payload**: The connector publishes the market message twice — the full candle book for swing horizons, and a lean profile (intraday tiers + a trend line, 88% fewer tokens) for minutes-horizon scalpers. See [ADR-0010](docs/adr/0010-lean-market-message-profile.md).
 - **Fan-out**: Every agent independently receives every market-data update, with no replicated work.
 - **Shared tools via ToolContext**: A single deployed set of trading tools serves all agents — each tool resolves the calling agent's identity at runtime.
 - **Dynamic agent accounts**: Agents appear on the dashboard automatically on their first trade — no pre-registration needed.
@@ -199,7 +200,18 @@ uv run python -m deploy.agent \
 # uv run python -m deploy.agent \
 #     --from-config <agent-name> --strategy <strategy> \
 #     --bootstrap-servers <broker-url>
+
+# Or, one agent, several models: repeat --model-id and the agent round-robins
+# inference across them, resting whichever model hits a rate limit
+# uv run python -m deploy.agent \
+#     --name <unique-agent-name> --model-id <model-id> --model-id <another-model-id> \
+#     --strategy <strategy> --bootstrap-servers <broker-url>
 ```
+
+A model pool is for capacity, not variety: every model in it answers the same
+strategy prompt with the same tools, so the agent does not notice which one replied.
+Rate limits are charged per model, so two models roughly double an agent's headroom
+without standing up a second agent. See [ADR-0009](docs/adr/0009-round-robin-model-pool.md).
 
 Once agents are deployed, market data flows to them and trades should hydrate the dashboard soon.
 

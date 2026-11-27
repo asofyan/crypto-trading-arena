@@ -8,11 +8,13 @@ These tests pin the bridge between `arena.instruments` and `PaperExecutor`.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from arena.account_store import AccountStore
 from arena.fees import FeeModel
-from arena.instruments import parse_exchange_info
+from arena.instruments import SymbolRules, parse_exchange_info
 from arena.price_book import PriceBook
 
 SOL_ASK = 100.10
@@ -157,3 +159,106 @@ def test_symbol_without_rules_prices_normally(store):
     result = store.execute_trade("a", "BTC-USD", 0.1, "buy")
     assert not result.success
     assert "Insufficient cash" in result.message
+
+
+# ── Dust: a flip must not create a position no order can close ───
+#
+# The measured run ended holding LINKUSDT-PERP short 0.1 — a $0.92 residue from a sell
+# that overshot a long by one step. The venue floor is 20 USDT, so the only order that
+# could flatten it was refused for being too small, and the residue sat for two hours.
+# The scorecard read that as a guard that did not fire, which is right: nothing could
+# ever close it. Two rules stop the arena growing those: a flip that would leave dust is
+# booked as the close it really is, and an exit is never refused for being small.
+
+LINK_PERP = "LINKUSDT-PERP"
+
+
+@pytest.fixture
+def perp_store():
+    """A wallet with one perp symbol carrying the real LINK-PERP 20 USDT floor."""
+    book = PriceBook()
+    book.update(
+        {
+            "product_id": LINK_PERP,
+            "price": "9.155",
+            "best_bid": "9.150",
+            "best_ask": "9.160",
+        }
+    )
+    rules = parse_exchange_info(SOLUSDT_INFO)
+    rules[LINK_PERP] = SymbolRules(
+        symbol="LINKUSDT",
+        base_asset="LINK",
+        quote_asset="USDT",
+        step_size=Decimal("0.01"),
+        min_qty=Decimal("0.01"),
+        min_notional=Decimal("20"),
+        tick_size=Decimal("0.01"),
+    )
+    s = AccountStore(book, FeeModel(taker_bps=10, perp_taker_bps=5))
+    s.get_or_create("a").cash = 100.0
+    s.set_instrument_rules(rules)
+    return s
+
+
+def test_flip_that_would_leave_dust_is_booked_as_a_close(perp_store):
+    """Selling 8.9 against a long of 8.8 is not "short 0.1", it is dust nobody can close."""
+    assert perp_store.execute_trade("a", LINK_PERP, 8.8, "buy").success
+
+    result = perp_store.execute_trade("a", LINK_PERP, 8.9, "sell")
+
+    assert result.success, result.message
+    account = perp_store.get_or_create("a")
+    assert account.positions.get(LINK_PERP, 0.0) == pytest.approx(0.0)
+
+
+def test_flip_that_clears_the_floor_still_flips(perp_store):
+    """Clamping is for dust, not for intent: a short above 20 USDT is a real position."""
+    assert perp_store.execute_trade("a", LINK_PERP, 8.8, "buy").success
+
+    result = perp_store.execute_trade("a", LINK_PERP, 11.0, "sell")
+
+    assert result.success, result.message
+    # 2.2 LINK at the bid is $20.13, just over the venue's 20 USDT floor.
+    assert perp_store.get_or_create("a").positions[LINK_PERP] == pytest.approx(-2.2)
+
+
+def test_dust_below_the_floor_can_still_be_closed(perp_store):
+    """An exit is never refused for being small — a size floor must not become the trap."""
+    account = perp_store.get_or_create("a")
+    account.positions[LINK_PERP] = 0.1
+    account.cost_basis[LINK_PERP] = 0.1 * 9.16
+
+    result = perp_store.execute_trade("a", LINK_PERP, 0.1, "sell")
+
+    assert result.success, result.message
+    assert account.positions.get(LINK_PERP, 0.0) == pytest.approx(0.0)
+
+
+def test_opening_dust_is_still_refused(perp_store):
+    """The exemption is for exits only: a 0.1 long is not a trade the venue accepts."""
+    result = perp_store.execute_trade("a", LINK_PERP, 0.1, "buy")
+
+    assert not result.success
+    assert "minimum" in result.message.lower()
+    assert perp_store.get_or_create("a").positions == {}
+
+
+def test_a_partial_close_is_untouched_by_the_clamp(perp_store):
+    """Only a flip is clamped; trimming a real position keeps the agent's quantity."""
+    assert perp_store.execute_trade("a", LINK_PERP, 4.0, "buy").success
+
+    result = perp_store.execute_trade("a", LINK_PERP, 3.0, "sell")
+
+    assert result.success, result.message
+    assert perp_store.get_or_create("a").positions[LINK_PERP] == pytest.approx(1.0)
+
+
+def test_a_short_flip_that_would_leave_dust_is_clamped_too(perp_store):
+    """The same rule on the other side: buying 8.9 against a short of 8.8 is a close."""
+    assert perp_store.execute_trade("a", LINK_PERP, 8.8, "sell").success
+
+    result = perp_store.execute_trade("a", LINK_PERP, 8.9, "buy")
+
+    assert result.success, result.message
+    assert perp_store.get_or_create("a").positions.get(LINK_PERP, 0.0) == pytest.approx(0.0)

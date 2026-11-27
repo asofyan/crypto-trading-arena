@@ -1,1 +1,4 @@
-uv run python -m deploy.portfolio_monitor --bootstrap-servers localhost:9092
+#!/usr/bin/env bash
+set -e
+cd -- "$(dirname -- "$0")"
+exec uv run python -m deploy.portfolio_monitor "$@"

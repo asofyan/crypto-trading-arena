@@ -1,22 +1,8 @@
 """Read-only live portfolio monitor for an arena that is already running.
 
-The arena's paper wallets live in the memory of the `deploy.tools_and_dashboard`
-process, so a second copy of that entrypoint cannot observe them: it would start
-its own wallet at $100 and, because calfkit names consumer groups after the node
-(`calfkit/worker/worker.py`), it would join the very same groups and split the
-stream — leaving two half-arenas that both look plausible.
-
-This monitor takes the indirect route instead. It replays the trades CSV that the
-running process writes, marks the rebuilt positions to market from the same Kafka
-price topic, and renders the same `PortfolioView`. Two properties keep the arena
-untouched:
-
-* it subscribes to `market_data.prices` under its own consumer group, so Kafka
-  fans the feed out to it rather than handing over the arena's partitions;
-* it never publishes anything — no fills, no tool calls, no state of its own.
-
-Killing this monitor therefore has no effect on trading, and the wallets it shows
-survive it.
+The monitor reads the arena's SQLite wallet ledger and marks positions using
+the same Kafka price feed under its own consumer group. CSV replay is available
+for sessions that run without a ledger. The monitor never publishes to Kafka.
 
 Usage:
     uv run python -m deploy.portfolio_monitor --bootstrap-servers localhost:9092
@@ -44,6 +30,8 @@ from arena.account_store import AccountStore
 from arena.dashboard import PortfolioView
 from arena.fees import FeeModel
 from arena.instruments import SymbolRules
+from arena.ledger import DEFAULT_DB_PATH, Ledger
+from arena.models import AgentAccount, TradeLogEntry
 from arena.price_book import PriceBook
 from config import load_config_strict
 from exchanges import PRICE_TOPIC, TickerMessage
@@ -55,8 +43,7 @@ MONITOR_GROUP_ID = "portfolio-monitor"
 # Every run gets its own group id. A fixed group resumes from whatever offset a previous
 # run committed, and this topic keeps history: a monitor started hours later would replay
 # that backlog (262k ticks in one case) and show prices from the wrong session while the
-# live edge raced away from it. The monitor keeps no state in Kafka — its state is the
-# trades CSV — so starting at the live edge is always the correct resume point.
+# live edge raced away from it. Wallet state is loaded independently of Kafka.
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +260,53 @@ class PortfolioMirror:
         return self._rows
 
 
+class LedgerPortfolioMirror:
+    """Read the current wallet without joining the writer or replaying fills."""
+
+    def __init__(self, path: Path, data_dir: Path) -> None:
+        self.session_file = path
+        self.snapshot_file = None
+        self.price_book = PriceBook()
+        self.accounts: dict[str, AgentAccount] = {}
+        self.trade_log: list[TradeLogEntry] = []
+        self.ledger_degraded = False
+        self.view = PortfolioView(self)
+
+        # Seed marks before Kafka delivers its first fresh quote, including in --once.
+        ticks = max(data_dir.glob("ticks_*.csv"), key=lambda file: file.name, default=None)
+        if ticks is not None:
+            latest = {}
+            with ticks.open(newline="") as source:
+                for row in csv.DictReader(source):
+                    if all(row.get(field) for field in ("product_id", "price", "best_bid", "best_ask")):
+                        latest[row["product_id"]] = row
+            for row in latest.values():
+                self.price_book.update(row)
+
+    def sync(self) -> bool:
+        # Reopen each poll so an engine restart that replaces the DB is visible.
+        with Ledger(self.session_file, read_only=True) as ledger:
+            accounts, fills, degraded = ledger.read_portfolio()
+        changed = (self.accounts, self.trade_log, self.ledger_degraded) != (accounts, fills, degraded)
+        self.accounts, self.trade_log, self.ledger_degraded = accounts, fills, degraded
+        return changed
+
+    def update_price(self, ticker: TickerMessage) -> None:
+        self.price_book.update(ticker.model_dump())
+
+
+def build_csv_mirror(data_dir: Path, config_path: str) -> PortfolioMirror:
+    from deploy.tools_and_dashboard import resolve_instrument_rules
+
+    config = load_config_strict(config_path)
+    fee_model = FeeModel(
+        taker_bps=config.trading.fees.taker_bps,
+        perp_taker_bps=config.trading.fees.perp_taker_bps,
+    )
+    rules, _summary = resolve_instrument_rules(config.trading)
+    return PortfolioMirror(data_dir, fee_model, rules)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Read-only monitor for a running trading arena.",
@@ -285,7 +319,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         default="./data",
-        help="Directory holding the arena's trades_*.csv (default: ./data)",
+        help="Directory holding the ledger and recorded CSVs (default: ./data)",
+    )
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--db", type=Path, help="Ledger path (default: <data-dir>/arena.db)")
+    source.add_argument(
+        "--no-ledger", action="store_true", help="Replay CSVs for an arena without persistence"
     )
     parser.add_argument(
         "--config",
@@ -296,12 +335,12 @@ def parse_args() -> argparse.Namespace:
         "--refresh",
         type=float,
         default=2.0,
-        help="Seconds between trades-CSV polls (default: 2.0)",
+        help="Seconds between wallet refreshes (default: 2.0)",
     )
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Replay the CSV and print one snapshot, then exit (no broker needed)",
+        help="Print one snapshot, then exit (no broker needed)",
     )
     return parser.parse_args()
 
@@ -317,22 +356,17 @@ async def run(args: argparse.Namespace) -> None:
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, stop.set)
 
-    config = load_config_strict(args.config)
-    fee_model = FeeModel(
-        taker_bps=config.trading.fees.taker_bps,
-        perp_taker_bps=config.trading.fees.perp_taker_bps,
-    )
-    # Imported here, not at module scope: the deploy CLI owns the spot+perp merge and
-    # importing it eagerly would drag its arena.tools singletons into this read-only
-    # process for no reason.
-    from deploy.tools_and_dashboard import resolve_instrument_rules
-
-    rules, _summary = resolve_instrument_rules(config.trading)
-    mirror = PortfolioMirror(Path(args.data_dir), fee_model, rules)
-
-    if not mirror.sync() and mirror.session_file is None:
-        print(f"ERROR: no trades_*.csv in {args.data_dir} — nothing to monitor yet.")
-        return
+    data_dir = Path(args.data_dir)
+    db = args.db or data_dir / DEFAULT_DB_PATH.name
+    mirror: LedgerPortfolioMirror | PortfolioMirror
+    if not args.no_ledger and (args.db is not None or db.exists()):
+        mirror = LedgerPortfolioMirror(db, data_dir)
+        mirror.sync()
+    else:
+        mirror = build_csv_mirror(data_dir, args.config)
+        if not mirror.sync() and mirror.session_file is None:
+            print(f"ERROR: no wallet ledger or trades_*.csv in {data_dir}")
+            return
 
     if args.once:
         # The Live layout divides the terminal height between panels; without a tty
@@ -341,7 +375,7 @@ async def run(args: argparse.Namespace) -> None:
         console.print(mirror.view._build_summary_cards())
         console.print(mirror.view._build_positions_table())
         console.print(mirror.view._build_trade_log())
-        print(f"replayed {mirror.replayed_contracts} fill(s) from {mirror.session_file}")
+        print(f"Wallet source: {mirror.session_file or mirror.snapshot_file}")
         return
 
     client = Client.connect(args.bootstrap_servers)
@@ -355,7 +389,7 @@ async def run(args: argparse.Namespace) -> None:
         if state:
             mirror.view.rerender()
 
-    async def poll_trades() -> None:
+    async def poll_wallet() -> None:
         while True:
             await asyncio.sleep(args.refresh)
             if mirror.sync():
@@ -370,7 +404,7 @@ async def run(args: argparse.Namespace) -> None:
     # A bare @broker.subscriber is inert until a Worker runs the app; with an empty
     # node list this worker does nothing but keep that price subscriber alive.
     worker = Worker(client, nodes=[])
-    poller = asyncio.create_task(poll_trades())
+    poller = asyncio.create_task(poll_wallet())
 
     if stop.is_set():
         # The operator interrupted the boot; nothing is running yet, so just leave.

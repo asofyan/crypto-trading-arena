@@ -389,3 +389,32 @@ def test_each_monitor_run_gets_its_own_consumer_group(monkeypatch):
     assert first != second
     assert first.startswith(MONITOR_GROUP_ID)
     assert MONITOR_GROUP_ID != "tools-dashboard"
+
+
+@pytest.mark.asyncio
+async def test_once_uses_persisted_wallet_even_with_empty_session_csv(tmp_path, capsys, monkeypatch):
+    from argparse import Namespace
+
+    from arena.ledger import Ledger
+    from arena.models import AgentAccount
+    from deploy.portfolio_monitor import run
+
+    monkeypatch.setattr("deploy.tools_and_dashboard.resolve_instrument_rules", lambda _: ({}, ""))
+    with Ledger(tmp_path / "arena.db") as writer:
+        account = AgentAccount(cash=43.09, trade_count=50, realized_pnl=1.22)
+        account.positions["ZECUSDT-PERP"] = 0.05
+        account.cost_basis["ZECUSDT-PERP"] = 38.01
+        writer.persist_account("scalper-perp", account)
+        (tmp_path / "ticks_20260101_000000.csv").write_text(
+            "product_id,price,best_bid,best_ask\nZECUSDT-PERP,757.47,757.46,757.48\n"
+        )
+        await run(Namespace(
+            data_dir=str(tmp_path), db=None, no_ledger=False, once=True,
+            config=str(tmp_path / "missing.json"),
+        ))
+
+    output = capsys.readouterr().out
+    assert "scalper-perp" in output
+    assert "$43.09" in output
+    assert "$80.96" in output
+    assert "+$1.22" in output

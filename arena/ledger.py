@@ -182,7 +182,7 @@ class Ledger:
         self.read_only = read_only
         # Tool nodes are invoked from worker threads, so the connection is shared
         # across threads; every statement below runs under self._lock.
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._lock_fd: int | None = None
 
@@ -409,6 +409,18 @@ class Ledger:
         }
 
     # ── Reads ────────────────────────────────────────────────────
+
+    def read_portfolio(
+        self,
+    ) -> tuple[dict[str, AgentAccount], list[TradeLogEntry], bool]:
+        """Read the dashboard state from a single SQLite snapshot."""
+        with self._lock:
+            conn = self._db()
+            conn.execute("BEGIN")
+            try:
+                return self.load_accounts(), self.recent_fills(), self.degraded_marker() is not None
+            finally:
+                conn.rollback()
 
     def load_accounts(self) -> dict[str, AgentAccount]:
         """Hydrate every persisted account, including its open positions."""

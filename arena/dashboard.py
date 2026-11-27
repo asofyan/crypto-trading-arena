@@ -15,8 +15,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from arena.account_store import AccountStore
-from arena.models import INITIAL_CASH
+from arena.models import INITIAL_CASH, AgentAccount, TradeLogEntry
+from arena.price_book import PriceBook
 
 MAX_BALANCE_HISTORY = 300  # ~25 min at 5s intervals
 
@@ -90,10 +90,24 @@ class PlotextChart:
         yield from decoder.decode(canvas)
 
 
+class PortfolioState(typing.Protocol):
+    @property
+    def accounts(self) -> dict[str, AgentAccount]: ...
+
+    @property
+    def price_book(self) -> PriceBook: ...
+
+    @property
+    def trade_log(self) -> list[TradeLogEntry]: ...
+
+    @property
+    def ledger_degraded(self) -> bool: ...
+
+
 class PortfolioView:
     """Builds and rerenders a Rich Live dashboard from AccountStore state."""
 
-    def __init__(self, store: AccountStore) -> None:
+    def __init__(self, store: PortfolioState) -> None:
         self._store = store
         self._live: Live | None = None
         self._balance_history: dict[str, deque[tuple[str, float]]] = {}

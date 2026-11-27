@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,12 +20,20 @@ from arena.hold_watchdog import HoldWatchdog
 from arena.live_session import HALTED, LiveSession, LiveState
 from arena.fees import FeeModel
 from arena.instruments import (
+    PERP_SUFFIX,
     SymbolRules,
     load_cache,
+    is_perp_product,
     parse_exchange_info,
     perp_product_id,
 )
-from arena.ledger import DEFAULT_DB_PATH, Ledger, LedgerInUseError, LedgerSchemaError
+from arena.ledger import (
+    DEFAULT_DB_PATH,
+    FUTURES_LEDGER_META_KEY,
+    Ledger,
+    LedgerInUseError,
+    LedgerSchemaError,
+)
 from arena.models import INITIAL_CASH, AgentAccount
 from arena.tools import (
     calculator,
@@ -39,6 +48,7 @@ from arena.tools import (
 from arena.risk import DEFAULT_HALT_PATH, LiveLimits, RiskGates
 from arena.trade_policy import ChurnLimits, ExitFloor
 from config import TradingConfig, load_config_strict
+from exchanges.binance import futures_quote_source, valid_futures_touch
 from exchanges.binance_spot import (
     BINANCE_SPOT_REST,
     BINANCE_SPOT_TESTNET_REST,
@@ -151,6 +161,22 @@ def halt(reason: str, *, path: Path = DEFAULT_HALT_PATH) -> None:
     logging.getLogger(__name__).error("LIVE TRADING HALTED: %s (flag: %s)", reason, path)
 
 
+def build_risk_gates(trading: TradingConfig, symbols: tuple[str, ...], state: LiveState) -> RiskGates:
+    live = trading.live
+    return RiskGates(
+        LiveLimits(
+            allow_symbols=symbols,
+            max_order_pct_of_equity=live.max_order_pct_of_equity,
+            max_position_pct_of_equity=live.max_position_pct_of_equity,
+            max_order_notional_usdt=live.max_order_notional_usdt,
+            max_daily_loss_pct=live.max_daily_loss_pct,
+            max_orders_per_minute=live.max_orders_per_minute,
+            max_price_age_seconds=live.max_price_age_seconds,
+        ),
+        is_halted=state.is_halted,
+    )
+
+
 def build_live_runtime(
     store: AccountStore,
     trading: TradingConfig,
@@ -187,18 +213,7 @@ def build_live_runtime(
     rules = parse_exchange_info(info)
     store.set_instrument_rules(rules)
 
-    gates = RiskGates(
-        LiveLimits(
-            allow_symbols=tuple(s.upper() for s in live.allow_symbols),
-            max_order_pct_of_equity=live.max_order_pct_of_equity,
-            max_position_pct_of_equity=live.max_position_pct_of_equity,
-            max_order_notional_usdt=live.max_order_notional_usdt,
-            max_daily_loss_pct=live.max_daily_loss_pct,
-            max_orders_per_minute=live.max_orders_per_minute,
-            max_price_age_seconds=live.max_price_age_seconds,
-        ),
-        is_halted=state.is_halted,
-    )
+    gates = build_risk_gates(trading, tuple(s.upper() for s in live.allow_symbols), state)
     executor = LiveBinanceExecutor(
         store,
         client,
@@ -224,6 +239,85 @@ def build_live_runtime(
         f"{live.max_orders_per_minute} orders/min"
     )
     return executor, summary
+
+
+def build_futures_session(store: AccountStore, trading: TradingConfig, ledger: Ledger):
+    """Share the spot arming and order limits while using futures account data."""
+    from arena.futures_execution import LiveBinanceFuturesExecutor
+    from arena.futures_session import FuturesLiveSession
+    from exchanges.binance_futures import (
+        BINANCE_FUTURES_DEMO_REST,
+        BINANCE_FUTURES_REST,
+        BinanceFuturesClient,
+    )
+
+    live = trading.live
+    agent_id, account_name = next(iter(live.agent_accounts.items()))
+    account = live.accounts[account_name]
+    base_url = BINANCE_FUTURES_DEMO_REST if account.testnet else BINANCE_FUTURES_REST
+    client = BinanceFuturesClient(
+        account.api_key,
+        account.api_secret,
+        base_url=base_url,
+        recv_window_ms=live.recv_window_ms,
+    )
+    state = LiveState(ledger)
+    try:
+        client.sync_time()
+        info = client.exchange_info(live.allow_symbols)
+        rules = parse_exchange_info(info, product_suffix=PERP_SUFFIX, market_order=True)
+        expected = {perp_product_id(symbol) for symbol in live.allow_symbols}
+        if expected != rules.keys():
+            raise ValueError(f"Missing futures instrument rules: {sorted(expected - rules.keys())}")
+        store.set_instrument_rules(rules)
+        gates = build_risk_gates(trading, tuple(sorted(rules)), state)
+        executor = LiveBinanceFuturesExecutor(
+            store, client, ledger,
+            account=account_name,
+            agent_accounts=dict(live.agent_accounts),
+            rules=rules,
+            gates=gates,
+            dry_run=live.dry_run,
+            max_price_slippage_bps=live.max_price_slippage_bps,
+            on_fatal=lambda exc: (
+                state.set(HALTED, f"venue refused further orders: {exc}"),
+                halt(f"venue refused further orders: {exc}"),
+            ),
+            on_unresolved=lambda reason: state.set(HALTED, reason),
+        )
+        session = FuturesLiveSession(
+            client, store, ledger, executor, rules, agent_id,
+            environment="demo" if account.testnet else "production",
+            reserve_usdt=live.reserve_usdt,
+            refresh_seconds=live.balance_refresh_seconds,
+            state=state,
+        )
+        store.set_executor(executor)
+        return session, client
+    except Exception:
+        client.close()
+        raise
+
+
+def validate_ledger_target(db: str, *, futures: bool, no_ledger: bool) -> None:
+    if futures and (no_ledger or Path(db).resolve() == DEFAULT_DB_PATH.resolve()):
+        raise ValueError("Live futures needs a dedicated --db path and wallet persistence")
+
+
+def accept_futures_ticker(
+    ticker: TickerMessage, source: str, *, max_age: float, now: datetime
+) -> bool:
+    if (
+        ticker.source != source or not is_perp_product(ticker.product_id)
+        or not valid_futures_touch(ticker.best_bid, ticker.best_ask)
+    ):
+        return False
+    try:
+        timestamp = datetime.fromisoformat(ticker.time)
+        age = (now - timestamp).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    return -1.0 <= age <= max_age
 
 
 def describe_wallet(accounts: dict[str, AgentAccount], path: str | Path) -> str:
@@ -354,6 +448,8 @@ async def main():
     # connector advertises to agents.
     arena_config = load_config_strict(args.config)
     trading = arena_config.trading
+    futures = trading.mode == "live" and trading.live.market == "perp"
+    validate_ledger_target(args.db, futures=futures, no_ledger=args.no_ledger)
     taker_bps = trading.fees.taker_bps
     perp_taker_bps = trading.fees.perp_taker_bps
     store.set_fee_model(FeeModel(taker_bps=taker_bps, perp_taker_bps=perp_taker_bps))
@@ -401,7 +497,7 @@ async def main():
     if trading.binance_perp_symbols:
         print(
             f"Perp fee:    {perp_taker_bps} bps ({perp_taker_bps / 100:.2f}% taker) on "
-            f"{len(trading.binance_perp_symbols)} perpetual contract(s), paper only "
+            f"{len(trading.binance_perp_symbols)} perpetual contract(s) "
             f"(1:1 leverage)"
         )
 
@@ -431,6 +527,9 @@ async def main():
         print("\nWARNING: persistence disabled (--no-ledger) — wallets reset on every restart")
     else:
         ledger = open_ledger_or_exit(args.db)
+        if not futures and ledger.get_meta(FUTURES_LEDGER_META_KEY) is not None:
+            ledger.close()
+            raise ValueError("A live futures ledger may only be opened in live futures mode")
         store.attach_ledger(ledger)
         print(f"\n{describe_wallet(store.accounts, ledger.path)}")
 
@@ -440,7 +539,26 @@ async def main():
     mode = trading.mode
     session: LiveSession | None = None
     live_client = None
-    if mode == "live":
+    quote_source = None
+    if futures:
+        try:
+            session, live_client = build_futures_session(store, trading, ledger)
+            report = session.start()
+        except Exception:
+            if session is not None:
+                session.stop()
+            if live_client is not None:
+                live_client.close()
+            ledger.close()
+            raise
+        account_name = next(iter(trading.live.agent_accounts.values()))
+        demo = trading.live.accounts[account_name].testnet
+        quote_source = futures_quote_source(demo)
+        environment = "DEMO" if demo else "PRODUCTION"
+        print(f"Execution: Binance Futures {environment} (dry_run={trading.live.dry_run})")
+        print(report.summary())
+        print(f"Live session: {session.state.state} {session.state.reason}".strip())
+    elif mode == "live":
         live_state = LiveState(ledger) if ledger is not None else None
         executor, live_summary = (
             build_live_runtime(store, trading, ledger, live_state)
@@ -498,7 +616,18 @@ async def main():
     # ── Price subscriber ─────────────────────────────────────────
     @client.broker.subscriber(PRICE_TOPIC, group_id="tools-dashboard")
     async def handle_price_update(ticker: TickerMessage) -> None:
-        price_book.update(ticker.model_dump())
+        if quote_source is not None and not accept_futures_ticker(
+            ticker,
+            quote_source,
+            max_age=trading.live.max_price_age_seconds,
+            now=datetime.now(timezone.utc),
+        ):
+            return
+        snapshot = ticker.model_dump()
+        if quote_source is not None:
+            # The last trade from the 24h ticker can predate the executable touch.
+            snapshot["price"] = str((float(ticker.best_bid) + float(ticker.best_ask)) / 2)
+        price_book.update(snapshot)
         if recorder is not None:
             # The band audit needs the path the price actually walked, not the
             # one-minute portfolio snapshots: record every quote, unaggregated.

@@ -98,3 +98,4 @@ class TickerMessage(BaseModel):
     trade_id: int
     sequence: int
     time: str
+    source: str | None = None

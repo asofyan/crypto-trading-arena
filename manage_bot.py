@@ -42,7 +42,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from arena.ledger import Ledger, LedgerInUseError, LedgerSchemaError
+from arena.ledger import FUTURES_LEDGER_META_KEY, Ledger, LedgerInUseError, LedgerSchemaError
 from arena.live_session import HALTED, RECONCILING, REASON_META_KEY, STATE_META_KEY
 from arena.models import AgentAccount
 from arena.reconcile import compare
@@ -275,7 +275,9 @@ def wallet_state(db: Path | str | None = None) -> dict:
                 "state": ledger.get_meta(STATE_META_KEY),
                 "reason": ledger.get_meta(REASON_META_KEY) or "",
                 "orders": ledger.order_counts(),
-                "has_baseline": bool(ledger.get_meta("live_baseline")),
+                "has_baseline": bool(
+                    ledger.get_meta("live_baseline") or ledger.get_meta(FUTURES_LEDGER_META_KEY)
+                ),
                 "halt_flag": DEFAULT_HALT_PATH.exists(),
             }
     except FileNotFoundError:
@@ -467,8 +469,8 @@ def render_live_status(live: dict, mode: str | None = None) -> list[str]:
         lines.append(f"Orders:  {summary}")
     if not live.get("has_baseline"):
         lines.append(
-            "         no go-live baseline recorded; run `manage_bot.py live-init` before "
-            "arming"
+            "         no go-live baseline recorded; live-init is required for spot. "
+            "Live futures binds its ledger at startup."
         )
     if state == HALTED or live.get("halt_flag"):
         lines.append("         re-arm: `manage_bot.py stop && manage_bot.py resume`")
@@ -537,6 +539,8 @@ def archive_ledger(db: Path | str | None = None) -> Path | None:
         ledger = None
 
     try:
+        if ledger is not None and ledger.get_meta(FUTURES_LEDGER_META_KEY) is not None:
+            raise ValueError("cannot reset a bound futures ledger")
         target = _archive_dir(path) / (
             f"{path.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}{path.suffix}"
         )
@@ -653,6 +657,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         except LedgerInUseError as exc:
             print(f"error: refusing --fresh for {db}: {exc}")
             print("       Nothing was moved; stop the running engine first.")
+            return 1
+        except ValueError as exc:
+            print(f"error: refusing --fresh for {db}: {exc}")
             return 1
         except OSError as exc:
             # Unmapped now that the ledger no longer reports filesystem failures as
@@ -984,6 +991,10 @@ def _venue_client_or_exit(cfg):
     )
 
     live = cfg.trading.live
+    if live.market == "perp":
+        print("Live futures initializes and reconciles in the tool server. "
+              "Use status with the futures --db to read its persisted state.")
+        raise SystemExit(1)
     account_name = sorted(set(live.agent_accounts.values()))[0]
     account = live.accounts[account_name]
     base_url = BINANCE_SPOT_TESTNET_REST if account.testnet else BINANCE_SPOT_REST

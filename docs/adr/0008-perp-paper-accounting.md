@@ -3,6 +3,7 @@
 **Status:** accepted — the flipping half of decision 2 is superseded for the agent path by
 [ADR-0011](0011-the-agent-names-an-exit-the-server-sizes-it.md) (an agent order never crosses
 zero; exits are sized by the server). The signed-net-position model itself is unchanged.
+[ADR-0012](0012-live-perpetuals-use-a-dedicated-futures-wallet.md) supersedes the paper-only restriction.
 
 ## Context & decision
 

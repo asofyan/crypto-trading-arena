@@ -20,11 +20,12 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
@@ -106,6 +107,24 @@ PERP_VENUE = BinanceVenue(
     book_ticker_path="/fapi/v1/ticker/bookTicker",
     product_suffix=PERP_SUFFIX,
 )
+PERP_DEMO_VENUE = replace(
+    PERP_VENUE,
+    name="binance-futures-demo",
+    ws_urls=("wss://demo-fstream.binance.com",),
+    rest_urls=("https://demo-fapi.binance.com",),
+)
+
+
+def futures_quote_source(demo: bool) -> str:
+    return PERP_DEMO_VENUE.name if demo else PERP_VENUE.name
+
+
+def valid_futures_touch(bid: str, ask: str) -> bool:
+    try:
+        bid_price, ask_price = float(bid), float(ask)
+    except (ValueError, TypeError):
+        return False
+    return 0 < bid_price <= ask_price and math.isfinite(ask_price)
 
 # Binance interval mapping (seconds -> Binance format)
 BINANCE_INTERVAL_MAP = {
@@ -353,13 +372,16 @@ async def poll_ticker_board(
                     stat = by_symbol.get(symbol.upper())
                     if stat is None:
                         continue
-                    await on_quote(
-                        _ticker_message(
-                            mapping.get(symbol, venue.product_id_for(symbol)),
-                            stat,
-                            books.get(symbol.upper()),
-                        )
+                    book = books.get(symbol.upper())
+                    ticker = _ticker_message(
+                        mapping.get(symbol, venue.product_id_for(symbol)), stat, book,
                     )
+                    if venue.is_perp and book and valid_futures_touch(
+                        book.get("bidPrice", ""), book.get("askPrice", "")
+                    ):
+                        ticker.source = venue.name
+                        ticker.time = _iso_ms(book.get("time"))
+                    await on_quote(ticker)
             except Exception:
                 # A failed cycle must not kill the loop: the dashboard keeps the last
                 # price and the next cycle retries.
@@ -508,6 +530,7 @@ class BinanceKafkaConnector:
         venue: BinanceVenue = SPOT_VENUE,
         board_interval: float = 0.0,
         lean_topic: str | None = None,
+        rest_feed_only: bool = False,
     ) -> None:
         if not symbols:
             raise ValueError("At least one symbol must be specified")
@@ -536,6 +559,7 @@ class BinanceKafkaConnector:
         # delivers something, which is what lets `_on_board_quote` tell "the socket is
         # just quiet between ticks" from "this network has no socket at all".
         self._board_interval = board_interval
+        self._rest_feed_only = rest_feed_only
         self._ws_last_frame = 0.0
         self._board_noted = False
 
@@ -545,6 +569,9 @@ class BinanceKafkaConnector:
         logger.info("Kafka broker connected")
 
         try:
+            if self._rest_feed_only:
+                await self._run_rest_feed()
+                return
             while self._running:
                 try:
                     await self._consume_and_publish()
@@ -572,6 +599,28 @@ class BinanceKafkaConnector:
         """Signal the connector to shut down gracefully."""
         self._running = False
 
+    async def _run_rest_feed(self) -> None:
+        """USD-M ticker streams omit the executable bid and ask used by live gates."""
+        tasks = [
+            asyncio.create_task(self._periodic_publish()),
+            asyncio.create_task(poll_ticker_board(
+                symbols=self._symbols, on_quote=self._on_board_quote,
+                interval=self._board_interval, venue=self._venue, products=self._products,
+            )),
+        ]
+        if self._candle_book is not None:
+            tasks.append(asyncio.create_task(poll_rest(
+                symbols=self._symbols, price_book=PriceBook(), candle_book=self._candle_book,
+                interval=60.0, venue=self._venue, products=self._products,
+            )))
+        try:
+            while self._running:
+                await asyncio.sleep(1)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def _parse_binance_ticker(self, data: dict) -> TickerMessage | None:
         """Parse Binance 24hr ticker data into TickerMessage."""
         try:
@@ -597,6 +646,10 @@ class BinanceKafkaConnector:
                 time=datetime.fromtimestamp(
                     data["E"] / 1000, tz=timezone.utc
                 ).isoformat(),
+                source=(
+                    self._venue.name if self._venue.is_perp
+                    and valid_futures_touch(data["b"], data["a"]) else None
+                ),
             )
         except Exception as e:
             logger.error("Failed to parse ticker data: %s (data: %s)", e, data)
@@ -621,6 +674,7 @@ class BinanceKafkaConnector:
             "volume_24h",
             "volume_30d",
             "time",
+            "source",
         }
         batch_json = json.dumps([t.model_dump(exclude=_exclude) for t in batch])
 
@@ -726,12 +780,13 @@ class BinanceKafkaConnector:
             return
         if not self._board_noted:
             self._board_noted = True
-            logger.warning(
-                "No WebSocket frame from %s; publishing from the REST ticker board "
-                "every %.0fs instead",
-                self._venue.name,
-                self._board_interval,
-            )
+            if self._rest_feed_only:
+                logger.info("Publishing live %s REST order-book quotes", self._venue.name)
+            else:
+                logger.warning(
+                    "No WebSocket frame from %s; publishing from the REST ticker board "
+                    "every %.0fs instead", self._venue.name, self._board_interval,
+                )
         self._latest[ticker.product_id] = ticker
         await self._client.broker.publish(ticker, PRICE_TOPIC)
 
@@ -791,7 +846,6 @@ class BinanceKafkaConnector:
                         continue
                     if not self._running:
                         break
-                    self._ws_last_frame = time.time()
 
                     try:
                         data = json.loads(raw)
@@ -818,6 +872,7 @@ class BinanceKafkaConnector:
                     if ticker is None:
                         continue
 
+                    self._ws_last_frame = time.time()
                     self._latest[ticker.product_id] = ticker
                     await self._client.broker.publish(ticker, PRICE_TOPIC)
             finally:
@@ -887,11 +942,11 @@ def parse_args(
     parser.add_argument(
         "--board-interval",
         type=float,
-        default=10.0,
+        default=None,
         help=(
             "Seconds between REST ticker-board polls, used when the WebSocket is not "
-            "delivering (some networks blackhole fstream). 0 disables the fallback. "
-            "(default: 10)"
+            "delivering or when live futures uses the REST feed. 0 disables the fallback. "
+            "(default: 3 seconds for live futures, 10 otherwise)"
         ),
     )
     parser.add_argument(
@@ -916,7 +971,20 @@ async def run(
 
     config = load_config_strict(args.config)
     trading = config.trading
+    rest_feed_only = (
+        venue.is_perp and getattr(trading, "mode", "paper") == "live"
+        and trading.live.market == "perp"
+    )
+    board_interval = getattr(args, "board_interval", None)
+    if board_interval is None:
+        board_interval = 3.0 if rest_feed_only else 10.0
+    if rest_feed_only and not (math.isfinite(board_interval) and board_interval > 0):
+        raise ValueError("Live futures requires a positive --board-interval for order-book quotes")
     if venue.is_perp:
+        if rest_feed_only:
+            account_name = next(iter(trading.live.agent_accounts.values()))
+            if trading.live.accounts[account_name].testnet:
+                venue = PERP_DEMO_VENUE
         # `binance_perp_symbols` lands with the perp config change; getattr keeps this
         # entrypoint startable against a config that predates it.
         configured = getattr(trading, "binance_perp_symbols", None) or []
@@ -941,7 +1009,8 @@ async def run(
         lean_topic=lean_topic,
         candle_book=candle_book,
         venue=venue,
-        board_interval=getattr(args, "board_interval", 10.0),
+        board_interval=board_interval,
+        rest_feed_only=rest_feed_only,
     )
 
     loop = asyncio.get_running_loop()
@@ -955,7 +1024,6 @@ async def run(
     logger.info("  Symbols:     %s", ", ".join(symbols))
     logger.info("  Products:    %s", ", ".join(venue.product_id_for(s) for s in symbols))
     logger.info("  Min interval: %ss", args.min_interval)
-    board_interval = getattr(args, "board_interval", 10.0)
     logger.info(
         "  REST board:  %s",
         f"every {board_interval:g}s (fallback when the socket is silent)"

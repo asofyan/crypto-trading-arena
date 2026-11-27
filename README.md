@@ -162,13 +162,14 @@ uv run python -m exchanges.coinbase --bootstrap-servers <broker-url>
 
 Optional: You can use the `--min-interval <seconds>` flag which controls how often agents are fed market data (default: 60s for spot, 15s for perps). Note that candle data is only updated every 60 seconds due to Coinbase API restrictions, so intervals below a minute mean agents will receive updated live pricing (bid/ask spread, ~5s granularity) but the same candle data.
 
-**Perpetual futures (paper only).** `exchanges.binance_perp` streams Binance USDⓈ-M contracts and
+**Perpetual futures.** `exchanges.binance_perp` streams Binance USDⓈ-M contracts and
 publishes them as `<SYMBOL>-PERP` products (`SOLUSDT-PERP`), so they never collide with the spot
 product of the same name. Perp products are a *signed net position*: `sell` from flat opens a short,
 `buy` against a short covers it. An agent order never crosses zero: a fill larger than the position
 is refused and the position is flattened with `close_position` instead ([ADR-0011](docs/adr/0011-the-agent-names-an-exit-the-server-sizes-it.md)). Leverage is fixed at
 **1:1** — gross notional (Σ |position| × mark) may not exceed equity — and the simulated taker fee is
-`trading.fees.perp_taker_bps` (default 5 bps, Binance USDⓈ-M VIP 0). No real futures orders are placed.
+`trading.fees.perp_taker_bps` (default 5 bps, Binance USDⓈ-M VIP 0). Live perpetuals use a dedicated Binance USDⓈ-M wallet and ledger.
+See [How to run a Binance Futures Demo session](docs/run-binance-futures-demo.md).
 Refresh the contract rules with `uv run python -m arena.instruments --perp`.
 
 <br>

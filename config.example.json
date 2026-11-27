@@ -71,6 +71,7 @@
     },
     "live": {
       "_comment": "Nothing here is used while trading.mode is 'paper'. Setting mode to 'live' requires accounts, agent_accounts and allow_symbols, and fails at startup otherwise. Keep dry_run true until you have watched a full session in the journal. Secrets: use ${ENV_VAR} references, never literals.",
+      "market": "spot",
       "accounts": {
         "main": {
           "api_key": "${BINANCE_API_KEY}",

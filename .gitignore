@@ -228,3 +228,6 @@ config.json
 
 # Harness plan snapshots / reports (local agent orchestration state)
 .harness/
+
+# browser_execute scratch: agent scripts and a throwaway Chrome profile (holds sessions)
+.bcode/

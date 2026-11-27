@@ -63,6 +63,7 @@ class SymbolRules:
     min_notional: Decimal
     tick_size: Decimal
     min_notional_applies_to_market: bool = True
+    max_qty: Decimal | None = None
 
     def quantize(self, quantity: float | Decimal) -> Decimal | None:
         """Floor `quantity` to step_size, or None when the result is not tradable."""
@@ -70,7 +71,9 @@ class SymbolRules:
         if qty is None or qty <= 0:
             return None
         stepped = (qty / self.step_size).to_integral_value(rounding=ROUND_DOWN) * self.step_size
-        if stepped <= 0 or stepped < self.min_qty:
+        if stepped <= 0 or stepped < self.min_qty or (
+            self.max_qty is not None and stepped > self.max_qty
+        ):
             return None
         return stepped
 
@@ -89,7 +92,9 @@ class SymbolRules:
         return qty * px >= self.min_notional
 
 
-def parse_exchange_info(payload: dict, *, product_suffix: str = "") -> dict[str, SymbolRules]:
+def parse_exchange_info(
+    payload: dict, *, product_suffix: str = "", market_order: bool = False,
+) -> dict[str, SymbolRules]:
     """Build rules from an exchangeInfo body, skipping untradable symbols.
 
     `product_suffix` is appended to the venue symbol to form the product id (``-PERP``
@@ -105,7 +110,7 @@ def parse_exchange_info(payload: dict, *, product_suffix: str = "") -> dict[str,
             # never take the engine down at startup.
             log.warning("instruments: skipping malformed symbol entry %r", entry)
             continue
-        symbol_rules = _parse_symbol(entry, product_suffix=product_suffix)
+        symbol_rules = _parse_symbol(entry, product_suffix=product_suffix, market_order=market_order)
         if symbol_rules is not None:
             rules[symbol_rules.symbol] = symbol_rules
     return rules
@@ -181,7 +186,9 @@ def _number(filter_entry: dict | None, key: str) -> Decimal:
     return converted if converted is not None else Decimal(0)
 
 
-def _parse_symbol(entry: dict, *, product_suffix: str = "") -> SymbolRules | None:
+def _parse_symbol(
+    entry: dict, *, product_suffix: str = "", market_order: bool = False,
+) -> SymbolRules | None:
     symbol = entry.get("symbol")
     if not symbol or entry.get("status") != "TRADING":
         log.debug("instruments: skipping %s (status %s)", symbol, entry.get("status"))
@@ -196,10 +203,11 @@ def _parse_symbol(entry: dict, *, product_suffix: str = "") -> SymbolRules | Non
     # Binance reports MARKET_LOT_SIZE.stepSize "0.00000000" for most spot symbols; that
     # filter is deliberately not read, because trusting the zero would floor every order
     # to nothing. LOT_SIZE is the only step that is ever usable.
-    lot = _filter_value(filters, "LOT_SIZE")
+    lot = _filter_value(filters, "MARKET_LOT_SIZE" if market_order else "LOT_SIZE")
     step_size = _number(lot, "stepSize")
     min_qty = _number(lot, "minQty")
-    if step_size <= 0 or min_qty <= 0:
+    max_qty = _number(lot, "maxQty") if market_order else None
+    if step_size <= 0 or min_qty <= 0 or (max_qty is not None and max_qty < min_qty):
         log.debug("instruments: skipping %s (no usable LOT_SIZE)", symbol)
         return None
 
@@ -225,6 +233,7 @@ def _parse_symbol(entry: dict, *, product_suffix: str = "") -> SymbolRules | Non
         min_notional=min_notional,
         tick_size=_number(_filter_value(filters, "PRICE_FILTER"), "tickSize"),
         min_notional_applies_to_market=applies_to_market,
+        max_qty=max_qty,
     )
 
 
@@ -232,6 +241,10 @@ def _rules_to_dict(rule: SymbolRules) -> dict:
     data = asdict(rule)
     for field in ("step_size", "min_qty", "min_notional", "tick_size"):
         data[field] = str(data[field])
+    if rule.max_qty is None:
+        data.pop("max_qty")
+    else:
+        data["max_qty"] = str(rule.max_qty)
     return data
 
 
@@ -247,6 +260,7 @@ def _rules_from_dict(data: dict) -> SymbolRules:
         min_notional=Decimal(str(data["min_notional"])),
         tick_size=Decimal(str(data["tick_size"])),
         min_notional_applies_to_market=bool(data["min_notional_applies_to_market"]),
+        max_qty=Decimal(str(data["max_qty"])) if "max_qty" in data else None,
     )
 
 

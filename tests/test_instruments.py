@@ -620,3 +620,21 @@ def test_refresh_cache_warns_about_a_symbol_the_venue_does_not_list(tmp_path, ca
         refresh_cache(tmp_path / "instruments.json", symbols=["SOLUSDT", "DOGEUSDT"], client=client)
 
     assert "DOGEUSDT" in caplog.text
+
+
+def test_live_futures_market_rules_use_market_lot_size_and_cap():
+    from decimal import Decimal
+
+    from arena.instruments import parse_exchange_info
+
+    payload = {"symbols": [{
+        "symbol": "ZECUSDT", "status": "TRADING", "baseAsset": "ZEC", "quoteAsset": "USDT",
+        "filters": [
+            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001", "maxQty": "100"},
+            {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.01", "minQty": "0.05", "maxQty": "2"},
+        ],
+    }]}
+    rule = parse_exchange_info(payload, product_suffix="-PERP", market_order=True)["ZECUSDT-PERP"]
+    assert rule.quantize(0.051) == Decimal("0.05")
+    assert rule.quantize(0.049) is None
+    assert rule.quantize(2.01) is None

@@ -280,7 +280,7 @@
         },
         "testnet": {
           "default": false,
-          "description": "Use testnet.binance.vision instead of the live venue.",
+          "description": "Use Spot Testnet or USD-M Futures Demo instead of production.",
           "title": "Testnet",
           "type": "boolean"
         }
@@ -304,6 +304,13 @@
           "default": null,
           "description": "Operator note. Ignored by the engine.",
           "title": "Comment"
+        },
+        "market": {
+          "default": "spot",
+          "description": "Venue used for live execution. Perp uses Binance USD-M Futures.",
+          "enum": ["spot", "perp"],
+          "title": "Market",
+          "type": "string"
         },
         "accounts": {
           "additionalProperties": {

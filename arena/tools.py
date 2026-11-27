@@ -148,9 +148,9 @@ def _get_portfolio(agent_id: str) -> str:
 
 @agent_tool
 def execute_trade(ctx: ToolContext, product_id: str, quantity: float, action: str) -> str:
-    """Execute a buy or sell trade (fill-or-cancel). The order fills immediately at the current
-    market price if possible, or returns an error if it cannot be filled — it never waits or queues.
-    Buys execute at the best ask price, sells at the best bid.
+    """Submit a buy or sell market order. Paper uses the best ask for buys and best bid
+    for sells. Live returns the venue's executed price and quantity, which may differ
+    from the quote and requested quantity. Read get_portfolio again if execution is partial.
     Fractional trading is allowed, subject to the venue's step size for that symbol.
 
     On a SPOT product (e.g. SOLUSDT) this is cash-funded: you cannot sell what you do not
@@ -169,11 +169,11 @@ def execute_trade(ctx: ToolContext, product_id: str, quantity: float, action: st
     changed it, so an exit carries no size at all.
     Leverage is fixed at 1:1: gross notional (sum of |position| x mark) may never exceed
     account equity, so an order that would lever the book up is rejected with the size
-    you may use. Closing or reducing a position is never blocked.
+    you may use. Reductions remain subject to the exit band and venue/session checks.
 
     A taker fee (set by the deployment) is charged on every fill and applies to both
     buys and sells. Buys cost: notional + fee. Sells proceed: notional - fee. The fee
-    rate in effect is reported alongside each ticker update you receive. Size positions
+    rate estimate is reported alongside each ticker update you receive. Size positions
     so expected returns exceed the round-trip fee, or you will lose money on flat markets.
 
     Args:
@@ -201,7 +201,7 @@ def execute_trade(ctx: ToolContext, product_id: str, quantity: float, action: st
 
 @agent_tool
 def close_position(ctx: ToolContext, product_id: str) -> str:
-    """Close whatever position is open in one product — the exit that cannot be stale.
+    """Submit a market order sized to close the current position in one product.
 
     No quantity: the size is read from the book at the moment the fill is booked, so an
     exit can never be sized from a number that went stale. Asking to close something you
@@ -209,13 +209,14 @@ def close_position(ctx: ToolContext, product_id: str) -> str:
 
     On a perp it closes a long by selling and a short by buying — whichever the position
     is. Round-trip fees and the exit band apply exactly as they do to any other fill, and
-    the hold watchdog closes stale positions the same way.
+    the hold watchdog closes stale positions the same way. Live perp reductions are
+    reduce-only. Use get_portfolio to confirm whether a partial fill left exposure.
 
     Args:
         product_id: The product to flatten (e.g., SOLUSDT-PERP)
 
     Returns:
-        The fill confirmation (price, fee, resulting flat position, cash, equity), or the
+        The fill confirmation (price, fee, remaining position, cash, equity), or the
         reason it could not be closed
     """
     log.debug(

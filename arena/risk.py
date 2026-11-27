@@ -101,6 +101,8 @@ class RiskGates:
         price_age_s: float,
         portfolio: PortfolioSnapshot,
         armed: bool = True,
+        reduce_only: bool = False,
+        resulting_position_notional: float | None = None,
     ) -> Decision:
         limits = self.limits
 
@@ -125,12 +127,12 @@ class RiskGates:
                 f"position={portfolio.position_notional_usdt!r}); "
                 "refusing to size an order against it"
             )
-        if portfolio.equity_usdt <= 0:
+        if not reduce_only and portfolio.equity_usdt <= 0:
             return _deny(
                 f"account equity is {_usdt(portfolio.equity_usdt)}; refusing to size an "
                 "order against a non-positive balance"
             )
-        if portfolio.session_start_equity_usdt <= 0:
+        if not reduce_only and portfolio.session_start_equity_usdt <= 0:
             return _deny(
                 f"session-start equity is {_usdt(portfolio.session_start_equity_usdt)}, so the "
                 f"{_pct(limits.max_daily_loss_pct)} daily-loss limit cannot be measured; "
@@ -139,7 +141,7 @@ class RiskGates:
 
         loss_cap = portfolio.session_start_equity_usdt * limits.max_daily_loss_pct / 100.0
         session_pnl = portfolio.realised_pnl_usdt + portfolio.unrealised_pnl_usdt
-        if session_pnl <= -loss_cap:
+        if not reduce_only and session_pnl <= -loss_cap:
             return _deny(
                 f"session P&L is {_usdt(session_pnl)}, at the "
                 f"{_pct(limits.max_daily_loss_pct)} daily-loss limit "
@@ -185,13 +187,13 @@ class RiskGates:
 
         # ── Sizing caps, as a share of equity so they scale with a top-up ──
         order_cap = portfolio.equity_usdt * limits.max_order_pct_of_equity / 100.0
-        if notional > order_cap:
+        if not reduce_only and notional > order_cap:
             share = notional / portfolio.equity_usdt * 100.0
             return _deny(
                 f"order notional {_usdt(notional)} ({share:.1f}% of equity) exceeds the "
                 f"{_pct(limits.max_order_pct_of_equity)} cap ({_usdt(order_cap)}); reduce size"
             )
-        if limits.max_order_notional_usdt is not None and (
+        if not reduce_only and limits.max_order_notional_usdt is not None and (
             notional > limits.max_order_notional_usdt
         ):
             return _deny(
@@ -199,11 +201,13 @@ class RiskGates:
                 f"{_usdt(limits.max_order_notional_usdt)} per-order ceiling; reduce size"
             )
 
-        if limits.max_position_pct_of_equity is not None:
+        if not reduce_only and limits.max_position_pct_of_equity is not None:
             position_cap = portfolio.equity_usdt * limits.max_position_pct_of_equity / 100.0
             # A sell can only shrink exposure, and blocking it would trap the agent in
             # a losing position — the one denial that must never fire on an exit.
-            if side.strip().lower() == "sell":
+            if resulting_position_notional is not None:
+                resulting = resulting_position_notional
+            elif side.strip().lower() == "sell":
                 resulting = max(0.0, portfolio.position_notional_usdt - notional)
             else:
                 resulting = portfolio.position_notional_usdt + notional

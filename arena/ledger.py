@@ -23,6 +23,7 @@ import logging
 import os
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +37,20 @@ RECENT_FILLS_LIMIT = 50
 # meta row that makes a failed fill persist across processes: the TUI runs inside
 # Live(screen=True), so a logged traceback is erased the moment the operator exits.
 DEGRADED_META_KEY = "ledger_degraded"
+FUTURES_LEDGER_META_KEY = "live_futures_binding"
+FUTURES_FUNDING_START_META_KEY = "live_futures_started_ms"
+FUTURES_FUNDING_CHECKPOINT_META_KEY = "live_futures_funding_verified_ms"
+
+
+@dataclass(frozen=True)
+class FuturesFunding:
+    transaction_id: int
+    time_ms: int
+    amount: float
+
+    @property
+    def meta_key(self) -> str:
+        return f"live_futures_funding:{self.transaction_id}"
 
 # One row per submitted order, written *before* the venue is contacted. It is what
 # makes a crash between "POST sent" and "fill booked" recoverable: on startup every
@@ -561,6 +576,71 @@ class Ledger:
             with conn:
                 self._persist_account_state(
                     conn, agent_id, account, timestamp or datetime.now(timezone.utc).isoformat()
+                )
+
+    def initialize_futures(
+        self, agent_id: str, account: AgentAccount, binding: str, start_ms: int
+    ) -> None:
+        """Seed an empty ledger and bind it to the verified USD-M wallet atomically."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            conn = self._db()
+            with conn:
+                occupied = any(
+                    conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                    for table in ("accounts", "positions", "fills", "orders", "equity_events")
+                )
+                marked = conn.execute(
+                    "SELECT 1 FROM meta WHERE key IN (?, ?, ?) LIMIT 1",
+                    (FUTURES_LEDGER_META_KEY, "live_baseline", "live_session_start_equity"),
+                ).fetchone()
+                if occupied or marked:
+                    raise ValueError("live futures requires a pristine dedicated ledger")
+                self._persist_account_state(conn, agent_id, account, now)
+                conn.executemany(
+                    "INSERT INTO meta (key, value) VALUES (?, ?)",
+                    (
+                        (FUTURES_LEDGER_META_KEY, binding),
+                        ("live_session_start_equity", repr(account.cash)),
+                        (FUTURES_FUNDING_START_META_KEY, str(start_ms)),
+                        (FUTURES_FUNDING_CHECKPOINT_META_KEY, str(start_ms)),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO equity_events (ts, agent_id, kind, amount, equity_before,"
+                    " equity_after, note) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (now, agent_id, "initial_allocation", account.cash, 0.0, account.cash,
+                     "dedicated USD-M wallet balance after reserve"),
+                )
+
+    def settle_futures_funding(
+        self,
+        agent_id: str,
+        account: AgentAccount,
+        funding: list[FuturesFunding],
+        equity_before: float,
+        checkpoint_ms: int,
+    ) -> None:
+        """Funding IDs and their cash effect commit together across retries and restarts."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            conn = self._db()
+            with conn:
+                self._persist_account_state(conn, agent_id, account, now)
+                equity = equity_before
+                for event in funding:
+                    ts = datetime.fromtimestamp(event.time_ms / 1000, timezone.utc).isoformat()
+                    conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (event.meta_key, ts))
+                    conn.execute(
+                        "INSERT INTO equity_events (ts, agent_id, kind, amount, equity_before,"
+                        " equity_after, note) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (ts, agent_id, "funding", event.amount, equity, equity + event.amount,
+                         f"Binance USD-M transaction {event.transaction_id}"),
+                    )
+                    equity += event.amount
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = ?",
+                    (str(checkpoint_ms), FUTURES_FUNDING_CHECKPOINT_META_KEY),
                 )
 
     # ── Order journal (live execution) ───────────────────────────

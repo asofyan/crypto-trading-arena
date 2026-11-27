@@ -356,7 +356,7 @@ class AccountStore:
         the default.
         """
         if not replay:
-            blocked = self._preadmission_rejection(
+            blocked = self.preadmission_rejection(
                 agent_id, product_id, quantity, action, allow_flip=allow_flip
             )
             if blocked is not None:
@@ -373,10 +373,13 @@ class AccountStore:
                 )
                 return rejection
         return self._executor.execute(
-            FillRequest(agent_id, product_id, quantity, action, latency, replay=replay)
+            FillRequest(
+                agent_id, product_id, quantity, action, latency,
+                replay=replay, allow_flip=allow_flip,
+            )
         )
 
-    def _preadmission_rejection(
+    def preadmission_rejection(
         self,
         agent_id: str,
         product_id: str,
@@ -1110,7 +1113,7 @@ class AccountStore:
             client_order_id,
             fee_asset,
             venue_order_id,
-            replay=not enforce_margin,
+            replay=not enforce_margin and client_order_id is None,
         )
 
         gross_now = self._gross_notional(account.positions)

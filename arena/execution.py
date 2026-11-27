@@ -90,6 +90,7 @@ class FillRequest:
     # A replay books a fill that already happened (the monitor's CSV): it must not be
     # re-gated against a price book the replay only partially knows.
     replay: bool = False
+    allow_flip: bool = True
 
 
 class Executor(Protocol):

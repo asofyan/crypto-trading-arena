@@ -628,3 +628,148 @@ def test_help_renders(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["agent", "--help"])
     with pytest.raises(SystemExit):
         agent_module.parse_args()
+
+
+def test_live_futures_requires_a_dedicated_persistent_ledger(tmp_path):
+    with pytest.raises(ValueError, match="dedicated"):
+        deploy_cli.validate_ledger_target(str(DEFAULT_DB_PATH.resolve()), futures=True, no_ledger=False)
+    with pytest.raises(ValueError, match="persistence"):
+        deploy_cli.validate_ledger_target(str(tmp_path / "futures.db"), futures=True, no_ledger=True)
+    deploy_cli.validate_ledger_target(str(tmp_path / "futures.db"), futures=True, no_ledger=False)
+    deploy_cli.validate_ledger_target(str(DEFAULT_DB_PATH), futures=False, no_ledger=False)
+
+
+@pytest.mark.parametrize("source, age, expected", [
+    ("binance-futures-demo", 1, True),
+    ("binance_perp", 1, False),
+    ("binance-futures-demo", 6, False),
+    ("binance-futures-demo", -10, False),
+    (None, 1, False),
+])
+def test_live_futures_quote_must_match_venue_and_be_fresh(source, age, expected):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    now = datetime.now(timezone.utc)
+    ticker = SimpleNamespace(
+        product_id="ZECUSDT-PERP", source=source,
+        time=(now - timedelta(seconds=age)).isoformat(),
+        best_bid="99", best_ask="100",
+    )
+    assert deploy_cli.accept_futures_ticker(
+        ticker, "binance-futures-demo", max_age=5, now=now,
+    ) is expected
+
+
+def test_live_futures_builder_routes_long_and_short_via_demo(monkeypatch, tmp_path):
+    from decimal import Decimal
+
+    from arena.account_store import AccountStore
+    from arena.live_session import ARMED, LiveState
+    from arena.price_book import PriceBook
+    from config import TradingConfig
+    from exchanges import binance_futures
+    from exchanges.binance_spot import VenueFill
+
+    class DemoVenue:
+        def __init__(self, *args, base_url, **kwargs):
+            assert base_url == binance_futures.BINANCE_FUTURES_DEMO_REST
+            self.positions = Decimal("0")
+            self.balance = Decimal("100")
+            self.calls = []
+
+        def sync_time(self):
+            pass
+
+        def exchange_info(self, symbols):
+            assert symbols == ["BTCUSDT"]
+            return {"symbols": [{
+                "symbol": "BTCUSDT", "status": "TRADING", "baseAsset": "BTC",
+                "quoteAsset": "USDT", "filters": [
+                    {"filterType": "MARKET_LOT_SIZE", "stepSize": ".01", "minQty": ".01",
+                     "maxQty": "100"},
+                ],
+            }]}
+
+        def account_config(self):
+            return {"canTrade": True, "dualSidePosition": False, "multiAssetsMargin": False}
+
+        def bnb_fee_burn(self):
+            return False
+
+        def symbol_config(self, symbol=None):
+            assert symbol in (None, "BTCUSDT")
+            return [{"symbol": "BTCUSDT", "leverage": 1, "marginType": "CROSSED"}]
+
+        def position_risk(self, symbol=None):
+            assert symbol in (None, "BTCUSDT")
+            return [] if not self.positions else [{
+                "symbol": "BTCUSDT", "positionSide": "BOTH",
+                "positionAmt": str(self.positions), "entryPrice": "100",
+            }]
+
+        def futures_balances(self):
+            return [{
+                "asset": "USDT", "balance": str(self.balance),
+                "availableBalance": str(self.balance), "accountAlias": "demo-wallet",
+            }]
+
+        def open_orders(self):
+            return []
+
+        def open_algo_orders(self):
+            return []
+
+        def funding_income(self, *args, **kwargs):
+            return []
+
+        def place_market_order(self, symbol, side, quantity, client_id, *, reduce_only):
+            assert symbol == "BTCUSDT"
+            self.calls.append((side, reduce_only))
+            self.positions += quantity if side == "buy" else -quantity
+            self.balance -= Decimal(".005")
+            return VenueFill(client_id, str(len(self.calls)), symbol, side, "FILLED",
+                             float(quantity), float(quantity), float(100 * quantity),
+                             100., .005, "USDT")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(binance_futures, "BinanceFuturesClient", DemoVenue)
+    monkeypatch.setattr(deploy_cli, "LiveState", lambda ledger: LiveState(
+        ledger, halt_path=tmp_path / "LIVE_HALT",
+    ))
+    config = TradingConfig.model_validate({
+        "mode": "live", "exchange": "binance", "binance_perp_symbols": ["BTCUSDT"],
+        "live": {
+            "market": "perp", "dry_run": False, "allow_symbols": ["BTCUSDT"],
+            "accounts": {"demo": {"api_key": "demo", "api_secret": "demo", "testnet": True}},
+            "agent_accounts": {"scalper-perp": "demo"}, "max_orders_per_minute": 10,
+        },
+    })
+    book = PriceBook()
+    product = "BTCUSDT-PERP"
+    book.update({"product_id": product, "price": "100", "best_bid": "100", "best_ask": "100"})
+    store = AccountStore(book)
+    store.set_agent_markets({"scalper-perp": ["perp"]})
+    with Ledger(tmp_path / "futures.db") as ledger:
+        store.attach_ledger(ledger)
+        session, client = deploy_cli.build_futures_session(store, config, ledger)
+        try:
+            assert session.start().armed
+            assert session.state.state == ARMED
+            for side, quantity in (("buy", .1), ("sell", -.1)):
+                store.record_portfolio_read(
+                    "scalper-perp", trade_count=store.accounts["scalper-perp"].trade_count,
+                )
+                assert store.execute_trade(
+                    "scalper-perp", product, .1, side, allow_flip=False,
+                ).success
+                assert store.accounts["scalper-perp"].positions[product] == quantity
+                assert store.close_position("scalper-perp", product).success
+            assert session.recheck().armed
+            assert client.calls == [("buy", False), ("sell", True), ("sell", False), ("buy", True)]
+            assert len(ledger.recent_fills()) == 4
+        finally:
+            session.stop()
+            client.close()

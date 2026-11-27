@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from dotenv import find_dotenv, load_dotenv
 
 from arena.fees import DEFAULT_PERP_TAKER_BPS, DEFAULT_TAKER_BPS, MAX_TAKER_BPS
+from arena.instruments import venue_symbol
 from arena.model_pool import normalize_model_ids
 from arena.strategies import STRATEGIES
 
@@ -248,14 +249,14 @@ class PaperConfig(BaseModel):
 
 
 class LiveAccountConfig(BaseModel):
-    """One Binance Spot account's credentials. Never commit the resolved values."""
+    """One Binance account's credentials. Never commit the resolved values."""
 
     model_config = ConfigDict(extra="forbid")
 
     api_key: str = Field("", description="API key or ${ENV_VAR} reference.")
     api_secret: str = Field("", description="API secret or ${ENV_VAR} reference.")
     testnet: bool = Field(
-        False, description="Use testnet.binance.vision instead of the live venue."
+        False, description="Use Spot Testnet or USD-M Futures Demo instead of production."
     )
 
 
@@ -273,6 +274,9 @@ class LiveConfig(BaseModel):
 
     comment: str | None = Field(
         None, alias="_comment", description="Operator note. Ignored by the engine."
+    )
+    market: Literal["spot", "perp"] = Field(
+        "spot", description="Venue used for live execution. Perp uses Binance USD-M Futures."
     )
     accounts: dict[str, LiveAccountConfig] = Field(
         default_factory=dict, description="Named venue accounts, referenced by agent_accounts."
@@ -441,14 +445,10 @@ class ArenaConfig(BaseModel):
         live = self.trading.live
         if self.trading.mode != "live":
             return self
-        if self.trading.binance_perp_symbols:
-            # A perp short credits its notional to the wallet, so it cannot be
-            # reconciled against a spot balance sheet, and this executor only speaks
-            # /api/v3. Refusing at load time beats a mysterious halt on the first order.
+        if live.market == "spot" and self.trading.binance_perp_symbols:
             raise ValueError(
-                "perpetual futures are paper-only: trading.mode is 'live' and "
-                "trading.binance_perp_symbols is not empty. Set trading.mode to 'paper' "
-                "or empty binance_perp_symbols."
+                "Live spot cannot execute perpetual futures. Set trading.live.market "
+                "to 'perp' or empty binance_perp_symbols."
             )
         if not live.accounts:
             raise ValueError("trading.mode is 'live' but trading.live.accounts is empty")
@@ -485,6 +485,19 @@ class ArenaConfig(BaseModel):
             raise ValueError(
                 f"live.agent_accounts names agent(s) not in agents[]: {', '.join(unknown)}"
             )
+        if live.market == "perp":
+            if self.trading.exchange != "binance":
+                raise ValueError("Live perpetual execution requires Binance")
+            if len(live.agent_accounts) != 1:
+                raise ValueError("Live perpetual execution requires exactly one mapped agent")
+            agent = next(agent for agent in self.agents if agent.name in live.agent_accounts)
+            if tuple(agent.markets) != ("perp",):
+                raise ValueError("Live perpetual execution requires a perp-only agent")
+            allowed = dict.fromkeys(venue_symbol(symbol.strip().upper()) for symbol in live.allow_symbols)
+            subscribed = set(self.trading.binance_perp_symbols)
+            if not allowed.keys() <= subscribed:
+                raise ValueError("Live perpetual allow_symbols must be in binance_perp_symbols")
+            live.allow_symbols = list(allowed)
         return self
 
     def get_provider_config(self, provider_name: str) -> LLMProviderConfig | None:

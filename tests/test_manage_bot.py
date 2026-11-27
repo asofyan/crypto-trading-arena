@@ -1401,3 +1401,14 @@ def test_status_reports_paper_mode_instead_of_dormant_live_state(live_venue, tmp
     manage_bot.main(["status", "--config", str(config)])
 
     assert "Live:    not in use (trading.mode = paper)" in capsys.readouterr().out
+
+
+def test_archive_ledger_refuses_a_bound_futures_wallet(tmp_path):
+    from arena.ledger import FUTURES_LEDGER_META_KEY
+
+    db = tmp_path / "live-futures.db"
+    with Ledger(db) as ledger:
+        ledger.set_meta(FUTURES_LEDGER_META_KEY, "{}")
+    with pytest.raises(ValueError, match="futures ledger"):
+        manage_bot.archive_ledger(db)
+    assert db.exists()

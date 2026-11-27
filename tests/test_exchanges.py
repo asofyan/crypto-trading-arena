@@ -748,3 +748,29 @@ async def test_binance_run_subscribes_both_profiles(monkeypatch):
 
     assert captured["agent_topic"] == AGENT_INPUT_TOPIC
     assert captured["lean_topic"] == AGENT_INPUT_TOPIC_LEAN
+
+
+async def test_live_perp_demo_uses_the_demo_order_book_polling_path(monkeypatch):
+    import config as config_module
+
+    captured, _ = _stub_run_env(monkeypatch, bn)
+    monkeypatch.setattr(bn, "BinanceKafkaConnector", _capturing(captured))
+    trading = SimpleNamespace(
+        mode="live", binance_perp_symbols=["ZECUSDT"],
+        live=SimpleNamespace(
+            market="perp", agent_accounts={"scalper": "demo"},
+            accounts={"demo": SimpleNamespace(testnet=True)},
+        ),
+        fees=SimpleNamespace(taker_bps=10, perp_taker_bps=5),
+    )
+    monkeypatch.setattr(
+        config_module, "load_config_strict", lambda _: SimpleNamespace(trading=trading),
+    )
+    args = SimpleNamespace(
+        config="config.json", symbols=None, min_interval=15.0,
+        bootstrap_servers="isolated", board_interval=None,
+    )
+    await bn.run(args, venue=bn.PERP_VENUE)
+    assert captured["venue"] is bn.PERP_DEMO_VENUE
+    assert captured["rest_feed_only"] is True
+    assert captured["board_interval"] == 3.0

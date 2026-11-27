@@ -558,3 +558,45 @@ def test_committed_schema_documents_the_payload_profiles():
 
     assert payload["enum"] == ["full", "lean"]
     assert payload["default"] == "full"
+
+
+def _futures_config():
+    return {
+        "agents": [{"name": "futures", "provider": "openai", "model": "m", "markets": ["perp"]}],
+        "trading": {
+            "exchange": "binance",
+            "mode": "live",
+            "binance_perp_symbols": ["ZECUSDT"],
+            "live": {
+                "market": "perp",
+                "accounts": {"demo": {"api_key": "key", "api_secret": "secret", "testnet": True}},
+                "agent_accounts": {"futures": "demo"},
+                "allow_symbols": ["zecusdt-perp"],
+            },
+        },
+    }
+
+
+def test_live_futures_accepts_one_perp_agent_and_normalizes_symbols():
+    cfg = ArenaConfig.model_validate(_futures_config())
+    assert cfg.trading.live.market == "perp"
+    assert cfg.trading.live.allow_symbols == ["ZECUSDT"]
+
+
+@pytest.mark.parametrize("change, message", [
+    ("spot_agent", "perp-only agent"),
+    ("unsubscribed", "binance_perp_symbols"),
+    ("two_agents", "exactly one"),
+])
+def test_live_futures_refuses_ambiguous_position_ownership(change, message):
+    raw = _futures_config()
+    live = raw["trading"]["live"]
+    if change == "spot_agent":
+        raw["agents"][0]["markets"] = ["spot"]
+    elif change == "unsubscribed":
+        live["allow_symbols"] = ["BTCUSDT"]
+    else:
+        raw["agents"].append({**raw["agents"][0], "name": "other"})
+        live["agent_accounts"]["other"] = "demo"
+    with pytest.raises(ValidationError, match=message):
+        ArenaConfig.model_validate(raw)
